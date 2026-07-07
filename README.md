@@ -2,8 +2,20 @@
 
 `young-agent` is a Rust Agent Kernel experiment. The first implementation phase validates the kernel through a minimal CLI Proof Surface and built-in Coding Capability.
 
+## Workspace
+
+| Crate | Responsibility |
+| --- | --- |
+| `young-model-runtime` | Provider-neutral model runtime boundary. |
+| `young-agent-runtime` | Agent Run orchestration boundary. |
+| `young-tool-runtime` | Tool definition, policy, and execution boundary. |
+| `young-event-store` | Canonical Event Log storage boundary. |
+| `young-capability-coding` | Built-in Coding Capability boundary. |
+| `young-agent-cli` | CLI Proof Surface scaffold. |
+
 ## Validate
 
 ```sh
 cargo test --workspace
+cargo run -p young-agent-cli
 ```
