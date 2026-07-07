@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>younggglcy/renovate-config"],
+  "packageRules": [
+    {
+      "description": "Disable automerge inherited from the shared preset",
+      "matchPackageNames": ["*"],
+      "automerge": false
+    }
+  ]
+}
