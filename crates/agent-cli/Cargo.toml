@@ -1,0 +1,13 @@
+[package]
+name = "young-agent-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "CLI Proof Surface for the Agent Kernel."
+
+[[bin]]
+name = "young-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true

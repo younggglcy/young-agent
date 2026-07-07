@@ -1,0 +1,9 @@
+[package]
+name = "young-model-runtime"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Provider-neutral model runtime boundary for the Agent Kernel."
+
+[lints]
+workspace = true

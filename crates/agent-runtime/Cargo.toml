@@ -1,0 +1,9 @@
+[package]
+name = "young-agent-runtime"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Agent Run orchestration boundary for the Agent Kernel."
+
+[lints]
+workspace = true
