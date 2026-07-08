@@ -5,7 +5,7 @@ members = [
     "crates/tool-runtime",
     "crates/event-store",
     "crates/capability-coding",
-    "crates/agent-cli",
+    "crates/cli-proof-surface",
 ]
 resolver = "2"
 

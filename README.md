@@ -4,6 +4,8 @@
 
 ## Workspace
 
+The workspace contains kernel crates, one built-in capability crate, and one proof surface crate. The CLI is a surface that consumes the kernel boundary; it is not part of the Agent Kernel concept.
+
 | Crate | Responsibility |
 | --- | --- |
 | `young-model-runtime` | Provider-neutral model runtime boundary. |
@@ -11,11 +13,11 @@
 | `young-tool-runtime` | Tool definition, policy, and execution boundary. |
 | `young-event-store` | Canonical Event Log storage boundary. |
 | `young-capability-coding` | Built-in Coding Capability boundary. |
-| `young-agent-cli` | CLI Proof Surface scaffold. |
+| `young-cli-proof-surface` | Rust CLI Proof Surface scaffold. |
 
 ## Validate
 
 ```sh
 cargo test --workspace
-cargo run -p young-agent-cli
+cargo run -p young-cli-proof-surface
 ```

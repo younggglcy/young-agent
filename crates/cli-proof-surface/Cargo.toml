@@ -1,9 +1,9 @@
 [package]
-name = "young-agent-cli"
+name = "young-cli-proof-surface"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-description = "CLI Proof Surface for the Agent Kernel."
+description = "Rust CLI Proof Surface for the Agent Kernel."
 
 [[bin]]
 name = "young-agent"
