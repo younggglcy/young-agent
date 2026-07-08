@@ -1,0 +1,1 @@
+//! Coding Capability manifest placeholders.

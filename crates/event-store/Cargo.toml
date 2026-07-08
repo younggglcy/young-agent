@@ -1,0 +1,9 @@
+[package]
+name = "young-event-store"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Canonical Event Log storage boundary for Agent Runs."
+
+[lints]
+workspace = true

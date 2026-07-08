@@ -1,0 +1,1 @@
+//! JSONL Event Log placeholders.

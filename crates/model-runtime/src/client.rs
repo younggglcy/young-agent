@@ -1,0 +1,1 @@
+//! Model client boundary placeholders.

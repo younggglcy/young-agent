@@ -1,0 +1,13 @@
+[package]
+name = "young-cli-proof-surface"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Rust CLI Proof Surface for the Agent Kernel."
+
+[[bin]]
+name = "young-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true

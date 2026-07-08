@@ -1,0 +1,1 @@
+//! Model stream event placeholders.
