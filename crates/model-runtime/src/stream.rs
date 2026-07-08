@@ -44,5 +44,6 @@ pub struct ModelUsage {
 pub struct ModelError {
     pub code: String,
     pub message: String,
+    /// Whether retrying the same provider request is expected to help.
     pub retryable: bool,
 }

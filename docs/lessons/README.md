@@ -36,4 +36,4 @@ What an agent or human should do differently.
 
 ## Index
 
-No lesson entries yet.
+- [Contract Review Should Harden Wire Shape First](contract-review-wire-shape.md)

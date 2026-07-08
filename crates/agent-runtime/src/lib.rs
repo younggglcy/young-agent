@@ -8,6 +8,8 @@ pub use turn::TurnId;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
     use young_model_runtime::stream::{ModelStreamEvent, ModelUsage};
     use young_tool_runtime::execution::{ToolCall, ToolContent, ToolOutput, ToolResult};
@@ -30,7 +32,7 @@ mod tests {
                 content: vec![ToolContent::Text {
                     text: "# Agent Kernel".to_string(),
                 }],
-                metadata: json!({ "bytes": 14 }),
+                metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
             },
         };
         let error = AgentError {
@@ -87,14 +89,6 @@ mod tests {
                     final_message: "Done".to_string(),
                 },
             },
-            AgentEvent::Interrupted {
-                run_id: run_id.clone(),
-                reason: "user paused the run".to_string(),
-            },
-            AgentEvent::Cancelled {
-                run_id,
-                reason: "user cancelled the run".to_string(),
-            },
         ];
 
         let encoded = serde_json::to_string(&events).expect("agent events serialize");
@@ -102,5 +96,35 @@ mod tests {
             serde_json::from_str(&encoded).expect("agent events deserialize");
 
         assert_eq!(decoded, events);
+    }
+
+    #[test]
+    fn run_status_variants_round_trip_with_terminal_reasons() {
+        let statuses = vec![
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            RunStatus::Completed {
+                final_message: "Done".to_string(),
+            },
+            RunStatus::Failed {
+                error: AgentError {
+                    code: "model_failed".to_string(),
+                    message: "model stream ended with an error".to_string(),
+                    recoverable: false,
+                },
+            },
+            RunStatus::Interrupted {
+                reason: "user paused the run".to_string(),
+            },
+            RunStatus::Cancelled {
+                reason: "user cancelled the run".to_string(),
+            },
+        ];
+
+        let encoded = serde_json::to_value(&statuses).expect("statuses serialize");
+        let decoded: Vec<RunStatus> =
+            serde_json::from_value(encoded).expect("statuses deserialize");
+
+        assert_eq!(decoded, statuses);
     }
 }

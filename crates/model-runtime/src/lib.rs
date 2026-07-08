@@ -80,8 +80,16 @@ mod tests {
             ModelStreamEvent::Started {
                 provider_request_id: Some("qoder-request-001".to_string()),
             },
+            ModelStreamEvent::Started {
+                provider_request_id: None,
+            },
             ModelStreamEvent::TextDelta {
                 delta: "I will inspect the file.".to_string(),
+            },
+            ModelStreamEvent::ToolCallDelta {
+                id: "call-001".to_string(),
+                name: None,
+                arguments_delta: "{\"path\"".to_string(),
             },
             ModelStreamEvent::ToolCall {
                 id: "call-001".to_string(),
@@ -96,6 +104,9 @@ mod tests {
             },
             ModelStreamEvent::Completed {
                 finish_reason: Some("stop".to_string()),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: None,
             },
             ModelStreamEvent::Failed {
                 error: ModelError {

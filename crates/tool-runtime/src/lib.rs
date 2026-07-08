@@ -8,6 +8,8 @@ pub use registry::{CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefi
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use crate::execution::{ToolCall, ToolContent, ToolError, ToolOutput, ToolResult};
@@ -63,7 +65,7 @@ mod tests {
                 content: vec![ToolContent::Text {
                     text: "# Agent Kernel".to_string(),
                 }],
-                metadata: json!({ "bytes": 14 }),
+                metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
             },
         };
         let failure = ToolResult {
@@ -83,5 +85,60 @@ mod tests {
             serde_json::from_value(encoded).expect("payloads deserialize");
 
         assert_eq!(decoded, (call, success, failure));
+    }
+
+    #[test]
+    fn empty_tool_metadata_is_omitted_from_success_output() {
+        let output = ToolOutput::Success {
+            content: vec![ToolContent::Json {
+                value: json!({ "ok": true }),
+            }],
+            metadata: BTreeMap::new(),
+        };
+
+        let encoded = serde_json::to_value(&output).expect("output serializes");
+
+        assert!(encoded.get("metadata").is_none());
+    }
+
+    #[test]
+    fn tool_definition_optional_fields_and_policy_variants_round_trip() {
+        let requires_approval = ToolDefinition {
+            name: "run_command".to_string(),
+            description: "Run a command in the workspace.".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            capability: CapabilityRef {
+                id: "coding".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            approval_policy: ToolApprovalPolicy::RequiresApproval {
+                reason: "command may mutate the workspace".to_string(),
+            },
+            mcp: None,
+        };
+        let always_reject = ToolDefinition {
+            name: "delete_workspace".to_string(),
+            description: "Rejected destructive operation.".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            capability: CapabilityRef {
+                id: "coding".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            approval_policy: ToolApprovalPolicy::AlwaysReject {
+                reason: "outside the first-phase safety boundary".to_string(),
+            },
+            mcp: None,
+        };
+
+        let encoded = serde_json::to_value((&requires_approval, &always_reject))
+            .expect("definitions serialize");
+        assert!(encoded[0].get("output_schema").is_none());
+        assert!(encoded[0].get("mcp").is_none());
+
+        let decoded: (ToolDefinition, ToolDefinition) =
+            serde_json::from_value(encoded).expect("definitions deserialize");
+        assert_eq!(decoded, (requires_approval, always_reject));
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -19,8 +21,9 @@ pub struct ToolResult {
 pub enum ToolOutput {
     Success {
         content: Vec<ToolContent>,
-        #[serde(default)]
-        metadata: Value,
+        /// Producer-defined object metadata for logs, UI hints, and metrics.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        metadata: BTreeMap<String, Value>,
     },
     Failure {
         error: ToolError,
@@ -38,5 +41,6 @@ pub enum ToolContent {
 pub struct ToolError {
     pub code: String,
     pub message: String,
+    /// Whether retrying the same low-level tool call is expected to help.
     pub retryable: bool,
 }
