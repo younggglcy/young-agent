@@ -23,6 +23,7 @@ mod tests {
                 role: ModelMessageRole::User,
                 content: "Read README.md and summarize it.".to_string(),
                 name: None,
+                tool_call_id: None,
             }],
             tools: vec![ModelToolSpec {
                 name: "read_file".to_string(),
@@ -41,6 +42,35 @@ mod tests {
         let encoded = serde_json::to_string(&request).expect("request serializes");
         let decoded: ModelRequest = serde_json::from_str(&encoded).expect("request deserializes");
 
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn model_request_preserves_tool_result_correlation() {
+        let request = ModelRequest {
+            model: "qoder-coder".to_string(),
+            messages: vec![
+                ModelMessage {
+                    role: ModelMessageRole::Assistant,
+                    content: "I need to read README.md.".to_string(),
+                    name: None,
+                    tool_call_id: None,
+                },
+                ModelMessage {
+                    role: ModelMessageRole::Tool,
+                    content: "# Agent Kernel".to_string(),
+                    name: Some("read_file".to_string()),
+                    tool_call_id: Some("call-001".to_string()),
+                },
+            ],
+            tools: Vec::new(),
+            metadata: BTreeMap::new(),
+        };
+
+        let encoded = serde_json::to_value(&request).expect("request serializes");
+        assert_eq!(encoded["messages"][1]["tool_call_id"], json!("call-001"));
+
+        let decoded: ModelRequest = serde_json::from_value(encoded).expect("request deserializes");
         assert_eq!(decoded, request);
     }
 
