@@ -1,24 +1,23 @@
-# Contract Review Should Harden Wire Shape First
+# Contract Review 先收紧 Wire Shape
 
-## Context
+## 背景
 
-Issue 3 introduced the first persisted contracts for model, tool, and agent run
-events. Review feedback mixed concrete wire-shape risks with broader provider
-evolution ideas.
+Issue 3 引入了 model、tool 和 agent run event 的第一批持久化 contract。
+review 反馈里混在一起的，既有具体的 wire shape 风险，也有更长远的
+provider 演进设想。
 
-## Lesson
+## 经验
 
-For early protocol work, prioritize feedback that makes persisted data less
-ambiguous without guessing future provider behavior. In this case, object-shaped
-metadata and a single terminal run status were worth fixing immediately because
-they prevent divergent consumers. Broader ideas such as multimodal message
-parts, richer stream deltas, and provider-specific lifecycle states should wait
-for implementation pressure from real adapters.
+做早期协议设计时，优先处理能减少持久化数据歧义的反馈，但不要提前猜未来
+provider 的复杂行为。这次 object-shaped metadata 和单一 terminal run status
+值得立即修，因为它们能避免不同 consumer 对同一份日志产生不同解释。多模态
+message parts、更丰富的 stream deltas、provider-specific lifecycle states 这类
+更大的表达能力，应该等真实 adapter 带来实现压力之后再设计。
 
-## Next Time
+## 下次怎么做
 
-When reviewing a contract PR, classify comments into:
+review contract PR 时，先把评论分成三类：
 
-- wire-shape ambiguity to fix now;
-- semantic rules to document now;
-- future expressiveness to defer until a real consumer needs it.
+- 现在就该修的 wire-shape ambiguity；
+- 现在就该写清楚的 semantic rules；
+- 等真实 consumer 需要时再扩展的 future expressiveness。
