@@ -1,0 +1,63 @@
+name: Qoder Assistant
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  qoder-assistant:
+    if: |
+      contains(github.event.comment.body, '@qoder') &&
+      !endsWith(github.event.comment.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Build arguments
+        id: build_args
+        run: |
+          # Read comment fields from the event payload so user-authored text is not evaluated by the shell.
+          ARGS="$(jq -r --arg repo "$GITHUB_REPOSITORY" --arg event_name "$GITHUB_EVENT_NAME" '
+            [
+              "REPO:\($repo)",
+              "REQUEST_SOURCE:\($event_name)",
+              "THREAD_ID:\(.comment.node_id)",
+              "COMMENT_ID:\(.comment.id)",
+              "AUTHOR:\(.comment.user.login)",
+              "BODY:\(.comment.body)",
+              "URL:\(.comment.html_url)",
+              "IS_PR:\((.issue.pull_request != null) or ($event_name == "pull_request_review_comment"))",
+              "ISSUE_OR_PR_NUMBER:\((.issue.number // .pull_request.number) // "")",
+              "OUTPUT_LANGUAGE:Chinese"
+            ]
+            + (if .comment.pull_request_review_id then ["REVIEW_ID:\(.comment.pull_request_review_id)"] else [] end)
+            + (if .comment.in_reply_to_id then ["REPLY_TO_COMMENT_ID:\(.comment.in_reply_to_id)"] else [] end)
+            | join("\n")
+          ' "$GITHUB_EVENT_PATH")"
+
+          delimiter="QODER_ARGS_$(uuidgen)"
+          {
+            echo "args<<$delimiter"
+            echo "$ARGS"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Qoder Assistant
+        uses: QoderAI/qoder-action@v0
+        with:
+          qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+          flags: --model ultimate
+          prompt: |
+            /assistant
+            ${{ steps.build_args.outputs.args }}
