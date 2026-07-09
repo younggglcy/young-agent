@@ -12,12 +12,16 @@ pub enum ModelStreamEvent {
         delta: String,
     },
     ToolCallDelta {
+        /// Provider tool-call id. This must match the final ToolCall id and
+        /// the later tool-runtime ToolResult.call_id for the same invocation.
         id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         arguments_delta: String,
     },
     ToolCall {
+        /// Provider tool-call id. This must match the tool-runtime ToolCall.id
+        /// dispatched by the agent for the same invocation.
         id: String,
         name: String,
         arguments: Value,

@@ -14,6 +14,10 @@ provider 的复杂行为。这次 object-shaped metadata 和单一 terminal run 
 message parts、更丰富的 stream deltas、provider-specific lifecycle states 这类
 更大的表达能力，应该等真实 adapter 带来实现压力之后再设计。
 
+如果一个字段组合本身就有语义约束，优先把约束编码进类型形态和 round-trip
+测试里，而不是只靠注释提醒 producer。例如 tool result message 必须携带工具名
+和 tool call id，普通 model message 则不应该承载这两个字段。
+
 ## 下次怎么做
 
 review contract PR 时，先把评论分成三类：

@@ -14,13 +14,74 @@ pub struct ModelRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelMessage {
-    pub role: ModelMessageRole,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: String,
+    },
+    Tool {
+        content: String,
+        /// Tool definition name used to produce this tool result message.
+        name: String,
+        /// Correlates this message to the model-emitted tool call id.
+        tool_call_id: String,
+    },
+}
+
+impl ModelMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::System {
+            content: content.into(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::User {
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::Assistant {
+            content: content.into(),
+        }
+    }
+
+    pub fn tool(
+        content: impl Into<String>,
+        name: impl Into<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self::Tool {
+            content: content.into(),
+            name: name.into(),
+            tool_call_id: tool_call_id.into(),
+        }
+    }
+
+    pub fn role(&self) -> ModelMessageRole {
+        match self {
+            Self::System { .. } => ModelMessageRole::System,
+            Self::User { .. } => ModelMessageRole::User,
+            Self::Assistant { .. } => ModelMessageRole::Assistant,
+            Self::Tool { .. } => ModelMessageRole::Tool,
+        }
+    }
+
+    pub fn content(&self) -> &str {
+        match self {
+            Self::System { content }
+            | Self::User { content }
+            | Self::Assistant { content }
+            | Self::Tool { content, .. } => content,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

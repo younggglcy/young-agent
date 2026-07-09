@@ -19,12 +19,7 @@ mod tests {
     fn model_request_round_trips_without_provider_impl() {
         let request = ModelRequest {
             model: "qoder-coder".to_string(),
-            messages: vec![ModelMessage {
-                role: ModelMessageRole::User,
-                content: "Read README.md and summarize it.".to_string(),
-                name: None,
-                tool_call_id: None,
-            }],
+            messages: vec![ModelMessage::user("Read README.md and summarize it.")],
             tools: vec![ModelToolSpec {
                 name: "read_file".to_string(),
                 description: "Read a UTF-8 file in the workspace.".to_string(),
@@ -43,6 +38,7 @@ mod tests {
         let decoded: ModelRequest = serde_json::from_str(&encoded).expect("request deserializes");
 
         assert_eq!(decoded, request);
+        assert_eq!(decoded.messages[0].role(), ModelMessageRole::User);
     }
 
     #[test]
@@ -50,18 +46,8 @@ mod tests {
         let request = ModelRequest {
             model: "qoder-coder".to_string(),
             messages: vec![
-                ModelMessage {
-                    role: ModelMessageRole::Assistant,
-                    content: "I need to read README.md.".to_string(),
-                    name: None,
-                    tool_call_id: None,
-                },
-                ModelMessage {
-                    role: ModelMessageRole::Tool,
-                    content: "# Agent Kernel".to_string(),
-                    name: Some("read_file".to_string()),
-                    tool_call_id: Some("call-001".to_string()),
-                },
+                ModelMessage::assistant("I need to read README.md."),
+                ModelMessage::tool("# Agent Kernel", "read_file", "call-001"),
             ],
             tools: Vec::new(),
             metadata: BTreeMap::new(),
@@ -72,6 +58,40 @@ mod tests {
 
         let decoded: ModelRequest = serde_json::from_value(encoded).expect("request deserializes");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn model_message_role_controls_allowed_wire_fields() {
+        let user_message =
+            serde_json::to_value(ModelMessage::user("hello")).expect("message serializes");
+        assert_eq!(user_message["role"], json!("user"));
+        assert!(user_message.get("name").is_none());
+        assert!(user_message.get("tool_call_id").is_none());
+
+        let tool_message = serde_json::to_value(ModelMessage::tool(
+            "# Agent Kernel",
+            "read_file",
+            "call-001",
+        ))
+        .expect("message serializes");
+        assert_eq!(tool_message["role"], json!("tool"));
+        assert_eq!(tool_message["name"], json!("read_file"));
+        assert_eq!(tool_message["tool_call_id"], json!("call-001"));
+
+        let user_with_tool_fields = json!({
+            "role": "user",
+            "content": "hello",
+            "name": "read_file",
+            "tool_call_id": "call-001"
+        });
+        let missing_tool_call_id = json!({
+            "role": "tool",
+            "content": "# Agent Kernel",
+            "name": "read_file"
+        });
+
+        assert!(serde_json::from_value::<ModelMessage>(user_with_tool_fields).is_err());
+        assert!(serde_json::from_value::<ModelMessage>(missing_tool_call_id).is_err());
     }
 
     #[test]

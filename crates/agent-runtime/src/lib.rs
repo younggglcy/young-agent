@@ -11,6 +11,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
+    use young_model_runtime::client::ModelMessage;
     use young_model_runtime::stream::{ModelStreamEvent, ModelUsage};
     use young_tool_runtime::execution::{ToolCall, ToolContent, ToolOutput, ToolResult};
 
@@ -126,5 +127,46 @@ mod tests {
             serde_json::from_value(encoded).expect("statuses deserialize");
 
         assert_eq!(decoded, statuses);
+    }
+
+    #[test]
+    fn tool_invocation_id_is_shared_across_runtime_contracts() {
+        let call_id = "call-001";
+        let model_tool_call = ModelStreamEvent::ToolCall {
+            id: call_id.to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        };
+        let tool_call = ToolCall {
+            id: call_id.to_string(),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        };
+        let tool_result = ToolResult {
+            call_id: call_id.to_string(),
+            output: ToolOutput::Success {
+                content: vec![ToolContent::Text {
+                    text: "# Agent Kernel".to_string(),
+                }],
+                metadata: BTreeMap::new(),
+            },
+        };
+        let tool_message = ModelMessage::tool("# Agent Kernel", "read_file", call_id);
+
+        let encoded =
+            serde_json::to_value((&model_tool_call, &tool_call, &tool_result, &tool_message))
+                .expect("runtime payloads serialize");
+        let decoded: (ModelStreamEvent, ToolCall, ToolResult, ModelMessage) =
+            serde_json::from_value(encoded).expect("runtime payloads deserialize");
+
+        assert_eq!(
+            decoded,
+            (model_tool_call, tool_call, tool_result, tool_message)
+        );
+        assert_eq!(decoded.1.id, decoded.2.call_id);
+        match decoded.3 {
+            ModelMessage::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, decoded.2.call_id),
+            _ => panic!("expected tool result message"),
+        }
     }
 }
