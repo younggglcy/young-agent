@@ -3,7 +3,7 @@
 pub mod execution;
 pub mod registry;
 
-pub use execution::{ToolCall, ToolContent, ToolError, ToolOutput, ToolResult};
+pub use execution::{ToolCall, ToolCallId, ToolContent, ToolError, ToolOutput, ToolResult};
 pub use registry::{CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition};
 
 #[cfg(test)]
@@ -12,7 +12,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::execution::{ToolCall, ToolContent, ToolError, ToolOutput, ToolResult};
+    use crate::execution::{ToolCall, ToolCallId, ToolContent, ToolError, ToolOutput, ToolResult};
     use crate::registry::{CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition};
 
     #[test]
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn tool_call_result_and_error_round_trip() {
         let call = ToolCall {
-            id: "call-001".to_string(),
+            id: ToolCallId::new("call-001"),
             tool_name: "read_file".to_string(),
             arguments: json!({ "path": "README.md" }),
         };
@@ -112,16 +112,18 @@ mod tests {
                     text: "# Agent Kernel".to_string(),
                 }],
                 metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
+                extensions: BTreeMap::new(),
             },
         };
         let failure = ToolResult {
-            call_id: "call-002".to_string(),
+            call_id: ToolCallId::new("call-002"),
             output: ToolOutput::Failure {
                 error: ToolError {
                     code: "outside_workspace".to_string(),
                     message: "path escapes the workspace boundary".to_string(),
                     retryable: false,
                 },
+                extensions: BTreeMap::new(),
             },
         };
 
@@ -136,7 +138,7 @@ mod tests {
     #[test]
     fn tool_result_serializes_representative_wire_payload() {
         let result = ToolResult {
-            call_id: "call-001".to_string(),
+            call_id: ToolCallId::new("call-001"),
             output: ToolOutput::Success {
                 content: vec![
                     ToolContent::Text {
@@ -147,6 +149,7 @@ mod tests {
                     },
                 ],
                 metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
+                extensions: BTreeMap::new(),
             },
         };
 
@@ -182,7 +185,7 @@ mod tests {
             "id": "call-001",
             "tool_name": "read_file",
             "arguments": { "path": "README.md" },
-            "provider_only": true
+            "future_hint": true
         });
         let result_with_unknown_field = json!({
             "call_id": "call-001",
@@ -217,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_envelopes_tolerate_additive_fields() {
+    fn tool_output_envelopes_preserve_additive_fields() {
         let output_with_additive_field = json!({
             "status": "success",
             "content": [
@@ -234,6 +237,7 @@ mod tests {
 
         let decoded: ToolOutput =
             serde_json::from_value(output_with_additive_field).expect("output deserializes");
+        let reencoded = serde_json::to_value(&decoded).expect("output serializes");
 
         assert_eq!(
             decoded,
@@ -242,8 +246,13 @@ mod tests {
                     text: "# Agent Kernel".to_string(),
                 }],
                 metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
+                extensions: BTreeMap::from([(
+                    "producer_hint".to_string(),
+                    json!("display_as_markdown")
+                )]),
             }
         );
+        assert_eq!(reencoded["producer_hint"], json!("display_as_markdown"));
     }
 
     #[test]
@@ -253,6 +262,7 @@ mod tests {
                 value: json!({ "ok": true }),
             }],
             metadata: BTreeMap::new(),
+            extensions: BTreeMap::new(),
         };
 
         let encoded = serde_json::to_value(&output).expect("output serializes");

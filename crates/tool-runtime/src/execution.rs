@@ -3,12 +3,25 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ToolCallId(String);
+
+impl ToolCallId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCall {
-    /// Stable invocation id shared with model-runtime tool-call events and
-    /// the corresponding ToolResult.call_id.
-    pub id: String,
+    /// Kernel-owned invocation id for the concrete tool execution.
+    pub id: ToolCallId,
     pub tool_name: String,
     pub arguments: Value,
 }
@@ -17,7 +30,7 @@ pub struct ToolCall {
 #[serde(deny_unknown_fields)]
 pub struct ToolResult {
     /// Correlates this result to the ToolCall.id that was executed.
-    pub call_id: String,
+    pub call_id: ToolCallId,
     pub output: ToolOutput,
 }
 
@@ -32,9 +45,13 @@ pub enum ToolOutput {
         /// Core tool semantics must not depend on producer-specific keys.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         metadata: BTreeMap<String, Value>,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     Failure {
         error: ToolError,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
 }
 

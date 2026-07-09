@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use young_model_runtime::stream::ModelStreamEvent;
 use young_tool_runtime::execution::{ToolCall, ToolResult};
 
@@ -28,47 +31,63 @@ impl RunId {
 pub enum AgentEvent {
     RunStarted {
         run_id: RunId,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     TurnStarted {
         run_id: RunId,
         turn_id: TurnId,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     ModelOutput {
         run_id: RunId,
         turn_id: TurnId,
         event: ModelStreamEvent,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     ToolCallRequested {
         run_id: RunId,
         turn_id: TurnId,
         call: ToolCall,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     ApprovalRequested {
         run_id: RunId,
         turn_id: TurnId,
         request: ApprovalRequest,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     ToolResult {
         run_id: RunId,
         turn_id: TurnId,
         result: ToolResult,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     Error {
         run_id: RunId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
         error: AgentError,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     /// The final event for a run. Terminal outcomes, including interruption and
     /// cancellation, are represented only through this status.
     RunFinished {
         run_id: RunId,
         status: TerminalRunStatus,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunStatus {
     Running,
     AwaitingApproval,
@@ -76,7 +95,7 @@ pub enum RunStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TerminalRunStatus {
     Completed { final_message: String },
     Failed { error: AgentError },

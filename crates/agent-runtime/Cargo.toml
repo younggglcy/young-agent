@@ -7,11 +7,11 @@ description = "Agent Run orchestration boundary for the Agent Kernel."
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 young-model-runtime = { path = "../model-runtime" }
 young-tool-runtime = { path = "../tool-runtime" }
 
 [dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -12,8 +12,11 @@ mod tests {
 
     use serde_json::json;
     use young_model_runtime::client::ModelMessage;
-    use young_model_runtime::stream::{ModelStreamEvent, ModelUsage};
-    use young_tool_runtime::execution::{ToolCall, ToolContent, ToolOutput, ToolResult};
+    use young_model_runtime::stream::ModelStreamEvent;
+    use young_model_runtime::{ModelToolCallId, ModelUsage};
+    use young_tool_runtime::execution::{
+        ToolCall, ToolCallId, ToolContent, ToolOutput, ToolResult,
+    };
 
     use crate::run::{
         AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
@@ -25,7 +28,7 @@ mod tests {
         let run_id = RunId::new("run-001");
         let turn_id = TurnId::new("turn-001");
         let call = ToolCall {
-            id: "call-001".to_string(),
+            id: ToolCallId::new("call-001"),
             tool_name: "read_file".to_string(),
             arguments: json!({ "path": "README.md" }),
         };
@@ -36,6 +39,7 @@ mod tests {
                     text: "# Agent Kernel".to_string(),
                 }],
                 metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
+                extensions: BTreeMap::new(),
             },
         };
         let error = AgentError {
@@ -47,10 +51,12 @@ mod tests {
         let events = vec![
             AgentEvent::RunStarted {
                 run_id: run_id.clone(),
+                extensions: BTreeMap::new(),
             },
             AgentEvent::TurnStarted {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
+                extensions: BTreeMap::new(),
             },
             AgentEvent::ModelOutput {
                 run_id: run_id.clone(),
@@ -60,12 +66,15 @@ mod tests {
                         input_tokens: 120,
                         output_tokens: 32,
                     },
+                    extensions: BTreeMap::new(),
                 },
+                extensions: BTreeMap::new(),
             },
             AgentEvent::ToolCallRequested {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 call: call.clone(),
+                extensions: BTreeMap::new(),
             },
             AgentEvent::ApprovalRequested {
                 run_id: run_id.clone(),
@@ -75,22 +84,26 @@ mod tests {
                     call: call.clone(),
                     reason: "command mutates the workspace".to_string(),
                 },
+                extensions: BTreeMap::new(),
             },
             AgentEvent::ToolResult {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 result,
+                extensions: BTreeMap::new(),
             },
             AgentEvent::Error {
                 run_id: run_id.clone(),
                 turn_id: Some(turn_id),
                 error: error.clone(),
+                extensions: BTreeMap::new(),
             },
             AgentEvent::RunFinished {
                 run_id: run_id.clone(),
                 status: TerminalRunStatus::Completed {
                     final_message: "Done".to_string(),
                 },
+                extensions: BTreeMap::new(),
             },
         ];
 
@@ -149,12 +162,36 @@ mod tests {
     }
 
     #[test]
+    fn run_status_payloads_reject_unknown_fields() {
+        let run_status_with_unknown_field = json!({
+            "status": "finished",
+            "terminal_status": {
+                "status": "completed",
+                "final_message": "Done"
+            },
+            "future_hint": true
+        });
+        let terminal_status_with_unknown_field = json!({
+            "status": "completed",
+            "final_message": "Done",
+            "future_hint": true
+        });
+
+        assert!(serde_json::from_value::<RunStatus>(run_status_with_unknown_field).is_err());
+        assert!(
+            serde_json::from_value::<TerminalRunStatus>(terminal_status_with_unknown_field)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn run_finished_serializes_only_terminal_statuses() {
         let event = AgentEvent::RunFinished {
             run_id: RunId::new("run-001"),
             status: TerminalRunStatus::Interrupted {
                 reason: "user paused the run".to_string(),
             },
+            extensions: BTreeMap::new(),
         };
 
         let encoded = serde_json::to_value(&event).expect("event serializes");
@@ -178,6 +215,19 @@ mod tests {
                 "status": "running"
             }
         });
+        let conflicting_terminal_status = json!({
+            "type": "run_finished",
+            "run_id": "run-001",
+            "status": {
+                "status": "completed",
+                "final_message": "Done",
+                "error": {
+                    "code": "model_failed",
+                    "message": "model stream ended with an error",
+                    "recoverable": false
+                }
+            }
+        });
         let event_with_additive_field = json!({
             "type": "run_finished",
             "run_id": "run-001",
@@ -185,36 +235,64 @@ mod tests {
                 "status": "completed",
                 "final_message": "Done"
             },
-            "provider_only": true
+            "future_hint": true
         });
 
         assert!(serde_json::from_value::<AgentEvent>(impossible_finished_event).is_err());
-        assert!(serde_json::from_value::<AgentEvent>(event_with_additive_field).is_ok());
+        assert!(serde_json::from_value::<AgentEvent>(conflicting_terminal_status).is_err());
+        let decoded: AgentEvent =
+            serde_json::from_value(event_with_additive_field).expect("event deserializes");
+
+        match decoded {
+            AgentEvent::RunFinished { extensions, .. } => {
+                assert_eq!(extensions["future_hint"], json!(true));
+            }
+            _ => panic!("expected run finished"),
+        }
     }
 
     #[test]
-    fn tool_invocation_id_is_shared_across_runtime_contracts() {
-        let call_id = "call-001";
+    fn agent_event_extensions_round_trip_without_dropping_additive_fields() {
+        let event = AgentEvent::RunStarted {
+            run_id: RunId::new("run-001"),
+            extensions: BTreeMap::from([("future_hint".to_string(), json!("preserve"))]),
+        };
+
+        let encoded = serde_json::to_value(&event).expect("event serializes");
+        let decoded: AgentEvent =
+            serde_json::from_value(encoded.clone()).expect("event deserializes");
+        let reencoded = serde_json::to_value(&decoded).expect("event serializes");
+
+        assert_eq!(encoded["future_hint"], json!("preserve"));
+        assert_eq!(reencoded["future_hint"], json!("preserve"));
+    }
+
+    #[test]
+    fn tool_invocation_id_is_kernel_owned_while_model_call_id_stays_separate() {
+        let call_id = ToolCallId::new("call-001");
+        let model_call_id = ModelToolCallId::new("model-call-001");
         let model_tool_call = ModelStreamEvent::ToolCall {
-            id: call_id.to_string(),
+            id: model_call_id,
             name: "read_file".to_string(),
             arguments: json!({ "path": "README.md" }),
+            extensions: BTreeMap::new(),
         };
         let tool_call = ToolCall {
-            id: call_id.to_string(),
+            id: call_id.clone(),
             tool_name: "read_file".to_string(),
             arguments: json!({ "path": "README.md" }),
         };
         let tool_result = ToolResult {
-            call_id: call_id.to_string(),
+            call_id: call_id.clone(),
             output: ToolOutput::Success {
                 content: vec![ToolContent::Text {
                     text: "# Agent Kernel".to_string(),
                 }],
                 metadata: BTreeMap::new(),
+                extensions: BTreeMap::new(),
             },
         };
-        let tool_message = ModelMessage::tool("# Agent Kernel", "read_file", call_id);
+        let tool_message = ModelMessage::tool("# Agent Kernel", "read_file", "model-call-001");
 
         let encoded =
             serde_json::to_value((&model_tool_call, &tool_call, &tool_result, &tool_message))
@@ -228,7 +306,9 @@ mod tests {
         );
         assert_eq!(decoded.1.id, decoded.2.call_id);
         match decoded.3 {
-            ModelMessage::Tool { tool_call_id, .. } => assert_eq!(tool_call_id, decoded.2.call_id),
+            ModelMessage::Tool { tool_call_id, .. } => {
+                assert_eq!(tool_call_id.as_str(), "model-call-001");
+            }
             _ => panic!("expected tool result message"),
         }
     }

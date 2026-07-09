@@ -1,11 +1,13 @@
 #![doc = "Provider-neutral model runtime boundary for the Agent Kernel."]
 
 pub mod client;
+pub mod id;
 pub mod stream;
 
 pub use client::{
     ModelMessage, ModelMessageContent, ModelMessageRole, ModelRequest, ModelToolCall, ModelToolSpec,
 };
+pub use id::{ModelRequestId, ModelToolCallId};
 pub use stream::{ModelError, ModelStreamEvent, ModelUsage};
 
 #[cfg(test)]
@@ -18,6 +20,7 @@ mod tests {
         ModelMessage, ModelMessageContent, ModelMessageRole, ModelRequest, ModelToolCall,
         ModelToolSpec,
     };
+    use crate::id::{ModelRequestId, ModelToolCallId};
     use crate::stream::{ModelError, ModelStreamEvent, ModelUsage};
 
     #[test]
@@ -52,7 +55,7 @@ mod tests {
             model: "qoder-coder".to_string(),
             messages: vec![
                 ModelMessage::assistant_tool_calls(vec![ModelToolCall {
-                    id: "call-001".to_string(),
+                    id: ModelToolCallId::new("call-001"),
                     name: "read_file".to_string(),
                     arguments: json!({ "path": "README.md" }),
                 }]),
@@ -99,7 +102,7 @@ mod tests {
                 ModelMessage::system("You are a coding agent."),
                 ModelMessage::user("Read README.md."),
                 ModelMessage::assistant_tool_calls(vec![ModelToolCall {
-                    id: "call-001".to_string(),
+                    id: ModelToolCallId::new("call-001"),
                     name: "read_file".to_string(),
                     arguments: json!({ "path": "README.md" }),
                 }]),
@@ -179,7 +182,7 @@ mod tests {
     fn model_request_keeps_assistant_empty_text_distinct_from_no_text() {
         let no_text =
             serde_json::to_value(ModelMessage::assistant_tool_calls(vec![ModelToolCall {
-                id: "call-001".to_string(),
+                id: ModelToolCallId::new("call-001"),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "README.md" }),
             }]))
@@ -187,7 +190,7 @@ mod tests {
         let empty_text = serde_json::to_value(ModelMessage::assistant_with_tool_calls(
             "",
             vec![ModelToolCall {
-                id: "call-001".to_string(),
+                id: ModelToolCallId::new("call-001"),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "README.md" }),
             }],
@@ -203,7 +206,7 @@ mod tests {
         let message = ModelMessage::assistant_with_tool_calls(
             "I will read the file.",
             vec![ModelToolCall {
-                id: "call-001".to_string(),
+                id: ModelToolCallId::new("call-001"),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "README.md" }),
             }],
@@ -259,7 +262,7 @@ mod tests {
                     "id": "call-001",
                     "name": "read_file",
                     "arguments": { "path": "README.md" },
-                    "provider_only": true
+                    "future_hint": true
                 }
             ]
         });
@@ -275,35 +278,43 @@ mod tests {
     fn model_stream_events_round_trip_representative_payloads() {
         let events = vec![
             ModelStreamEvent::Started {
-                provider_request_id: Some("qoder-request-001".to_string()),
+                request_id: Some(ModelRequestId::new("model-request-001")),
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Started {
-                provider_request_id: None,
+                request_id: None,
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::TextDelta {
                 delta: "I will inspect the file.".to_string(),
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::ToolCallDelta {
-                id: "call-001".to_string(),
+                id: ModelToolCallId::new("call-001"),
                 name: None,
                 arguments_delta: "{\"path\"".to_string(),
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::ToolCall {
-                id: "call-001".to_string(),
+                id: ModelToolCallId::new("call-001"),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "README.md" }),
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Usage {
                 usage: ModelUsage {
                     input_tokens: 120,
                     output_tokens: 32,
                 },
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Completed {
                 finish_reason: Some("stop".to_string()),
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Completed {
                 finish_reason: None,
+                extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Failed {
                 error: ModelError {
@@ -311,6 +322,7 @@ mod tests {
                     message: "provider returned 503".to_string(),
                     retryable: true,
                 },
+                extensions: BTreeMap::new(),
             },
         ];
 
@@ -324,9 +336,10 @@ mod tests {
     #[test]
     fn model_stream_event_serializes_representative_wire_payload() {
         let event = ModelStreamEvent::ToolCall {
-            id: "call-001".to_string(),
+            id: ModelToolCallId::new("call-001"),
             name: "read_file".to_string(),
             arguments: json!({ "path": "README.md" }),
+            extensions: BTreeMap::new(),
         };
 
         let encoded = serde_json::to_value(&event).expect("stream event serializes");
@@ -349,13 +362,13 @@ mod tests {
         let request_with_unknown_field = json!({
             "model": "qoder-coder",
             "messages": [],
-            "provider_only": true
+            "future_hint": true
         });
         let tool_spec_with_unknown_field = json!({
             "name": "read_file",
             "description": "Read a UTF-8 file in the workspace.",
             "input_schema": { "type": "object" },
-            "provider_only": true
+            "future_hint": true
         });
 
         assert!(serde_json::from_value::<ModelRequest>(request_with_unknown_field).is_err());
@@ -363,25 +376,28 @@ mod tests {
     }
 
     #[test]
-    fn model_stream_event_envelopes_tolerate_additive_fields() {
+    fn model_stream_event_envelopes_preserve_additive_fields() {
         let stream_event_with_additive_field = json!({
             "type": "tool_call",
             "id": "call-001",
             "name": "read_file",
             "arguments": { "path": "README.md" },
-            "provider_only": true
+            "future_hint": true
         });
 
         let decoded: ModelStreamEvent =
             serde_json::from_value(stream_event_with_additive_field).expect("event deserializes");
+        let reencoded = serde_json::to_value(&decoded).expect("event serializes");
 
         assert_eq!(
             decoded,
             ModelStreamEvent::ToolCall {
-                id: "call-001".to_string(),
+                id: ModelToolCallId::new("call-001"),
                 name: "read_file".to_string(),
                 arguments: json!({ "path": "README.md" }),
+                extensions: BTreeMap::from([("future_hint".to_string(), json!(true))]),
             }
         );
+        assert_eq!(reencoded["future_hint"], json!(true));
     }
 }

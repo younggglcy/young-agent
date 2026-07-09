@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::id::ModelToolCallId;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRequest {
@@ -37,8 +39,9 @@ pub enum ModelMessage {
         content: Vec<ModelMessageContent>,
         /// Tool definition name used to produce this tool result message.
         name: String,
-        /// Correlates this message to the model-emitted tool call id.
-        tool_call_id: String,
+        /// Correlates this message to the model-emitted tool call id in the
+        /// preceding assistant message.
+        tool_call_id: ModelToolCallId,
     },
 }
 
@@ -87,7 +90,7 @@ impl ModelMessage {
         Self::Tool {
             content: vec![ModelMessageContent::text(content)],
             name: name.into(),
-            tool_call_id: tool_call_id.into(),
+            tool_call_id: ModelToolCallId::new(tool_call_id),
         }
     }
 
@@ -99,7 +102,7 @@ impl ModelMessage {
         Self::Tool {
             content,
             name: name.into(),
-            tool_call_id: tool_call_id.into(),
+            tool_call_id: ModelToolCallId::new(tool_call_id),
         }
     }
 
@@ -157,7 +160,7 @@ impl ModelMessageContent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelToolCall {
-    pub id: String,
+    pub id: ModelToolCallId,
     pub name: String,
     pub arguments: Value,
 }

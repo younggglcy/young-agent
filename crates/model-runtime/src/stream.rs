@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::id::{ModelRequestId, ModelToolCallId};
 
 /// Stream event envelopes are forward-readable for provider adapters and
 /// surfaces. Stable extension data must be modeled explicitly or carried in
@@ -9,35 +13,49 @@ use serde_json::Value;
 pub enum ModelStreamEvent {
     Started {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider_request_id: Option<String>,
+        request_id: Option<ModelRequestId>,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     TextDelta {
         delta: String,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     ToolCallDelta {
-        /// Provider tool-call id. This must match the final ToolCall id and
-        /// the later tool-runtime ToolResult.call_id for the same invocation.
-        id: String,
+        /// Model-emitted tool-call id. This correlates model messages with
+        /// model stream events; the tool runtime owns its own invocation id.
+        id: ModelToolCallId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         arguments_delta: String,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     ToolCall {
-        /// Provider tool-call id. This must match the tool-runtime ToolCall.id
-        /// dispatched by the agent for the same invocation.
-        id: String,
+        /// Model-emitted tool-call id. This correlates model messages with
+        /// model stream events; the tool runtime owns its own invocation id.
+        id: ModelToolCallId,
         name: String,
         arguments: Value,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     Usage {
         usage: ModelUsage,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
     Failed {
         error: ModelError,
+        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
     },
 }
 
