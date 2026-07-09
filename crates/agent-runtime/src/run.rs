@@ -20,8 +20,11 @@ impl RunId {
     }
 }
 
+/// Event envelopes are forward-readable so older surfaces and replay readers can
+/// tolerate additive fields written by newer kernels. Stable semantics still
+/// belong in typed fields, not ad hoc unknown fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     RunStarted {
         run_id: RunId,
@@ -65,7 +68,7 @@ pub enum AgentEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum RunStatus {
     Running,
     AwaitingApproval,
@@ -73,7 +76,7 @@ pub enum RunStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum TerminalRunStatus {
     Completed { final_message: String },
     Failed { error: AgentError },

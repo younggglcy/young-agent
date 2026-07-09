@@ -178,7 +178,7 @@ mod tests {
                 "status": "running"
             }
         });
-        let event_with_unknown_field = json!({
+        let event_with_additive_field = json!({
             "type": "run_finished",
             "run_id": "run-001",
             "status": {
@@ -189,7 +189,7 @@ mod tests {
         });
 
         assert!(serde_json::from_value::<AgentEvent>(impossible_finished_event).is_err());
-        assert!(serde_json::from_value::<AgentEvent>(event_with_unknown_field).is_err());
+        assert!(serde_json::from_value::<AgentEvent>(event_with_additive_field).is_ok());
     }
 
     #[test]

@@ -24,14 +24,17 @@ pub enum ModelMessage {
         content: String,
     },
     Assistant {
-        content: String,
+        /// Optional text emitted by the assistant. A tool-call-only assistant
+        /// message leaves this absent instead of forcing an empty string.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
         /// Tool calls emitted by the assistant message. Provider adapters need
         /// this history when the following Tool messages report results.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ModelToolCall>,
     },
     Tool {
-        content: String,
+        content: Vec<ModelMessageContent>,
         /// Tool definition name used to produce this tool result message.
         name: String,
         /// Correlates this message to the model-emitted tool call id.
@@ -54,7 +57,7 @@ impl ModelMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant {
-            content: content.into(),
+            content: Some(content.into()),
             tool_calls: Vec::new(),
         }
     }
@@ -64,7 +67,14 @@ impl ModelMessage {
         tool_calls: Vec<ModelToolCall>,
     ) -> Self {
         Self::Assistant {
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls,
+        }
+    }
+
+    pub fn assistant_tool_calls(tool_calls: Vec<ModelToolCall>) -> Self {
+        Self::Assistant {
+            content: None,
             tool_calls,
         }
     }
@@ -75,7 +85,19 @@ impl ModelMessage {
         tool_call_id: impl Into<String>,
     ) -> Self {
         Self::Tool {
-            content: content.into(),
+            content: vec![ModelMessageContent::text(content)],
+            name: name.into(),
+            tool_call_id: tool_call_id.into(),
+        }
+    }
+
+    pub fn tool_content(
+        content: Vec<ModelMessageContent>,
+        name: impl Into<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self::Tool {
+            content,
             name: name.into(),
             tool_call_id: tool_call_id.into(),
         }
@@ -90,12 +112,11 @@ impl ModelMessage {
         }
     }
 
-    pub fn content(&self) -> &str {
+    pub fn text_content(&self) -> Option<&str> {
         match self {
-            Self::System { content }
-            | Self::User { content }
-            | Self::Assistant { content, .. }
-            | Self::Tool { content, .. } => content,
+            Self::System { content } | Self::User { content } => Some(content),
+            Self::Assistant { content, .. } => content.as_deref(),
+            Self::Tool { content, .. } => content.iter().find_map(ModelMessageContent::as_text),
         }
     }
 }
@@ -107,6 +128,30 @@ pub enum ModelMessageRole {
     User,
     Assistant,
     Tool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelMessageContent {
+    Text { text: String },
+    Json { value: Value },
+}
+
+impl ModelMessageContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into() }
+    }
+
+    pub fn json(value: Value) -> Self {
+        Self::Json { value }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } => Some(text),
+            Self::Json { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

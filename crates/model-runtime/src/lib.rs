@@ -3,7 +3,9 @@
 pub mod client;
 pub mod stream;
 
-pub use client::{ModelMessage, ModelMessageRole, ModelRequest, ModelToolCall, ModelToolSpec};
+pub use client::{
+    ModelMessage, ModelMessageContent, ModelMessageRole, ModelRequest, ModelToolCall, ModelToolSpec,
+};
 pub use stream::{ModelError, ModelStreamEvent, ModelUsage};
 
 #[cfg(test)]
@@ -13,7 +15,8 @@ mod tests {
     use serde_json::json;
 
     use crate::client::{
-        ModelMessage, ModelMessageRole, ModelRequest, ModelToolCall, ModelToolSpec,
+        ModelMessage, ModelMessageContent, ModelMessageRole, ModelRequest, ModelToolCall,
+        ModelToolSpec,
     };
     use crate::stream::{ModelError, ModelStreamEvent, ModelUsage};
 
@@ -48,21 +51,26 @@ mod tests {
         let request = ModelRequest {
             model: "qoder-coder".to_string(),
             messages: vec![
-                ModelMessage::assistant_with_tool_calls(
-                    "I need to read README.md.",
-                    vec![ModelToolCall {
-                        id: "call-001".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: json!({ "path": "README.md" }),
-                    }],
+                ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+                    id: "call-001".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "README.md" }),
+                }]),
+                ModelMessage::tool_content(
+                    vec![
+                        ModelMessageContent::text("# Agent Kernel"),
+                        ModelMessageContent::json(json!({ "bytes": 14 })),
+                    ],
+                    "read_file",
+                    "call-001",
                 ),
-                ModelMessage::tool("# Agent Kernel", "read_file", "call-001"),
             ],
             tools: Vec::new(),
             metadata: BTreeMap::new(),
         };
 
         let encoded = serde_json::to_value(&request).expect("request serializes");
+        assert!(encoded["messages"][0].get("content").is_none());
         assert_eq!(
             encoded["messages"][0]["tool_calls"][0]["id"],
             json!("call-001")
@@ -76,6 +84,8 @@ mod tests {
             json!({ "path": "README.md" })
         );
         assert_eq!(encoded["messages"][1]["tool_call_id"], json!("call-001"));
+        assert_eq!(encoded["messages"][1]["content"][0]["type"], json!("text"));
+        assert_eq!(encoded["messages"][1]["content"][1]["type"], json!("json"));
 
         let decoded: ModelRequest = serde_json::from_value(encoded).expect("request deserializes");
         assert_eq!(decoded, request);
@@ -88,15 +98,19 @@ mod tests {
             messages: vec![
                 ModelMessage::system("You are a coding agent."),
                 ModelMessage::user("Read README.md."),
-                ModelMessage::assistant_with_tool_calls(
-                    "I will read the file.",
-                    vec![ModelToolCall {
-                        id: "call-001".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: json!({ "path": "README.md" }),
-                    }],
+                ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+                    id: "call-001".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "README.md" }),
+                }]),
+                ModelMessage::tool_content(
+                    vec![
+                        ModelMessageContent::text("# Agent Kernel"),
+                        ModelMessageContent::json(json!({ "ok": true })),
+                    ],
+                    "read_file",
+                    "call-001",
                 ),
-                ModelMessage::tool("# Agent Kernel", "read_file", "call-001"),
             ],
             tools: vec![ModelToolSpec {
                 name: "read_file".to_string(),
@@ -123,7 +137,6 @@ mod tests {
                     },
                     {
                         "role": "assistant",
-                        "content": "I will read the file.",
                         "tool_calls": [
                             {
                                 "id": "call-001",
@@ -134,7 +147,16 @@ mod tests {
                     },
                     {
                         "role": "tool",
-                        "content": "# Agent Kernel",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "# Agent Kernel"
+                            },
+                            {
+                                "type": "json",
+                                "value": { "ok": true }
+                            }
+                        ],
                         "name": "read_file",
                         "tool_call_id": "call-001"
                     }
@@ -154,6 +176,46 @@ mod tests {
     }
 
     #[test]
+    fn model_request_keeps_assistant_empty_text_distinct_from_no_text() {
+        let no_text =
+            serde_json::to_value(ModelMessage::assistant_tool_calls(vec![ModelToolCall {
+                id: "call-001".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            }]))
+            .expect("assistant message serializes");
+        let empty_text = serde_json::to_value(ModelMessage::assistant_with_tool_calls(
+            "",
+            vec![ModelToolCall {
+                id: "call-001".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            }],
+        ))
+        .expect("assistant message serializes");
+
+        assert!(no_text.get("content").is_none());
+        assert_eq!(empty_text["content"], json!(""));
+    }
+
+    #[test]
+    fn model_request_allows_text_assistant_with_tool_calls() {
+        let message = ModelMessage::assistant_with_tool_calls(
+            "I will read the file.",
+            vec![ModelToolCall {
+                id: "call-001".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            }],
+        );
+
+        let encoded = serde_json::to_value(&message).expect("assistant message serializes");
+
+        assert_eq!(encoded["content"], json!("I will read the file."));
+        assert_eq!(encoded["tool_calls"][0]["id"], json!("call-001"));
+    }
+
+    #[test]
     fn model_message_role_controls_allowed_wire_fields() {
         let user_message =
             serde_json::to_value(ModelMessage::user("hello")).expect("message serializes");
@@ -168,6 +230,8 @@ mod tests {
         ))
         .expect("message serializes");
         assert_eq!(tool_message["role"], json!("tool"));
+        assert_eq!(tool_message["content"][0]["type"], json!("text"));
+        assert_eq!(tool_message["content"][0]["text"], json!("# Agent Kernel"));
         assert_eq!(tool_message["name"], json!("read_file"));
         assert_eq!(tool_message["tool_call_id"], json!("call-001"));
 
@@ -179,7 +243,12 @@ mod tests {
         });
         let missing_tool_call_id = json!({
             "role": "tool",
-            "content": "# Agent Kernel",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "# Agent Kernel"
+                }
+            ],
             "name": "read_file"
         });
         let assistant_with_unknown_tool_call_field = json!({
@@ -276,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn model_contracts_reject_unknown_wire_fields() {
+    fn model_contracts_keep_precise_shapes_strict() {
         let request_with_unknown_field = json!({
             "model": "qoder-coder",
             "messages": [],
@@ -288,7 +357,14 @@ mod tests {
             "input_schema": { "type": "object" },
             "provider_only": true
         });
-        let stream_event_with_unknown_field = json!({
+
+        assert!(serde_json::from_value::<ModelRequest>(request_with_unknown_field).is_err());
+        assert!(serde_json::from_value::<ModelToolSpec>(tool_spec_with_unknown_field).is_err());
+    }
+
+    #[test]
+    fn model_stream_event_envelopes_tolerate_additive_fields() {
+        let stream_event_with_additive_field = json!({
             "type": "tool_call",
             "id": "call-001",
             "name": "read_file",
@@ -296,10 +372,16 @@ mod tests {
             "provider_only": true
         });
 
-        assert!(serde_json::from_value::<ModelRequest>(request_with_unknown_field).is_err());
-        assert!(serde_json::from_value::<ModelToolSpec>(tool_spec_with_unknown_field).is_err());
-        assert!(
-            serde_json::from_value::<ModelStreamEvent>(stream_event_with_unknown_field).is_err()
+        let decoded: ModelStreamEvent =
+            serde_json::from_value(stream_event_with_additive_field).expect("event deserializes");
+
+        assert_eq!(
+            decoded,
+            ModelStreamEvent::ToolCall {
+                id: "call-001".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            }
         );
     }
 }

@@ -21,8 +21,10 @@ pub struct ToolResult {
     pub output: ToolOutput,
 }
 
+/// Output envelopes are forward-readable so older consumers can tolerate
+/// additive fields. Durable producer data belongs in Success.metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum ToolOutput {
     Success {
         content: Vec<ToolContent>,

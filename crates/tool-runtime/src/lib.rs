@@ -217,6 +217,36 @@ mod tests {
     }
 
     #[test]
+    fn tool_output_envelopes_tolerate_additive_fields() {
+        let output_with_additive_field = json!({
+            "status": "success",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "# Agent Kernel"
+                }
+            ],
+            "metadata": {
+                "bytes": 14
+            },
+            "producer_hint": "display_as_markdown"
+        });
+
+        let decoded: ToolOutput =
+            serde_json::from_value(output_with_additive_field).expect("output deserializes");
+
+        assert_eq!(
+            decoded,
+            ToolOutput::Success {
+                content: vec![ToolContent::Text {
+                    text: "# Agent Kernel".to_string(),
+                }],
+                metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
+            }
+        );
+    }
+
+    #[test]
     fn empty_tool_metadata_is_omitted_from_success_output() {
         let output = ToolOutput::Success {
             content: vec![ToolContent::Json {
