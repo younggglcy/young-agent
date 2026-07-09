@@ -15,6 +15,12 @@ The workspace contains kernel crates, one built-in capability crate, and one pro
 | `young-capability-coding` | Built-in Coding Capability boundary. |
 | `young-cli-proof-surface` | Rust CLI Proof Surface scaffold. |
 
+## Docs
+
+- [`CONTEXT.md`](CONTEXT.md): shared vocabulary for the Agent Kernel.
+- [`docs/courses/`](docs/courses/): human-readable courses that trace how we build the agent from zero to one.
+- [`docs/lessons/`](docs/lessons/): durable standalone lessons learned during implementation.
+
 ## Validate
 
 ```sh

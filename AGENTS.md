@@ -10,8 +10,11 @@ Repo-local instructions for coding agents working on `young-agent`.
   tool runtime, event store, capability packs, and surfaces should stay distinct.
 - Prefer small, reviewable changes with concrete validation over broad rewrites.
 - Put durable project knowledge in the right place: ADRs in `docs/adr/`, plans in
-  `docs/prd/` or `docs/issues/`, research in `docs/research/`, and lessons in
-  `docs/lessons/`.
+  `docs/prd/` or `docs/issues/`, research in `docs/research/`, courses in
+  `docs/courses/`, and lessons in `docs/lessons/`.
+- Maintain `docs/courses/` for teaching and learning narratives that trace how
+  we build our own agent from zero to one. Keep it human-readable, sequential,
+  and grounded in real project artifacts.
 - Maintain `docs/lessons/` incrementally. Write for human readers first, link new
   entries from `docs/lessons/README.md`, and update older lessons when later work
   changes the conclusion.
