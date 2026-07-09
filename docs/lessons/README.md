@@ -1,39 +1,37 @@
-# Lessons
+# 经验沉淀
 
-`docs/lessons/` captures what we learn while building `young-agent` from zero to
-one.
+`docs/lessons/` 用来沉淀从零到一构建 `young-agent` 过程中学到的可复用经验。
 
-This directory is for durable lessons, not scratch notes. Write for a human
-reader first. Agents should maintain it gradually as work reveals reusable
-knowledge.
+这个目录放长期有价值的经验，不放临时草稿。写作时优先面向后续阅读的人；
+当工作暴露出可复用知识时，agent 应该逐步维护这里。
 
-## Maintenance
+## 维护方式
 
-- Add a short lesson when a decision, debugging path, interface shape, workflow,
-  or mistake will help future work.
-- Prefer concrete context, the lesson, and what to do next time.
-- Keep entries small; split a note when it starts covering multiple lessons.
-- Link new entries from the index below.
-- Revisit older lessons when later evidence changes them.
+- 当某个决策、排障路径、接口形态、工作流或错误能帮助未来工作时，
+  新增一篇短 lesson。
+- 优先写清具体上下文、经验结论，以及下次应该怎么做。
+- 保持条目短小；如果一篇开始覆盖多个经验，就拆开。
+- 新条目需要加到下面的索引。
+- 如果后续证据改变了旧经验，回头更新旧条目。
 
-## Suggested Shape
+## 建议结构
 
 ```md
-# Lesson title
+# 经验标题
 
-## Context
+## 背景
 
-What happened, and why it mattered.
+发生了什么，以及为什么重要。
 
-## Lesson
+## 经验
 
-The durable takeaway.
+可以长期复用的结论。
 
-## Next Time
+## 下次怎么做
 
-What an agent or human should do differently.
+agent 或人下次应该怎么做。
 ```
 
-## Index
+## 索引
 
-No lesson entries yet.
+- [Contract Review 先收紧 Wire Shape](contract-review-wire-shape.md)
