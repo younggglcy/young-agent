@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="1540" viewBox="0 0 1540 1540" role="img" aria-labelledby="title desc">
+  <title id="title">Agent = Model + Harness architecture</title>
+  <desc id="desc">Architecture diagram showing the model outside the harness and the Agent Kernel Harness layers: surfaces, runtime, model runtime, tool runtime, policy, capability packs, event log, and validation harness.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font: 700 34px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 20px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .h { font: 700 22px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .b { font: 17px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .small { font: 15px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #374151; }
+      .box { stroke-width: 2.2; rx: 14; ry: 14; }
+      .arrow { stroke: #334155; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .arrow2 { stroke: #7c2d12; stroke-width: 2.4; fill: none; marker-start: url(#arrow); marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1540" height="1050" fill="#ffffff"/>
+  <text x="80" y="66" class="title">Agent = Model + Harness</text>
+  <text x="82" y="107" class="subtitle">我们构建的是 Model 之外的 Harness：运行、工具、策略、事件、回放、验证和 Surface。</text>
+
+  <rect x="70" y="185" width="260" height="370" class="box" stroke="#334155" fill="#e0f2fe"/>
+  <text x="95" y="230" class="h">Surfaces</text>
+  <text x="95" y="270" class="b">CLI Proof Surface</text>
+  <text x="95" y="302" class="b">未来 Desktop / IDE / Web</text>
+  <text x="95" y="344" class="small">展示 Agent Events</text>
+  <text x="95" y="372" class="small">处理 approval 输入</text>
+  <text x="95" y="400" class="small">不承载 Kernel 语义</text>
+
+  <rect x="405" y="150" width="650" height="650" class="box" stroke="#14532d" fill="#dcfce7"/>
+  <text x="435" y="197" class="h">Agent Kernel Harness</text>
+
+  <rect x="445" y="230" width="260" height="105" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="465" y="260" class="h">Agent Runtime</text>
+  <text x="465" y="291" class="small">Run / Turn loop</text>
+  <text x="465" y="317" class="small">Tool-call orchestration</text>
+
+  <rect x="760" y="230" width="250" height="105" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="780" y="260" class="h">Model Runtime</text>
+  <text x="780" y="291" class="small">ModelRequest</text>
+  <text x="780" y="317" class="small">ModelStreamEvent</text>
+
+  <rect x="540" y="380" width="380" height="90" class="box" stroke="#166534" fill="#bbf7d0"/>
+  <text x="620" y="415" class="h">Canonical Agent Events</text>
+  <text x="600" y="445" class="small">surface display + event log source</text>
+
+  <rect x="445" y="515" width="260" height="105" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="465" y="545" class="h">Tool Runtime</text>
+  <text x="465" y="576" class="small">ToolDefinition</text>
+  <text x="465" y="602" class="small">ToolCall / ToolResult</text>
+
+  <rect x="760" y="515" width="250" height="105" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="780" y="545" class="h">Policy &amp; Safety</text>
+  <text x="780" y="576" class="small">workspace boundary</text>
+  <text x="780" y="602" class="small">command approval</text>
+
+  <rect x="540" y="665" width="380" height="90" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="590" y="700" class="h">Capability Manifest Loader</text>
+  <text x="590" y="730" class="small">TOML built-ins, MCP boundary reserved</text>
+
+  <rect x="1140" y="215" width="330" height="220" class="box" stroke="#7c2d12" fill="#ffedd5"/>
+  <text x="1165" y="260" class="h">Model Providers</text>
+  <text x="1165" y="300" class="b">Qoder first</text>
+  <text x="1165" y="332" class="b">DeepSeek / Codex later</text>
+  <text x="1165" y="374" class="small">只负责 inference</text>
+  <text x="1165" y="402" class="small">不拥有 Harness 状态</text>
+
+  <rect x="95" y="805" width="360" height="180" class="box" stroke="#581c87" fill="#f3e8ff"/>
+  <text x="120" y="850" class="h">Coding Capability Pack</text>
+  <text x="120" y="892" class="b">read / search / patch / command</text>
+  <text x="120" y="930" class="small">built-in first, user packs later</text>
+
+  <rect x="565" y="850" width="330" height="135" class="box" stroke="#075985" fill="#e0f2fe"/>
+  <text x="608" y="890" class="h">Canonical JSONL Event Log</text>
+  <text x="640" y="922" class="small">append / read / replay</text>
+  <text x="642" y="950" class="small">future adapters later</text>
+
+  <rect x="1065" y="760" width="400" height="225" class="box" stroke="#92400e" fill="#fef3c7"/>
+  <text x="1090" y="805" class="h">Validation Harness</text>
+  <text x="1090" y="845" class="b">FakeModelClient + fake tools</text>
+  <text x="1090" y="878" class="small">workspace / approval tests</text>
+  <text x="1090" y="906" class="small">replay tests</text>
+  <text x="1090" y="934" class="small">Qoder smoke when configured</text>
+
+  <path d="M 335 360 L 395 360" class="arrow"/>
+  <path d="M 1058 295 L 1133 295" class="arrow2" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+  <path d="M 540 710 L 405 800" class="arrow"/>
+  <path d="M 730 475 L 730 840" class="arrow"/>
+  <path d="M 1065 865 L 895 730" class="arrow"/>
+
+  <text x="348" y="342" class="small">goal / approvals</text>
+  <text x="1074" y="276" class="small">request / stream</text>
+  <text x="420" y="765" class="small">tools from capability</text>
+  <text x="742" y="645" class="small">append events</text>
+  <text x="910" y="820" class="small">prove behavior</text>
+</svg>

@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1540" height="1400" viewBox="0 0 1540 1400" role="img" aria-labelledby="title desc">
+  <title id="title">Long-term growable agent architecture</title>
+  <desc id="desc">Long-term architecture diagram for a growable, general-purpose, complex problem-solving agent built on top of the Agent Kernel.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#166534"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b21a8"/>
+    </marker>
+    <style>
+      .title { font: 700 36px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 20px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .h { font: 700 22px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .h2 { font: 700 18px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .b { font: 16px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #1f2937; }
+      .small { font: 14px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #374151; }
+      .box { stroke-width: 2.2; rx: 14; ry: 14; }
+      .corebox { stroke-width: 3; rx: 18; ry: 18; }
+      .arrow { stroke: #334155; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .arrow2 { stroke: #166534; stroke-width: 2.4; fill: none; marker-end: url(#arrow-green); }
+      .arrow3 { stroke: #6b21a8; stroke-width: 2.4; fill: none; marker-end: url(#arrow-purple); }
+      .dash { stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+
+  <rect width="1540" height="1400" fill="#ffffff"/>
+  <g transform="scale(0.85)">
+  <text x="90" y="76" class="title">长期形态：Growable General-purpose Problem-solving Agent</text>
+  <text x="92" y="116" class="subtitle">不是把所有能力一次塞进 core，而是用 Agent Kernel 做稳定腰部，让能力、记忆、验证和复杂任务编排逐步长出来。</text>
+
+  <rect x="70" y="185" width="270" height="245" class="box" stroke="#334155" fill="#e0f2fe"/>
+  <text x="100" y="230" class="h">User &amp; Surfaces</text>
+  <text x="100" y="270" class="b">CLI / Desktop / IDE / Web</text>
+  <text x="100" y="302" class="b">Messaging / API Gateway</text>
+  <text x="100" y="342" class="small">goal input, review, approval</text>
+  <text x="100" y="370" class="small">observe events and artifacts</text>
+  <text x="100" y="398" class="small">thin host, not the brain</text>
+
+  <rect x="430" y="170" width="800" height="1035" class="corebox" stroke="#14532d" fill="#dcfce7"/>
+  <text x="470" y="218" class="h">Agent Platform Core</text>
+  <text x="470" y="248" class="small">stable contracts first; capability and product layers grow around them</text>
+
+  <rect x="475" y="290" width="710" height="150" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="505" y="326" class="h">Product Orchestration Layer</text>
+  <text x="505" y="363" class="b">session / conversation / project context</text>
+  <text x="505" y="392" class="b">goal manager, budget, interrupt, checkpoint, resume</text>
+  <text x="505" y="421" class="small">turns user intent into durable agent runs</text>
+
+  <rect x="475" y="490" width="710" height="235" class="box" stroke="#14532d" fill="#bbf7d0"/>
+  <text x="505" y="528" class="h">Agent Kernel: Narrow Waist</text>
+  <text x="505" y="565" class="b">Agent Runtime: loop, state machine, tool-call orchestration</text>
+  <text x="505" y="594" class="b">Model Runtime: provider-neutral request / stream events</text>
+  <text x="505" y="623" class="b">Tool Runtime: definitions, execution, result normalization</text>
+  <text x="505" y="652" class="b">Policy &amp; Safety: workspace boundary, approval, audit</text>
+  <text x="505" y="681" class="small">owns canonical contracts, not product-specific workflows</text>
+
+  <rect x="475" y="775" width="710" height="185" class="box" stroke="#166534" fill="#f0fdf4"/>
+  <text x="505" y="812" class="h">Capability &amp; Extension Plane</text>
+  <text x="505" y="849" class="b">Coding, browser, docs, office, data, ops, research...</text>
+  <text x="505" y="878" class="b">MCP / connectors / plugins / built-in capability packs</text>
+  <text x="505" y="907" class="small">tools are contracts with policy, errors, evals, and docs</text>
+  <text x="505" y="936" class="small">new capability should avoid widening the Kernel unless unavoidable</text>
+
+  <rect x="475" y="1010" width="710" height="145" class="box" stroke="#075985" fill="#e0f2fe"/>
+  <text x="505" y="1048" class="h">Durable Trace &amp; State Substrate</text>
+  <text x="505" y="1085" class="b">canonical event log, replay, state DB, artifact store</text>
+  <text x="505" y="1114" class="b">session search, compaction metadata, run lineage</text>
+  <text x="505" y="1143" class="small">debuggability and growth depend on durable history</text>
+
+  <rect x="1300" y="195" width="390" height="230" class="box" stroke="#7c2d12" fill="#ffedd5"/>
+  <text x="1330" y="240" class="h">Model Providers</text>
+  <text x="1330" y="280" class="b">Qoder / DeepSeek / Codex / future providers</text>
+  <text x="1330" y="320" class="small">inference, streaming, usage, capabilities</text>
+  <text x="1330" y="348" class="small">adapter-specific quirks stay outside the loop</text>
+  <text x="1330" y="388" class="small">Model is powerful, but not the agent</text>
+
+  <rect x="70" y="515" width="295" height="345" class="box" stroke="#6b21a8" fill="#f3e8ff"/>
+  <text x="100" y="560" class="h">Growth Loop</text>
+  <text x="100" y="600" class="b">experience store</text>
+  <text x="100" y="630" class="b">memory / user model / project model</text>
+  <text x="100" y="660" class="b">skills and lessons</text>
+  <text x="100" y="690" class="b">evals and regression suites</text>
+  <text x="100" y="730" class="small">post-run reflection</text>
+  <text x="100" y="758" class="small">human feedback</text>
+  <text x="100" y="786" class="small">promote learning only when verified</text>
+  <text x="100" y="824" class="small">能成长，不等于每次都自改 core</text>
+
+  <rect x="1300" y="500" width="410" height="360" class="box" stroke="#92400e" fill="#fef3c7"/>
+  <text x="1330" y="545" class="h">Complex Problem Solving</text>
+  <text x="1330" y="585" class="b">planner / task graph / dependency tracking</text>
+  <text x="1330" y="615" class="b">context gathering and compression</text>
+  <text x="1330" y="645" class="b">delegation / subagents when useful</text>
+  <text x="1330" y="675" class="b">scheduler / background jobs / monitors</text>
+  <text x="1330" y="715" class="small">start single-agent; add orchestration behind contracts</text>
+  <text x="1330" y="743" class="small">parent sees summaries, artifacts, and events</text>
+  <text x="1330" y="771" class="small">avoid unbounded recursive autonomy</text>
+  <text x="1330" y="812" class="small">解决复杂问题靠可恢复执行和验证闭环</text>
+
+  <rect x="1255" y="945" width="455" height="240" class="box" stroke="#0f766e" fill="#ccfbf1"/>
+  <text x="1285" y="990" class="h">Execution Environments</text>
+  <text x="1285" y="1030" class="b">local workspace / git worktree</text>
+  <text x="1285" y="1060" class="b">terminal / browser / IDE / filesystem</text>
+  <text x="1285" y="1090" class="b">remote sandbox later</text>
+  <text x="1285" y="1130" class="small">side effects happen here, guarded by policy</text>
+  <text x="1285" y="1158" class="small">tools adapt environments into stable contracts</text>
+
+  <rect x="70" y="950" width="295" height="235" class="box" stroke="#be123c" fill="#ffe4e6"/>
+  <text x="100" y="995" class="h">Trust Boundary</text>
+  <text x="100" y="1035" class="b">permissions and approvals</text>
+  <text x="100" y="1065" class="b">secret handling</text>
+  <text x="100" y="1095" class="b">audit trail</text>
+  <text x="100" y="1125" class="b">policy versioning</text>
+  <text x="100" y="1163" class="small">growth cannot bypass safety</text>
+
+  <path d="M 340 315 L 430 365" class="arrow"/>
+  <path d="M 1185 600 L 1275 600" class="arrow"/>
+  <path d="M 1185 855 L 1265 1050" class="arrow"/>
+  <path d="M 1185 570 L 1300 310" class="arrow"/>
+  <path d="M 1300 335 L 1185 585" class="arrow"/>
+  <path d="M 365 680 L 475 850" class="arrow3"/>
+  <path d="M 835 1155 C 770 1265 310 1265 220 860" class="arrow3 dash"/>
+  <path d="M 220 950 C 250 880 340 775 475 665" class="arrow"/>
+  <path d="M 830 440 L 830 490" class="arrow2"/>
+  <path d="M 830 725 L 830 775" class="arrow2"/>
+  <path d="M 830 960 L 830 1010" class="arrow2"/>
+
+  <text x="360" y="342" class="small">goals / review</text>
+  <text x="1210" y="575" class="small">task graph</text>
+  <text x="1215" y="1018" class="small">tool side effects</text>
+  <text x="1210" y="292" class="small">request</text>
+  <text x="1205" y="402" class="small">stream</text>
+  <text x="385" y="765" class="small">verified learning</text>
+  <text x="420" y="1254" class="small">logs + outcomes feed growth</text>
+
+  <rect x="92" y="1270" width="1605" height="70" class="box" stroke="#9ca3af" fill="#f9fafb"/>
+  <text x="120" y="1314" class="b">设计原则：Kernel 是稳定窄腰；能力在 extension plane 增长；复杂任务通过可恢复 task graph 和验证闭环解决；记忆和技能必须来自可审计历史。</text>
+  </g>
+</svg>
