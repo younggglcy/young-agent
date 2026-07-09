@@ -232,7 +232,9 @@ mod tests {
             "metadata": {
                 "bytes": 14
             },
-            "producer_hint": "display_as_markdown"
+            "extensions": {
+                "producer_hint": "display_as_markdown"
+            }
         });
 
         let decoded: ToolOutput =
@@ -252,7 +254,10 @@ mod tests {
                 )]),
             }
         );
-        assert_eq!(reencoded["producer_hint"], json!("display_as_markdown"));
+        assert_eq!(
+            reencoded["extensions"]["producer_hint"],
+            json!("display_as_markdown")
+        );
     }
 
     #[test]

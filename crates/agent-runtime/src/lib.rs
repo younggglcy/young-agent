@@ -73,6 +73,7 @@ mod tests {
             AgentEvent::ToolCallRequested {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
+                model_tool_call_id: ModelToolCallId::new("model-call-001"),
                 call: call.clone(),
                 extensions: BTreeMap::new(),
             },
@@ -112,6 +113,147 @@ mod tests {
             serde_json::from_str(&encoded).expect("agent events deserialize");
 
         assert_eq!(decoded, events);
+    }
+
+    #[test]
+    fn agent_events_serialize_representative_turn_wire_payload() {
+        let run_id = RunId::new("run-001");
+        let turn_id = TurnId::new("turn-001");
+        let model_call_id = ModelToolCallId::new("model-call-001");
+        let tool_call_id = ToolCallId::new("tool-call-001");
+        let tool_call = ToolCall {
+            id: tool_call_id.clone(),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        };
+
+        let events = vec![
+            AgentEvent::RunStarted {
+                run_id: run_id.clone(),
+                extensions: BTreeMap::new(),
+            },
+            AgentEvent::TurnStarted {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                extensions: BTreeMap::new(),
+            },
+            AgentEvent::ModelOutput {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                event: ModelStreamEvent::ToolCall {
+                    id: model_call_id.clone(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "README.md" }),
+                    extensions: BTreeMap::new(),
+                },
+                extensions: BTreeMap::new(),
+            },
+            AgentEvent::ToolCallRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                model_tool_call_id: model_call_id,
+                call: tool_call.clone(),
+                extensions: BTreeMap::new(),
+            },
+            AgentEvent::ApprovalRequested {
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                request: ApprovalRequest {
+                    id: "approval-001".to_string(),
+                    call: tool_call.clone(),
+                    reason: "command may read workspace files".to_string(),
+                },
+                extensions: BTreeMap::new(),
+            },
+            AgentEvent::ToolResult {
+                run_id,
+                turn_id,
+                result: ToolResult {
+                    call_id: tool_call_id,
+                    output: ToolOutput::Success {
+                        content: vec![ToolContent::Text {
+                            text: "# Agent Kernel".to_string(),
+                        }],
+                        metadata: BTreeMap::new(),
+                        extensions: BTreeMap::from([("display".to_string(), json!("markdown"))]),
+                    },
+                },
+                extensions: BTreeMap::new(),
+            },
+        ];
+
+        let encoded = serde_json::to_value(&events).expect("events serialize");
+
+        assert_eq!(
+            encoded,
+            json!([
+                {
+                    "type": "run_started",
+                    "run_id": "run-001"
+                },
+                {
+                    "type": "turn_started",
+                    "run_id": "run-001",
+                    "turn_id": "turn-001"
+                },
+                {
+                    "type": "model_output",
+                    "run_id": "run-001",
+                    "turn_id": "turn-001",
+                    "event": {
+                        "type": "tool_call",
+                        "id": "model-call-001",
+                        "name": "read_file",
+                        "arguments": { "path": "README.md" }
+                    }
+                },
+                {
+                    "type": "tool_call_requested",
+                    "run_id": "run-001",
+                    "turn_id": "turn-001",
+                    "model_tool_call_id": "model-call-001",
+                    "call": {
+                        "id": "tool-call-001",
+                        "tool_name": "read_file",
+                        "arguments": { "path": "README.md" }
+                    }
+                },
+                {
+                    "type": "approval_requested",
+                    "run_id": "run-001",
+                    "turn_id": "turn-001",
+                    "request": {
+                        "id": "approval-001",
+                        "call": {
+                            "id": "tool-call-001",
+                            "tool_name": "read_file",
+                            "arguments": { "path": "README.md" }
+                        },
+                        "reason": "command may read workspace files"
+                    }
+                },
+                {
+                    "type": "tool_result",
+                    "run_id": "run-001",
+                    "turn_id": "turn-001",
+                    "result": {
+                        "call_id": "tool-call-001",
+                        "output": {
+                            "status": "success",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "# Agent Kernel"
+                                }
+                            ],
+                            "extensions": {
+                                "display": "markdown"
+                            }
+                        }
+                    }
+                }
+            ])
+        );
     }
 
     #[test]
@@ -235,7 +377,9 @@ mod tests {
                 "status": "completed",
                 "final_message": "Done"
             },
-            "future_hint": true
+            "extensions": {
+                "future_hint": true
+            }
         });
 
         assert!(serde_json::from_value::<AgentEvent>(impossible_finished_event).is_err());
@@ -263,8 +407,8 @@ mod tests {
             serde_json::from_value(encoded.clone()).expect("event deserializes");
         let reencoded = serde_json::to_value(&decoded).expect("event serializes");
 
-        assert_eq!(encoded["future_hint"], json!("preserve"));
-        assert_eq!(reencoded["future_hint"], json!("preserve"));
+        assert_eq!(encoded["extensions"]["future_hint"], json!("preserve"));
+        assert_eq!(reencoded["extensions"]["future_hint"], json!("preserve"));
     }
 
     #[test]

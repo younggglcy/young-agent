@@ -9,17 +9,17 @@ use crate::id::{ModelRequestId, ModelToolCallId};
 /// surfaces. Stable extension data must be modeled explicitly or carried in
 /// metadata-bearing payloads, not inferred from ignored additive fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelStreamEvent {
     Started {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<ModelRequestId>,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     TextDelta {
         delta: String,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     ToolCallDelta {
@@ -29,7 +29,7 @@ pub enum ModelStreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         arguments_delta: String,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     ToolCall {
@@ -38,23 +38,23 @@ pub enum ModelStreamEvent {
         id: ModelToolCallId,
         name: String,
         arguments: Value,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     Usage {
         usage: ModelUsage,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish_reason: Option<String>,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     Failed {
         error: ModelError,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
 }

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use young_model_runtime::stream::ModelStreamEvent;
+use young_model_runtime::{stream::ModelStreamEvent, ModelToolCallId};
 use young_tool_runtime::execution::{ToolCall, ToolResult};
 
 use crate::turn::TurnId;
@@ -27,45 +27,48 @@ impl RunId {
 /// tolerate additive fields written by newer kernels. Stable semantics still
 /// belong in typed fields, not ad hoc unknown fields.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentEvent {
     RunStarted {
         run_id: RunId,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     TurnStarted {
         run_id: RunId,
         turn_id: TurnId,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     ModelOutput {
         run_id: RunId,
         turn_id: TurnId,
         event: ModelStreamEvent,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     ToolCallRequested {
         run_id: RunId,
         turn_id: TurnId,
+        /// Bridges the model-emitted tool call to the kernel-owned tool
+        /// invocation id carried by `call.id`.
+        model_tool_call_id: ModelToolCallId,
         call: ToolCall,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     ApprovalRequested {
         run_id: RunId,
         turn_id: TurnId,
         request: ApprovalRequest,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     ToolResult {
         run_id: RunId,
         turn_id: TurnId,
         result: ToolResult,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     Error {
@@ -73,7 +76,7 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
         error: AgentError,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     /// The final event for a run. Terminal outcomes, including interruption and
@@ -81,7 +84,7 @@ pub enum AgentEvent {
     RunFinished {
         run_id: RunId,
         status: TerminalRunStatus,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
 }

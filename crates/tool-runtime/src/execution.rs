@@ -37,7 +37,7 @@ pub struct ToolResult {
 /// Output envelopes are forward-readable so older consumers can tolerate
 /// additive fields. Durable producer data belongs in Success.metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolOutput {
     Success {
         content: Vec<ToolContent>,
@@ -45,12 +45,12 @@ pub enum ToolOutput {
         /// Core tool semantics must not depend on producer-specific keys.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         metadata: BTreeMap<String, Value>,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     Failure {
         error: ToolError,
-        #[serde(default, flatten, skip_serializing_if = "BTreeMap::is_empty")]
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
 }

@@ -382,7 +382,9 @@ mod tests {
             "id": "call-001",
             "name": "read_file",
             "arguments": { "path": "README.md" },
-            "future_hint": true
+            "extensions": {
+                "future_hint": true
+            }
         });
 
         let decoded: ModelStreamEvent =
@@ -398,6 +400,6 @@ mod tests {
                 extensions: BTreeMap::from([("future_hint".to_string(), json!(true))]),
             }
         );
-        assert_eq!(reencoded["future_hint"], json!(true));
+        assert_eq!(reencoded["extensions"]["future_hint"], json!(true));
     }
 }
