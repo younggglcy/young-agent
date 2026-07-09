@@ -53,6 +53,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_definition_serializes_representative_wire_payload() {
+        let definition = ToolDefinition {
+            name: "run_command".to_string(),
+            description: "Run a command in the workspace.".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            capability: CapabilityRef {
+                id: "coding".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            approval_policy: ToolApprovalPolicy::RequiresApproval {
+                reason: "command may mutate the workspace".to_string(),
+            },
+            mcp: Some(McpCompatibility {
+                server: "builtin-coding".to_string(),
+                tool_name: "run_command".to_string(),
+                protocol_version: "reserved".to_string(),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&definition).expect("definition serializes");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "name": "run_command",
+                "description": "Run a command in the workspace.",
+                "input_schema": { "type": "object" },
+                "capability": {
+                    "id": "coding",
+                    "version": "0.1.0"
+                },
+                "approval_policy": {
+                    "policy": "requires_approval",
+                    "reason": "command may mutate the workspace"
+                },
+                "mcp": {
+                    "server": "builtin-coding",
+                    "tool_name": "run_command",
+                    "protocol_version": "reserved"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn tool_call_result_and_error_round_trip() {
         let call = ToolCall {
             id: "call-001".to_string(),
@@ -85,6 +131,89 @@ mod tests {
             serde_json::from_value(encoded).expect("payloads deserialize");
 
         assert_eq!(decoded, (call, success, failure));
+    }
+
+    #[test]
+    fn tool_result_serializes_representative_wire_payload() {
+        let result = ToolResult {
+            call_id: "call-001".to_string(),
+            output: ToolOutput::Success {
+                content: vec![
+                    ToolContent::Text {
+                        text: "# Agent Kernel".to_string(),
+                    },
+                    ToolContent::Json {
+                        value: json!({ "ok": true }),
+                    },
+                ],
+                metadata: BTreeMap::from([("bytes".to_string(), json!(14))]),
+            },
+        };
+
+        let encoded = serde_json::to_value(&result).expect("result serializes");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "call_id": "call-001",
+                "output": {
+                    "status": "success",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "# Agent Kernel"
+                        },
+                        {
+                            "type": "json",
+                            "value": { "ok": true }
+                        }
+                    ],
+                    "metadata": {
+                        "bytes": 14
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn tool_contracts_reject_unknown_wire_fields() {
+        let call_with_unknown_field = json!({
+            "id": "call-001",
+            "tool_name": "read_file",
+            "arguments": { "path": "README.md" },
+            "provider_only": true
+        });
+        let result_with_unknown_field = json!({
+            "call_id": "call-001",
+            "output": {
+                "status": "success",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "# Agent Kernel",
+                        "mime_type": "text/markdown"
+                    }
+                ]
+            }
+        });
+        let definition_with_unknown_field = json!({
+            "name": "read_file",
+            "description": "Read a UTF-8 file inside the workspace boundary.",
+            "input_schema": { "type": "object" },
+            "capability": {
+                "id": "coding",
+                "version": "0.1.0"
+            },
+            "approval_policy": {
+                "policy": "always_allow"
+            },
+            "x-provider": true
+        });
+
+        assert!(serde_json::from_value::<ToolCall>(call_with_unknown_field).is_err());
+        assert!(serde_json::from_value::<ToolResult>(result_with_unknown_field).is_err());
+        assert!(serde_json::from_value::<ToolDefinition>(definition_with_unknown_field).is_err());
     }
 
     #[test]

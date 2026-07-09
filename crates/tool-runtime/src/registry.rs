@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -21,13 +22,14 @@ pub struct ToolDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityRef {
     pub id: String,
     pub version: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "policy", rename_all = "snake_case")]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolApprovalPolicy {
     AlwaysAllow,
     RequiresApproval { reason: String },
@@ -35,6 +37,7 @@ pub enum ToolApprovalPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpCompatibility {
     pub server: String,
     pub tool_name: String,

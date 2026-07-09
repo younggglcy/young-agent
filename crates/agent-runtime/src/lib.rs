@@ -3,7 +3,7 @@
 pub mod run;
 pub mod turn;
 
-pub use run::{AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus};
+pub use run::{AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus};
 pub use turn::TurnId;
 
 #[cfg(test)]
@@ -15,7 +15,9 @@ mod tests {
     use young_model_runtime::stream::{ModelStreamEvent, ModelUsage};
     use young_tool_runtime::execution::{ToolCall, ToolContent, ToolOutput, ToolResult};
 
-    use crate::run::{AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus};
+    use crate::run::{
+        AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
+    };
     use crate::turn::TurnId;
 
     #[test]
@@ -86,7 +88,7 @@ mod tests {
             },
             AgentEvent::RunFinished {
                 run_id: run_id.clone(),
-                status: RunStatus::Completed {
+                status: TerminalRunStatus::Completed {
                     final_message: "Done".to_string(),
                 },
             },
@@ -104,21 +106,10 @@ mod tests {
         let statuses = vec![
             RunStatus::Running,
             RunStatus::AwaitingApproval,
-            RunStatus::Completed {
-                final_message: "Done".to_string(),
-            },
-            RunStatus::Failed {
-                error: AgentError {
-                    code: "model_failed".to_string(),
-                    message: "model stream ended with an error".to_string(),
-                    recoverable: false,
+            RunStatus::Finished {
+                terminal_status: TerminalRunStatus::Completed {
+                    final_message: "Done".to_string(),
                 },
-            },
-            RunStatus::Interrupted {
-                reason: "user paused the run".to_string(),
-            },
-            RunStatus::Cancelled {
-                reason: "user cancelled the run".to_string(),
             },
         ];
 
@@ -127,6 +118,78 @@ mod tests {
             serde_json::from_value(encoded).expect("statuses deserialize");
 
         assert_eq!(decoded, statuses);
+    }
+
+    #[test]
+    fn terminal_run_status_variants_round_trip_with_final_reasons() {
+        let statuses = vec![
+            TerminalRunStatus::Completed {
+                final_message: "Done".to_string(),
+            },
+            TerminalRunStatus::Failed {
+                error: AgentError {
+                    code: "model_failed".to_string(),
+                    message: "model stream ended with an error".to_string(),
+                    recoverable: false,
+                },
+            },
+            TerminalRunStatus::Interrupted {
+                reason: "user paused the run".to_string(),
+            },
+            TerminalRunStatus::Cancelled {
+                reason: "user cancelled the run".to_string(),
+            },
+        ];
+
+        let encoded = serde_json::to_value(&statuses).expect("terminal statuses serialize");
+        let decoded: Vec<TerminalRunStatus> =
+            serde_json::from_value(encoded).expect("terminal statuses deserialize");
+
+        assert_eq!(decoded, statuses);
+    }
+
+    #[test]
+    fn run_finished_serializes_only_terminal_statuses() {
+        let event = AgentEvent::RunFinished {
+            run_id: RunId::new("run-001"),
+            status: TerminalRunStatus::Interrupted {
+                reason: "user paused the run".to_string(),
+            },
+        };
+
+        let encoded = serde_json::to_value(&event).expect("event serializes");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "run_finished",
+                "run_id": "run-001",
+                "status": {
+                    "status": "interrupted",
+                    "reason": "user paused the run"
+                }
+            })
+        );
+
+        let impossible_finished_event = json!({
+            "type": "run_finished",
+            "run_id": "run-001",
+            "status": {
+                "status": "running"
+            }
+        });
+        let event_with_unknown_field = json!({
+            "type": "run_finished",
+            "run_id": "run-001",
+            "status": {
+                "status": "completed",
+                "final_message": "Done"
+            },
+            "provider_only": true
+        });
+
+        assert!(serde_json::from_value::<AgentEvent>(impossible_finished_event).is_err());
+        assert!(serde_json::from_value::<AgentEvent>(event_with_unknown_field).is_err());
     }
 
     #[test]

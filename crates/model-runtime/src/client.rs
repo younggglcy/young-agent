@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelRequest {
     pub model: String,
     pub messages: Vec<ModelMessage>,
@@ -13,7 +14,7 @@ pub struct ModelRequest {
     pub metadata: BTreeMap<String, Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelMessage {
     System {
@@ -24,6 +25,10 @@ pub enum ModelMessage {
     },
     Assistant {
         content: String,
+        /// Tool calls emitted by the assistant message. Provider adapters need
+        /// this history when the following Tool messages report results.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ModelToolCall>,
     },
     Tool {
         content: String,
@@ -50,6 +55,17 @@ impl ModelMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant {
             content: content.into(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ModelToolCall>,
+    ) -> Self {
+        Self::Assistant {
+            content: content.into(),
+            tool_calls,
         }
     }
 
@@ -78,7 +94,7 @@ impl ModelMessage {
         match self {
             Self::System { content }
             | Self::User { content }
-            | Self::Assistant { content }
+            | Self::Assistant { content, .. }
             | Self::Tool { content, .. } => content,
         }
     }
@@ -94,6 +110,15 @@ pub enum ModelMessageRole {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelToolSpec {
     pub name: String,
     pub description: String,

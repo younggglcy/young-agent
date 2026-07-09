@@ -21,7 +21,7 @@ impl RunId {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentEvent {
     RunStarted {
         run_id: RunId,
@@ -60,15 +60,21 @@ pub enum AgentEvent {
     /// cancellation, are represented only through this status.
     RunFinished {
         run_id: RunId,
-        status: RunStatus,
+        status: TerminalRunStatus,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunStatus {
     Running,
     AwaitingApproval,
+    Finished { terminal_status: TerminalRunStatus },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TerminalRunStatus {
     Completed { final_message: String },
     Failed { error: AgentError },
     Interrupted { reason: String },
@@ -76,6 +82,7 @@ pub enum RunStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentError {
     pub code: String,
     pub message: String,
@@ -84,6 +91,7 @@ pub struct AgentError {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub id: String,
     pub call: ToolCall,
