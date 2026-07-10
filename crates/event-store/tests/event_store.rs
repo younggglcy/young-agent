@@ -106,6 +106,40 @@ fn append_writes_one_canonical_agent_event_per_jsonl_line() {
 }
 
 #[test]
+fn append_rejects_an_unterminated_log_without_changing_it() {
+    let log = TestLog::new("append-after-unterminated-record");
+    let original = "{\"type\":\"run_started\",\"run_id\":\"run-001\"}";
+    std::fs::write(log.path(), original).expect("fixture should write");
+    let store = JsonlEventStore::new(log.path());
+    let next_event = agent_event(json!({
+        "type": "run_finished",
+        "run_id": "run-001",
+        "status": {
+            "status": "completed",
+            "final_message": "Done"
+        }
+    }));
+
+    let error = store
+        .append(&next_event)
+        .expect_err("append should reject an unterminated log");
+    let message = error.to_string();
+    let contents = std::fs::read_to_string(log.path()).expect("event log should read");
+
+    match error {
+        EventStoreError::UnterminatedLog { path } => assert_eq!(
+            (
+                path,
+                message.contains("not terminated by a newline"),
+                contents,
+            ),
+            (log.path().to_path_buf(), true, original.to_string())
+        ),
+        other => panic!("expected unterminated log error, got {other:?}"),
+    }
+}
+
+#[test]
 fn replay_reconstructs_the_run_state_from_the_ordered_event_log() {
     let log = TestLog::new("replay");
     let store = JsonlEventStore::new(log.path());
@@ -320,6 +354,72 @@ fn replay_rejects_an_event_from_a_different_run() {
 }
 
 #[test]
+fn replay_rejects_approval_after_the_tool_call_has_a_result() {
+    let events = vec![
+        agent_event(json!({
+            "type": "run_started",
+            "run_id": "run-001"
+        })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "read_file",
+                "arguments": { "path": "README.md" }
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": {
+                    "status": "success",
+                    "content": [{ "type": "text", "text": "# young-agent" }]
+                }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": {
+                    "id": "tool-call-001",
+                    "tool_name": "read_file",
+                    "arguments": { "path": "README.md" }
+                },
+                "reason": "workspace read requires approval"
+            }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("approval after a tool result should fail");
+    let message = error.to_string();
+
+    match error {
+        ReplayError::ApprovalAfterToolResult {
+            event_number,
+            call_id,
+        } => assert_eq!(
+            (
+                event_number,
+                call_id.as_str(),
+                message.contains("already has a result"),
+            ),
+            (4, "tool-call-001", true)
+        ),
+        other => panic!("expected approval-after-result error, got {other:?}"),
+    }
+}
+
+#[test]
 fn malformed_record_reports_its_path_line_and_syntax_error() {
     let log = TestLog::new("malformed");
     std::fs::write(
@@ -373,6 +473,29 @@ fn truncated_final_record_reports_its_path_line_and_eof_error() {
             (log.path().to_path_buf(), 2, true)
         ),
         other => panic!("expected decode error, got {other:?}"),
+    }
+}
+
+#[test]
+fn syntactically_complete_record_without_newline_is_still_truncated() {
+    let log = TestLog::new("missing-commit-newline");
+    std::fs::write(
+        log.path(),
+        "{\"type\":\"run_started\",\"run_id\":\"run-001\"}",
+    )
+    .expect("fixture should write");
+
+    let error = JsonlEventStore::new(log.path())
+        .read_all()
+        .expect_err("unterminated record should fail");
+    let message = error.to_string();
+
+    match error {
+        EventStoreError::TruncatedRecord { path, line } => assert_eq!(
+            (path, line, message.contains("not terminated by a newline"),),
+            (log.path().to_path_buf(), 1, true)
+        ),
+        other => panic!("expected truncated record error, got {other:?}"),
     }
 }
 

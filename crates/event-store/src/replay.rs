@@ -154,6 +154,12 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
                         call_id: request.call.id.clone(),
                     });
                 }
+                if replayed_call.result.is_some() {
+                    return Err(ReplayError::ApprovalAfterToolResult {
+                        event_number,
+                        call_id: request.call.id.clone(),
+                    });
+                }
                 if replayed_call.approval.is_some() {
                     return Err(ReplayError::DuplicateApproval {
                         event_number,
@@ -244,6 +250,10 @@ pub enum ReplayError {
         event_number: usize,
         call_id: ToolCallId,
     },
+    ApprovalAfterToolResult {
+        event_number: usize,
+        call_id: ToolCallId,
+    },
     DuplicateApproval {
         event_number: usize,
         call_id: ToolCallId,
@@ -309,6 +319,14 @@ impl fmt::Display for ReplayError {
             } => write!(
                 formatter,
                 "Event Log event {event_number} changes the approved payload for tool call '{}'",
+                call_id.as_str()
+            ),
+            Self::ApprovalAfterToolResult {
+                event_number,
+                call_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} requests approval for tool call '{}' after it already has a result",
                 call_id.as_str()
             ),
             Self::DuplicateApproval {
