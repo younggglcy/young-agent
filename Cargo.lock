@@ -113,6 +113,12 @@ version = "0.1.0"
 [[package]]
 name = "young-event-store"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "young-agent-runtime",
+ "young-model-runtime",
+ "young-tool-runtime",
+]
 
 [[package]]
 name = "young-model-runtime"

@@ -5,5 +5,11 @@ edition.workspace = true
 repository.workspace = true
 description = "Canonical Event Log storage boundary for Agent Runs."
 
+[dependencies]
+serde_json.workspace = true
+young-agent-runtime = { path = "../agent-runtime" }
+young-model-runtime = { path = "../model-runtime" }
+young-tool-runtime = { path = "../tool-runtime" }
+
 [lints]
 workspace = true
