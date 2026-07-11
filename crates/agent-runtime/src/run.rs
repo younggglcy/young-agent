@@ -89,6 +89,22 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    /// Returns the Agent Run that owns this canonical event.
+    pub fn run_id(&self) -> &RunId {
+        match self {
+            Self::RunStarted { run_id, .. }
+            | Self::TurnStarted { run_id, .. }
+            | Self::ModelOutput { run_id, .. }
+            | Self::ToolCallRequested { run_id, .. }
+            | Self::ApprovalRequested { run_id, .. }
+            | Self::ToolResult { run_id, .. }
+            | Self::Error { run_id, .. }
+            | Self::RunFinished { run_id, .. } => run_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunStatus {
