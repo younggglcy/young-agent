@@ -5,7 +5,7 @@ use std::error::Error;
 use std::fmt;
 
 use young_agent_runtime::{
-    AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
+    AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
 };
 use young_model_runtime::ModelToolCallId;
 use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolResult};
@@ -16,6 +16,7 @@ pub struct ReplayedToolCall {
     model_tool_call_id: ModelToolCallId,
     call: ToolCall,
     approval: Option<ApprovalRequest>,
+    approval_decision: Option<ApprovalDecision>,
     result: Option<ToolResult>,
 }
 
@@ -30,6 +31,10 @@ impl ReplayedToolCall {
 
     pub fn approval(&self) -> Option<&ApprovalRequest> {
         self.approval.as_ref()
+    }
+
+    pub fn approval_decision(&self) -> Option<&ApprovalDecision> {
+        self.approval_decision.as_ref()
     }
 
     pub fn result(&self) -> Option<&ToolResult> {
@@ -77,7 +82,9 @@ impl RunReplay {
     pub fn terminal_status(&self) -> Option<&TerminalRunStatus> {
         match &self.status {
             RunStatus::Finished { terminal_status } => Some(terminal_status),
-            RunStatus::Running | RunStatus::AwaitingApproval => None,
+            RunStatus::Running
+            | RunStatus::AwaitingApproval
+            | RunStatus::RecoveryRequired { .. } => None,
         }
     }
 }
@@ -93,6 +100,7 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
     let mut status = RunStatus::Running;
     let mut tool_calls = Vec::<ReplayedToolCall>::new();
     let mut tool_call_indexes = HashMap::<ToolCallId, usize>::new();
+    let mut approval_indexes = HashMap::<String, usize>::new();
     let mut pending_approvals = HashSet::<ToolCallId>::new();
     let mut approvals = Vec::new();
     let mut errors = Vec::new();
@@ -136,6 +144,7 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
                     model_tool_call_id: model_tool_call_id.clone(),
                     call: call.clone(),
                     approval: None,
+                    approval_decision: None,
                     result: None,
                 });
             }
@@ -166,11 +175,43 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
                         call_id: request.call.id.clone(),
                     });
                 }
+                if approval_indexes.contains_key(&request.id) {
+                    return Err(ReplayError::DuplicateApprovalId {
+                        event_number,
+                        approval_id: request.id.clone(),
+                    });
+                }
 
                 replayed_call.approval = Some(request.clone());
+                approval_indexes.insert(request.id.clone(), tool_call_index);
                 approvals.push(request.clone());
                 pending_approvals.insert(request.call.id.clone());
                 status = RunStatus::AwaitingApproval;
+            }
+            AgentEvent::ApprovalResolved {
+                approval_id,
+                decision,
+                ..
+            } => {
+                let Some(&tool_call_index) = approval_indexes.get(approval_id) else {
+                    return Err(ReplayError::ResolutionForUnknownApproval {
+                        event_number,
+                        approval_id: approval_id.clone(),
+                    });
+                };
+                let replayed_call = &mut tool_calls[tool_call_index];
+                if replayed_call.approval_decision.is_some() {
+                    return Err(ReplayError::DuplicateApprovalResolution {
+                        event_number,
+                        approval_id: approval_id.clone(),
+                    });
+                }
+
+                replayed_call.approval_decision = Some(decision.clone());
+                pending_approvals.remove(&replayed_call.call.id);
+                if pending_approvals.is_empty() {
+                    status = RunStatus::Running;
+                }
             }
             AgentEvent::ToolResult { result, .. } => {
                 let Some(&tool_call_index) = tool_call_indexes.get(&result.call_id) else {
@@ -205,6 +246,17 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
                 run_finished = true;
             }
             AgentEvent::TurnStarted { .. } | AgentEvent::ModelOutput { .. } => {}
+        }
+    }
+
+    if matches!(status, RunStatus::Running) {
+        let call_ids = tool_calls
+            .iter()
+            .filter(|tool_call| tool_call.result.is_none())
+            .map(|tool_call| tool_call.call.id.clone())
+            .collect::<Vec<_>>();
+        if !call_ids.is_empty() {
+            status = RunStatus::RecoveryRequired { call_ids };
         }
     }
 
@@ -257,6 +309,18 @@ pub enum ReplayError {
     DuplicateApproval {
         event_number: usize,
         call_id: ToolCallId,
+    },
+    DuplicateApprovalId {
+        event_number: usize,
+        approval_id: String,
+    },
+    ResolutionForUnknownApproval {
+        event_number: usize,
+        approval_id: String,
+    },
+    DuplicateApprovalResolution {
+        event_number: usize,
+        approval_id: String,
     },
     DuplicateToolResult {
         event_number: usize,
@@ -336,6 +400,27 @@ impl fmt::Display for ReplayError {
                 formatter,
                 "Event Log event {event_number} repeats approval for tool call '{}'",
                 call_id.as_str()
+            ),
+            Self::DuplicateApprovalId {
+                event_number,
+                approval_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} repeats approval id '{approval_id}'"
+            ),
+            Self::ResolutionForUnknownApproval {
+                event_number,
+                approval_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} resolves unknown approval '{approval_id}'"
+            ),
+            Self::DuplicateApprovalResolution {
+                event_number,
+                approval_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} repeats resolution for approval '{approval_id}'"
             ),
             Self::DuplicateToolResult {
                 event_number,

@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::client::{ModelClient, ModelRequest};
 use crate::stream::{ModelError, ModelStreamEvent};
@@ -45,7 +47,11 @@ impl FakeModelClient {
 impl ModelClient for FakeModelClient {
     type Stream = std::vec::IntoIter<ModelStreamEvent>;
 
-    fn stream(&mut self, request: ModelRequest) -> Result<Self::Stream, ModelError> {
+    fn stream(
+        &mut self,
+        request: ModelRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> Result<Self::Stream, ModelError> {
         self.requests.push(request);
         match self.turns.pop_front() {
             Some(ScriptedModelTurn::Events(events)) => Ok(events.into_iter()),

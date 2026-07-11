@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use young_model_runtime::{stream::ModelStreamEvent, ModelToolCallId};
-use young_tool_runtime::execution::{ToolCall, ToolResult};
+use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolResult};
 
 use crate::turn::TurnId;
 
@@ -64,6 +64,14 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
+    ApprovalResolved {
+        run_id: RunId,
+        turn_id: TurnId,
+        approval_id: String,
+        decision: ApprovalDecision,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
+    },
     ToolResult {
         run_id: RunId,
         turn_id: TurnId,
@@ -98,6 +106,7 @@ impl AgentEvent {
             | Self::ModelOutput { run_id, .. }
             | Self::ToolCallRequested { run_id, .. }
             | Self::ApprovalRequested { run_id, .. }
+            | Self::ApprovalResolved { run_id, .. }
             | Self::ToolResult { run_id, .. }
             | Self::Error { run_id, .. }
             | Self::RunFinished { run_id, .. } => run_id,
@@ -110,6 +119,7 @@ impl AgentEvent {
 pub enum RunStatus {
     Running,
     AwaitingApproval,
+    RecoveryRequired { call_ids: Vec<ToolCallId> },
     Finished { terminal_status: TerminalRunStatus },
 }
 
@@ -137,4 +147,11 @@ pub struct ApprovalRequest {
     pub id: String,
     pub call: ToolCall,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny { reason: String },
 }

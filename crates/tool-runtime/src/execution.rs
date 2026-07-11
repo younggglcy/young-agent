@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,7 +35,10 @@ pub trait ToolExecutor {
         None
     }
 
-    fn execute(&mut self, call: &ToolCall) -> ToolResult;
+    /// Executes one invocation. Implementations that can block on external
+    /// work must observe `cancellation` and return promptly once it is set;
+    /// cancellation is cooperative, not forced.
+    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolResult;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

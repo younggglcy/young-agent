@@ -4,10 +4,12 @@ pub mod run;
 pub mod runtime;
 pub mod turn;
 
-pub use run::{AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus};
+pub use run::{
+    AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
+};
 pub use runtime::{
-    AgentEventSink, AgentRuntime, AgentRuntimeError, ApprovalDecision, RunControl, RunControlFlow,
-    RunOutcome, RunRequest,
+    AgentEventSink, AgentRuntime, AgentRuntimeError, RunControl, RunControlFlow, RunOutcome,
+    RunRequest, RunStopToken,
 };
 pub use turn::TurnId;
 
@@ -24,7 +26,8 @@ mod tests {
     };
 
     use crate::run::{
-        AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
+        AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus,
+        TerminalRunStatus,
     };
     use crate::turn::TurnId;
 
@@ -266,6 +269,9 @@ mod tests {
         let statuses = vec![
             RunStatus::Running,
             RunStatus::AwaitingApproval,
+            RunStatus::RecoveryRequired {
+                call_ids: vec![ToolCallId::new("tool-call-001")],
+            },
             RunStatus::Finished {
                 terminal_status: TerminalRunStatus::Completed {
                     final_message: "Done".to_string(),
@@ -278,6 +284,33 @@ mod tests {
             serde_json::from_value(encoded).expect("statuses deserialize");
 
         assert_eq!(decoded, statuses);
+    }
+
+    #[test]
+    fn approval_resolution_serializes_a_replayable_wire_payload() {
+        let event = AgentEvent::ApprovalResolved {
+            run_id: RunId::new("run-001"),
+            turn_id: TurnId::new("turn-001"),
+            approval_id: "approval-001".to_string(),
+            decision: ApprovalDecision::Deny {
+                reason: "user denied the command".to_string(),
+            },
+            extensions: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).expect("approval resolution serializes"),
+            json!({
+                "type": "approval_resolved",
+                "run_id": "run-001",
+                "turn_id": "turn-001",
+                "approval_id": "approval-001",
+                "decision": {
+                    "decision": "deny",
+                    "reason": "user denied the command"
+                }
+            })
+        );
     }
 
     #[test]

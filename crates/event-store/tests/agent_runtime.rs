@@ -1,18 +1,27 @@
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
 use young_agent_runtime::{
-    AgentEvent, AgentRuntime, ApprovalDecision, ApprovalRequest, RunControl, RunControlFlow, RunId,
-    RunRequest, TerminalRunStatus,
+    AgentEvent, AgentEventSink, AgentRuntime, AgentRuntimeError, ApprovalDecision, ApprovalRequest,
+    RunControl, RunControlFlow, RunId, RunRequest, RunStatus, RunStopToken, TerminalRunStatus,
 };
 use young_event_store::JsonlEventStore;
 use young_model_runtime::{
-    FakeModelClient, ModelError, ModelMessage, ModelMessageContent, ModelStreamEvent,
-    ModelToolCallId, ScriptedModelTurn,
+    FakeModelClient, ModelClient, ModelError, ModelMessage, ModelMessageContent, ModelRequest,
+    ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
-use young_tool_runtime::{FakeToolExecutor, ToolContent, ToolError, ToolOutput};
+use young_tool_runtime::{
+    FakeToolExecutor, ToolCall, ToolContent, ToolError, ToolExecutor, ToolOutput, ToolResult,
+};
 
 struct TestLog {
     path: PathBuf,
@@ -53,6 +62,129 @@ fn run_request(run_id: &str) -> RunRequest {
         messages: vec![ModelMessage::user("Read README.md and summarize it.")],
         tools: Vec::new(),
         metadata: no_extensions(),
+    }
+}
+
+struct BlockingModelClient {
+    entered: Arc<Barrier>,
+}
+
+struct BlockingStreamCreationModelClient {
+    entered: Arc<Barrier>,
+}
+
+impl ModelClient for BlockingStreamCreationModelClient {
+    type Stream = std::vec::IntoIter<ModelStreamEvent>;
+
+    fn stream(
+        &mut self,
+        _request: ModelRequest,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self::Stream, ModelError> {
+        self.entered.wait();
+        while !cancellation.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        Ok(Vec::new().into_iter())
+    }
+}
+
+struct BlockingModelStream {
+    entered: Arc<Barrier>,
+    cancellation: Arc<AtomicBool>,
+    observed_cancellation: bool,
+}
+
+impl Iterator for BlockingModelStream {
+    type Item = ModelStreamEvent;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.observed_cancellation {
+            self.entered.wait();
+            while !self.cancellation.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            self.observed_cancellation = true;
+        }
+        None
+    }
+}
+
+impl ModelClient for BlockingModelClient {
+    type Stream = BlockingModelStream;
+
+    fn stream(
+        &mut self,
+        _request: ModelRequest,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self::Stream, ModelError> {
+        Ok(BlockingModelStream {
+            entered: self.entered.clone(),
+            cancellation,
+            observed_cancellation: false,
+        })
+    }
+}
+
+struct BlockingToolExecutor {
+    entered: Arc<Barrier>,
+}
+
+#[derive(Clone, Debug)]
+struct TestSinkError;
+
+impl fmt::Display for TestSinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "scripted ToolResult persistence failure")
+    }
+}
+
+impl Error for TestSinkError {}
+
+#[derive(Clone)]
+struct FailOnceOnToolResultSink {
+    events: Rc<RefCell<Vec<AgentEvent>>>,
+    should_fail: Rc<Cell<bool>>,
+}
+
+impl FailOnceOnToolResultSink {
+    fn new() -> Self {
+        Self {
+            events: Rc::new(RefCell::new(Vec::new())),
+            should_fail: Rc::new(Cell::new(true)),
+        }
+    }
+}
+
+impl AgentEventSink for FailOnceOnToolResultSink {
+    type Error = TestSinkError;
+
+    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        if matches!(event, AgentEvent::ToolResult { .. }) && self.should_fail.replace(false) {
+            return Err(TestSinkError);
+        }
+        self.events.borrow_mut().push(event.clone());
+        Ok(())
+    }
+}
+
+impl ToolExecutor for BlockingToolExecutor {
+    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolResult {
+        self.entered.wait();
+        while !cancellation.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        ToolResult {
+            call_id: call.id.clone(),
+            output: ToolOutput::Failure {
+                error: ToolError {
+                    code: "cancelled".to_string(),
+                    message: "tool observed cancellation".to_string(),
+                    retryable: false,
+                },
+                extensions: no_extensions(),
+            },
+        }
     }
 }
 
@@ -110,6 +242,53 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
     assert_eq!(replay.terminal_status(), Some(outcome.status()));
     assert_eq!(replay.tool_calls().len(), 1);
     assert!(replay.tool_calls()[0].result().is_some());
+}
+
+#[test]
+fn completed_model_event_ends_the_turn_before_late_events_can_execute_tools() {
+    let log = TestLog::new("completed-is-terminal");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::TextDelta {
+            delta: "Done.".to_string(),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::Completed {
+            finish_reason: Some("stop".to_string()),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("late-model-call"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "touch should-not-exist" }),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let tools = FakeToolExecutor::new([ToolOutput::Success {
+        content: vec![ToolContent::Text {
+            text: "unexpected".to_string(),
+        }],
+        metadata: no_extensions(),
+        extensions: no_extensions(),
+    }]);
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+
+    let outcome = runtime
+        .run(run_request("run-completed-terminal"))
+        .expect("completed event should end the run");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Completed {
+            final_message: "Done.".to_string(),
+        }
+    );
+    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(!store
+        .read_all()
+        .expect("Event Log should read")
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolCallRequested { .. })));
 }
 
 #[test]
@@ -310,9 +489,206 @@ fn interruption_and_cancellation_produce_distinct_terminal_states() {
     }
 }
 
+#[test]
+fn cooperative_model_stream_observes_external_cancellation_while_next_is_pending() {
+    let log = TestLog::new("cancel-pending-model-stream");
+    let store = JsonlEventStore::new(log.path());
+    let entered = Arc::new(Barrier::new(2));
+    let stop = RunStopToken::default();
+    let cancellation = stop.clone();
+    let canceller_entered = entered.clone();
+    let canceller = thread::spawn(move || {
+        canceller_entered.wait();
+        cancellation.cancel("user cancelled pending model output");
+    });
+    let mut runtime = AgentRuntime::new(
+        BlockingModelClient { entered },
+        FakeToolExecutor::default(),
+        store.clone(),
+    );
+
+    let outcome = runtime
+        .run_with_stop_token(run_request("run-cancel-pending-model"), &stop)
+        .expect("cooperative cancellation should finish the run");
+    canceller.join().expect("canceller should finish");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Cancelled {
+            reason: "user cancelled pending model output".to_string(),
+        }
+    );
+    assert_eq!(
+        store
+            .replay()
+            .expect("cancelled run should replay")
+            .terminal_status(),
+        Some(outcome.status())
+    );
+}
+
+#[test]
+fn cooperative_model_client_observes_external_cancellation_while_stream_starts() {
+    let log = TestLog::new("cancel-pending-stream-start");
+    let store = JsonlEventStore::new(log.path());
+    let entered = Arc::new(Barrier::new(2));
+    let stop = RunStopToken::default();
+    let cancellation = stop.clone();
+    let canceller_entered = entered.clone();
+    let canceller = thread::spawn(move || {
+        canceller_entered.wait();
+        cancellation.cancel("user cancelled provider startup");
+    });
+    let mut runtime = AgentRuntime::new(
+        BlockingStreamCreationModelClient { entered },
+        FakeToolExecutor::default(),
+        store.clone(),
+    );
+
+    let outcome = runtime
+        .run_with_stop_token(run_request("run-cancel-stream-start"), &stop)
+        .expect("cooperative provider startup should observe cancellation");
+    canceller.join().expect("canceller should finish");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Cancelled {
+            reason: "user cancelled provider startup".to_string(),
+        }
+    );
+    assert_eq!(
+        store
+            .replay()
+            .expect("cancelled run should replay")
+            .terminal_status(),
+        Some(outcome.status())
+    );
+}
+
+#[test]
+fn cooperative_tool_observes_external_cancellation_while_execution_is_pending() {
+    let log = TestLog::new("cancel-pending-tool");
+    let store = JsonlEventStore::new(log.path());
+    let entered = Arc::new(Barrier::new(2));
+    let stop = RunStopToken::default();
+    let cancellation = stop.clone();
+    let canceller_entered = entered.clone();
+    let canceller = thread::spawn(move || {
+        canceller_entered.wait();
+        cancellation.cancel("user cancelled pending tool execution");
+    });
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("model-call-001"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "long-running-command" }),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::Completed {
+            finish_reason: Some("tool_calls".to_string()),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let mut runtime = AgentRuntime::new(model, BlockingToolExecutor { entered }, store.clone());
+
+    let outcome = runtime
+        .run_with_stop_token(run_request("run-cancel-pending-tool"), &stop)
+        .expect("cooperative cancellation should finish the run");
+    canceller.join().expect("canceller should finish");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Cancelled {
+            reason: "user cancelled pending tool execution".to_string(),
+        }
+    );
+    let events = store.read_all().expect("cancelled Event Log should read");
+    let result_index = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolResult { .. }))
+        .expect("cooperative tool result should be persisted");
+    let finished_index = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::RunFinished { .. }))
+        .expect("cancelled run should finish");
+    assert!(result_index < finished_index);
+}
+
+#[test]
+fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_tool() {
+    let sink = FailOnceOnToolResultSink::new();
+    let observed_events = sink.events.clone();
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("model-call-001"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "touch important-file" }),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::Completed {
+            finish_reason: Some("tool_calls".to_string()),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let tools = FakeToolExecutor::new([ToolOutput::Success {
+        content: vec![ToolContent::Text {
+            text: "created important-file".to_string(),
+        }],
+        metadata: no_extensions(),
+        extensions: no_extensions(),
+    }]);
+    let mut runtime = AgentRuntime::new(model, tools, sink);
+
+    let error = runtime
+        .run(run_request("run-tool-result-persistence-failure"))
+        .expect_err("ToolResult persistence failure must stop the run");
+
+    let recovery_event = match error {
+        AgentRuntimeError::ToolResultPersistenceIndeterminate { event, .. } => *event,
+        other => panic!("expected ToolResult recovery error, got {other:?}"),
+    };
+    assert!(matches!(
+        &recovery_event,
+        AgentEvent::ToolResult { result, .. }
+            if result.call_id.as_str() == "run-tool-result-persistence-failure-tool-001"
+    ));
+    assert_eq!(runtime.tool_executor().calls().len(), 1);
+
+    let replay = young_event_store::replay_events(observed_events.borrow().clone())
+        .expect("pre-execution intent should remain replayable");
+    assert_eq!(
+        replay.status(),
+        &RunStatus::RecoveryRequired {
+            call_ids: vec![runtime.tool_executor().calls()[0].id.clone()],
+        }
+    );
+}
+
 #[derive(Default)]
 struct ApprovingControl {
     requests: Vec<ApprovalRequest>,
+}
+
+#[derive(Default)]
+struct ApproveThenCancelControl {
+    approved: bool,
+}
+
+impl RunControl for ApproveThenCancelControl {
+    fn checkpoint(&mut self) -> RunControlFlow {
+        if self.approved {
+            RunControlFlow::Cancel {
+                reason: "cancelled after approval".to_string(),
+            }
+        } else {
+            RunControlFlow::Continue
+        }
+    }
+
+    fn decide_approval(&mut self, _request: &ApprovalRequest) -> ApprovalDecision {
+        self.approved = true;
+        ApprovalDecision::Approve
+    }
 }
 
 impl RunControl for ApprovingControl {
@@ -387,6 +763,72 @@ fn approval_is_emitted_before_an_approved_fake_tool_executes() {
         .position(|event| matches!(event, AgentEvent::ToolResult { .. }))
         .expect("tool result should be persisted");
     assert!(approval_index < result_index);
+}
+
+#[test]
+fn approval_decision_is_persisted_before_a_post_approval_cancellation() {
+    let log = TestLog::new("approval-then-cancel");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("model-call-001"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "cargo test" }),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::Completed {
+            finish_reason: Some("tool_calls".to_string()),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let tools = FakeToolExecutor::requiring_approval(
+        "command requires approval",
+        [ToolOutput::Success {
+            content: vec![],
+            metadata: no_extensions(),
+            extensions: no_extensions(),
+        }],
+    );
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+    let mut control = ApproveThenCancelControl::default();
+
+    let outcome = runtime
+        .run_with_control(run_request("run-approval-cancel"), &mut control)
+        .expect("post-approval cancellation should be terminal");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Cancelled {
+            reason: "cancelled after approval".to_string(),
+        }
+    );
+    assert!(runtime.tool_executor().calls().is_empty());
+    let events = store.read_all().expect("approval Event Log should read");
+    let resolved_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ApprovalResolved {
+                    decision: ApprovalDecision::Approve,
+                    ..
+                }
+            )
+        })
+        .expect("approval decision should be persisted");
+    let finished_index = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::RunFinished { .. }))
+        .expect("cancelled run should finish");
+    assert!(resolved_index < finished_index);
+    assert_eq!(
+        store
+            .replay()
+            .expect("approval decision should replay")
+            .tool_calls()[0]
+            .approval_decision(),
+        Some(&ApprovalDecision::Approve)
+    );
 }
 
 #[test]

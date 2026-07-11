@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::execution::{ToolCall, ToolError, ToolExecutor, ToolOutput, ToolResult};
 
@@ -43,7 +45,7 @@ impl ToolExecutor for FakeToolExecutor {
         self.approval_reason.clone()
     }
 
-    fn execute(&mut self, call: &ToolCall) -> ToolResult {
+    fn execute(&mut self, call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolResult {
         self.calls.push(call.clone());
         let output = self
             .outputs
