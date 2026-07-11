@@ -1,9 +1,14 @@
 #![doc = "Agent Run orchestration boundary for the Agent Kernel."]
 
 pub mod run;
+pub mod runtime;
 pub mod turn;
 
 pub use run::{AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus};
+pub use runtime::{
+    AgentEventSink, AgentRuntime, AgentRuntimeError, ApprovalDecision, RunControl, RunControlFlow,
+    RunOutcome, RunRequest,
+};
 pub use turn::TurnId;
 
 #[cfg(test)]

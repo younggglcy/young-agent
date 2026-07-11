@@ -6,7 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use young_agent_runtime::AgentEvent;
+use young_agent_runtime::{AgentEvent, AgentEventSink};
 
 use crate::replay::{replay_events, ReplayError, RunReplay};
 
@@ -127,6 +127,14 @@ impl JsonlEventStore {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+impl AgentEventSink for JsonlEventStore {
+    type Error = EventStoreError;
+
+    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        JsonlEventStore::append(self, event)
     }
 }
 

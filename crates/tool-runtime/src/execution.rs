@@ -26,6 +26,16 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Execution boundary consumed by the Agent Runtime. Tool lookup, policy, and
+/// concrete implementations remain owned by the Tool Runtime.
+pub trait ToolExecutor {
+    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+
+    fn execute(&mut self, call: &ToolCall) -> ToolResult;
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResult {

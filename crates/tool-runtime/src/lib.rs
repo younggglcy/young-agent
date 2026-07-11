@@ -1,9 +1,13 @@
 #![doc = "Tool definition, policy, and execution boundary for the Agent Kernel."]
 
 pub mod execution;
+pub mod fake;
 pub mod registry;
 
-pub use execution::{ToolCall, ToolCallId, ToolContent, ToolError, ToolOutput, ToolResult};
+pub use execution::{
+    ToolCall, ToolCallId, ToolContent, ToolError, ToolExecutor, ToolOutput, ToolResult,
+};
+pub use fake::FakeToolExecutor;
 pub use registry::{CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition};
 
 #[cfg(test)]
