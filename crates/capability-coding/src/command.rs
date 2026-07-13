@@ -144,6 +144,8 @@ struct CommandProcess {
     child: GroupChild,
     #[cfg(unix)]
     descendant_token: Option<DescendantToken>,
+    #[cfg(all(test, unix))]
+    fail_next_wait: bool,
 }
 
 impl CommandProcess {
@@ -152,6 +154,8 @@ impl CommandProcess {
         Self {
             child,
             descendant_token: Some(descendant_token),
+            #[cfg(all(test, unix))]
+            fail_next_wait: false,
         }
     }
 
@@ -160,6 +164,7 @@ impl CommandProcess {
         Self {
             child,
             descendant_token: None,
+            fail_next_wait: false,
         }
     }
 
@@ -168,12 +173,19 @@ impl CommandProcess {
         Self { child }
     }
 
-    fn seal_terminal_group(&mut self) -> Result<(), CommandError> {
+    fn seal_and_reap_terminal_group(&mut self) -> Result<ExitStatus, CommandError> {
         #[cfg(unix)]
         let descendant_token = self.descendant_token.as_mut();
         #[cfg(not(unix))]
         let descendant_token = None;
-        seal_terminal_process_group(&mut self.child, descendant_token)
+        seal_terminal_process_group(&mut self.child, descendant_token)?;
+        #[cfg(all(test, unix))]
+        if std::mem::replace(&mut self.fail_next_wait, false) {
+            return Err(CommandError::Wait(std::io::Error::other(
+                "injected supervisor wait failure",
+            )));
+        }
+        wait_for_command_group(&mut self.child)
     }
 
     fn id(&self) -> u32 {
@@ -200,8 +212,9 @@ impl CommandProcess {
         wait_for_leader_terminal_bounded(&self.child, grace)
     }
 
-    fn wait_for_group(&mut self) -> Result<ExitStatus, CommandError> {
-        wait_for_command_group(&mut self.child)
+    #[cfg(all(test, unix))]
+    fn inject_wait_failure(&mut self) {
+        self.fail_next_wait = true;
     }
 }
 
@@ -336,7 +349,11 @@ fn run_shell_command(
     #[cfg(not(all(test, unix)))]
     let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
     if let Err(source) = configure_result {
-        let cleanup = cleanup_process_group(child, false, true, supervision_permit);
+        let cleanup = cleanup_process_group(
+            child,
+            CommandCleanupState::TerminateAndReap,
+            supervision_permit,
+        );
         return match cleanup {
             Err(cleanup) => Err(cleanup),
             Ok(()) => Err(CommandError::ConfigureOutput(source)),
@@ -362,8 +379,7 @@ fn run_shell_command(
                 if status.is_none() {
                     child.terminate_group()?;
                     if child.wait_for_leader_terminal(TERMINATION_CONFIRM_GRACE)? {
-                        child.seal_terminal_group()?;
-                        status = Some(child.wait_for_group()?);
+                        status = Some(child.seal_and_reap_terminal_group()?);
                     }
                 }
                 forced_at = Some(Instant::now());
@@ -391,8 +407,7 @@ fn run_shell_command(
             if status.is_none() && leader_terminal {
                 // Keep the terminal leader unreaped while already-started descendant
                 // forks settle, then terminate the still-reserved process group once.
-                child.seal_terminal_group()?;
-                status = Some(child.wait_for_group()?);
+                status = Some(child.seal_and_reap_terminal_group()?);
             }
 
             if status.is_some() && stdout_done && stderr_done {
@@ -423,12 +438,12 @@ fn run_shell_command(
         }
     })();
 
-    let cleanup_result = cleanup_process_group(
-        child,
-        status.is_some(),
-        status.is_none() && (cancelled || control_result.is_err()),
-        supervision_permit,
-    );
+    let cleanup_state = if status.is_some() {
+        CommandCleanupState::AlreadyReaped
+    } else {
+        CommandCleanupState::TerminateAndReap
+    };
+    let cleanup_result = cleanup_process_group(child, cleanup_state, supervision_permit);
     match (control_result, cleanup_result) {
         (Err(_), Err(cleanup)) => return Err(cleanup),
         (Err(source), Ok(())) => return Err(source),
@@ -746,66 +761,51 @@ fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandE
     }
 }
 
+#[derive(Clone, Copy)]
+enum CommandCleanupState {
+    AlreadyReaped,
+    TerminateAndReap,
+}
+
 fn cleanup_process_group(
     mut child: CommandProcess,
-    process_exited: bool,
-    terminate_group: bool,
+    state: CommandCleanupState,
     supervision_permit: CommandSupervisionPermit,
 ) -> Result<(), CommandError> {
-    let mut first_error = None;
-    if terminate_group {
-        if let Err(source) = child.terminate_group() {
-            first_error = Some(source);
-        }
+    if matches!(state, CommandCleanupState::AlreadyReaped) {
+        return Ok(());
     }
-    if !process_exited {
-        if terminate_group {
-            match child.wait_for_leader_terminal(TERMINATION_CONFIRM_GRACE) {
-                Ok(false) => {
-                    return Err(supervise_live_command(
-                        child,
-                        supervision_permit,
-                        first_error
-                            .take()
-                            .unwrap_or(CommandError::TerminationUnverified),
-                        None,
-                    ));
-                }
-                Err(wait) => {
-                    return Err(supervise_live_command(
-                        child,
-                        supervision_permit,
-                        first_error
-                            .take()
-                            .unwrap_or(CommandError::TerminationUnverified),
-                        Some(wait),
-                    ));
-                }
-                Ok(true) => {
-                    if let Err(seal) = child.seal_terminal_group() {
-                        return Err(supervise_live_command(
-                            child,
-                            supervision_permit,
-                            first_error.take().unwrap_or(seal),
-                            None,
-                        ));
-                    }
-                    if let Err(source) = child.wait_for_group() {
-                        return Err(supervise_live_command(
-                            child,
-                            supervision_permit,
-                            first_error.take().unwrap_or(source),
-                            None,
-                        ));
-                    }
-                }
-            }
-        } else {
-            if let Err(source) = child.wait_for_group() {
+    let mut first_error = None;
+    if let Err(source) = child.terminate_group() {
+        first_error = Some(source);
+    }
+    match child.wait_for_leader_terminal(TERMINATION_CONFIRM_GRACE) {
+        Ok(false) => {
+            return Err(supervise_live_command(
+                child,
+                supervision_permit,
+                first_error
+                    .take()
+                    .unwrap_or(CommandError::TerminationUnverified),
+                None,
+            ));
+        }
+        Err(wait) => {
+            return Err(supervise_live_command(
+                child,
+                supervision_permit,
+                first_error
+                    .take()
+                    .unwrap_or(CommandError::TerminationUnverified),
+                Some(wait),
+            ));
+        }
+        Ok(true) => {
+            if let Err(source) = child.seal_and_reap_terminal_group() {
                 return Err(supervise_live_command(
                     child,
                     supervision_permit,
-                    source,
+                    first_error.take().unwrap_or(source),
                     None,
                 ));
             }
@@ -1295,22 +1295,14 @@ fn supervise_command_once(
     _supervisor: &CommandSupervisor,
 ) -> bool {
     if matches!(command.child.leader_terminal(), Ok(true)) {
-        if command.child.seal_terminal_group().is_ok() {
-            #[cfg(all(test, unix))]
-            _supervisor.wait_attempts.fetch_add(1, Ordering::Relaxed);
-            #[cfg(all(test, unix))]
-            let wait = if _supervisor.fail_next_wait.swap(false, Ordering::Relaxed) {
-                Err(CommandError::Wait(std::io::Error::other(
-                    "injected supervisor wait failure",
-                )))
-            } else {
-                command.child.wait_for_group()
-            };
-            #[cfg(not(all(test, unix)))]
-            let wait = command.child.wait_for_group();
-            if wait.is_ok() {
-                return false;
-            }
+        #[cfg(all(test, unix))]
+        if _supervisor.fail_next_wait.swap(false, Ordering::Relaxed) {
+            command.child.inject_wait_failure();
+        }
+        #[cfg(all(test, unix))]
+        _supervisor.wait_attempts.fetch_add(1, Ordering::Relaxed);
+        if command.child.seal_and_reap_terminal_group().is_ok() {
+            return false;
         }
         command.next_action = now + Duration::from_millis(250);
         return true;
@@ -1610,7 +1602,7 @@ mod tests {
         cleanup_process_group, command_leader_terminal, command_supervisor,
         next_exit_poll_interval, prepare_command_supervision, prepare_command_supervision_with,
         run_shell_command, shell_command, supervise_live_command, supervise_live_command_with,
-        CommandError, CommandProcess, CommandSupervisor, DescendantToken,
+        CommandCleanupState, CommandError, CommandProcess, CommandSupervisor, DescendantToken,
         SupervisorAdmissionHealth, SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
@@ -1681,6 +1673,53 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         stop.store(true, Ordering::Relaxed);
         writer_thread.join().expect("token writer stops");
+    }
+
+    #[test]
+    fn open_descendant_token_prevents_leader_reap_until_seal_is_verified() {
+        let mut command = shell_command("exit 0");
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("test command group starts");
+        let (reader, writer) = UnixStream::pair().expect("token pair is created");
+        reader
+            .set_nonblocking(true)
+            .expect("token reader is nonblocking");
+        let mut process = CommandProcess::tracked(
+            child,
+            DescendantToken {
+                reader,
+                closed: false,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process
+            .leader_terminal()
+            .expect("leader state is observable")
+        {
+            assert!(Instant::now() < deadline, "leader should become terminal");
+            thread::yield_now();
+        }
+
+        let error = process
+            .seal_and_reap_terminal_group()
+            .expect_err("an open token must prevent reap");
+
+        assert!(matches!(error, CommandError::TerminationUnverified));
+        assert!(
+            process
+                .leader_terminal()
+                .expect("unreaped leader remains observable"),
+            "failed sealing must retain the leader identity"
+        );
+        drop(writer);
+        let status = process
+            .seal_and_reap_terminal_group()
+            .expect("closed token permits seal and reap");
+        assert!(status.success());
     }
 
     fn take_last_supervised_command_id() -> u64 {
@@ -2121,7 +2160,11 @@ mod tests {
         INJECT_NEXT_FULL_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
 
         let permit = prepare_command_supervision().expect("supervision slot is available");
-        let result = cleanup_process_group(CommandProcess::untracked(child), false, true, permit);
+        let result = cleanup_process_group(
+            CommandProcess::untracked(child),
+            CommandCleanupState::TerminateAndReap,
+            permit,
+        );
 
         assert!(
             matches!(result, Err(CommandError::Kill(_))),
