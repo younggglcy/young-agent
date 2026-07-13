@@ -105,7 +105,7 @@ fn new_file_patch_fails_before_creating_staging_on_unsupported_platforms() {
 
 #[cfg(not(unix))]
 #[test]
-fn command_fails_closed_without_handle_bound_working_directories() {
+fn command_reports_unsupported_process_tracking_before_spawn() {
     let root = TestWorkspace::new();
     let workspace = CodingWorkspace::resolve(&root.0).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -125,7 +125,11 @@ fn command_fails_closed_without_handle_bound_working_directories() {
     );
 
     let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("unsupported command cwd binding must fail closed");
+        panic!("unsupported command process tracking must fail closed");
     };
-    assert_eq!(error.code, "workspace_changed");
+    assert_eq!(error.code, "command_process_tracking_unsupported");
+    assert_eq!(
+        error.message,
+        "stable command process-group tracking is not supported on this platform"
+    );
 }
