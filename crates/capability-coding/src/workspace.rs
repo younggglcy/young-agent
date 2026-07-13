@@ -408,7 +408,7 @@ impl CodingWorkspace {
     fn commit_existing_file(
         &self,
         directory: &Dir,
-        recovery_directory: &Dir,
+        recovery: &RecoveryNamespace,
         mut staged: StagedFile,
         path: &Path,
         mut expected: ReplacementMetadata,
@@ -424,7 +424,7 @@ impl CodingWorkspace {
             let recovery_path = match move_to_recovery_namespace(
                 directory,
                 &staged.path,
-                recovery_directory,
+                &recovery.directory,
                 "displaced",
             ) {
                 Ok(path) => path,
@@ -439,7 +439,7 @@ impl CodingWorkspace {
                 "patch staging file",
             )
             .and_then(|()| {
-                validate_installed_staging_slot(recovery_directory, &staged.path, &staged)
+                validate_installed_staging_slot(&recovery.directory, &staged.path, &staged)
             }) {
                 return Err(io::Error::new(
                     source.kind(),
@@ -449,8 +449,17 @@ impl CodingWorkspace {
                     ),
                 ));
             }
+            if let Err(source) = validate_recovery_namespace_slot(directory, recovery) {
+                return Err(io::Error::new(
+                    source.kind(),
+                    format!(
+                        "patch publication was refused because the recovery namespace drifted; staged data remains bound to recovery identity {}:{} ({source})",
+                        recovery.device, recovery.inode
+                    ),
+                ));
+            }
             if let Err(source) =
-                exchange_files_between(recovery_directory, &staged.path, directory, path)
+                exchange_files_between(&recovery.directory, &staged.path, directory, path)
             {
                 return Err(io::Error::new(
                     source.kind(),
@@ -473,17 +482,20 @@ impl CodingWorkspace {
 
             let validation =
                 validate_installed_staging_slot(directory, path, &staged).and_then(|()| {
-                    validate_replacement_slot_identity(recovery_directory, &staged.path, &expected)
+                    validate_replacement_slot_identity(&recovery.directory, &staged.path, &expected)
                 });
             if let Err(source) = validation {
                 let recovery = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
                 return Err(published_target_changed(path, Some(&recovery), source));
             }
+            if let Err(source) = validate_recovery_namespace_slot(directory, recovery) {
+                return Err(published_target_changed(path, None, source));
+            }
             Ok(PathBuf::from(RECOVERY_DIRECTORY).join(staged.path))
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = (directory, recovery_directory, staged, path, expected);
+            let _ = (directory, recovery, staged, path, expected);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic identity-bound patch commits are not supported on this platform",
@@ -568,6 +580,14 @@ struct StagedFile {
     path: PathBuf,
     file: File,
     snapshot: FileSnapshot,
+}
+
+struct RecoveryNamespace {
+    directory: Dir,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -876,7 +896,8 @@ fn move_claimed_to_recovery_namespace(
     kind: &str,
 ) -> io::Result<PathBuf> {
     let recovery = open_recovery_namespace(directory)?;
-    let destination = move_to_recovery_namespace(directory, claimed_path, &recovery, kind)?;
+    let destination =
+        move_to_recovery_namespace(directory, claimed_path, &recovery.directory, kind)?;
     Ok(PathBuf::from(RECOVERY_DIRECTORY).join(destination))
 }
 
@@ -922,7 +943,9 @@ fn move_claimed_to_recovery_namespace(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn open_recovery_namespace(directory: &Dir) -> io::Result<Dir> {
+fn open_recovery_namespace(directory: &Dir) -> io::Result<RecoveryNamespace> {
+    use cap_std::fs::MetadataExt as _;
+
     match directory.create_dir(RECOVERY_DIRECTORY) {
         Ok(()) => {}
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
@@ -937,15 +960,47 @@ fn open_recovery_namespace(directory: &Dir) -> io::Result<Dir> {
     }
     let recovery = directory.open_dir(RECOVERY_DIRECTORY)?;
     ensure_recovery_gitignore(&recovery)?;
-    Ok(recovery)
+    let metadata = recovery.metadata(".")?;
+    Ok(RecoveryNamespace {
+        directory: recovery,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn open_recovery_namespace(_directory: &Dir) -> io::Result<Dir> {
+fn open_recovery_namespace(_directory: &Dir) -> io::Result<RecoveryNamespace> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "namespaced patch recovery is not supported on this platform",
     ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_recovery_namespace_slot(parent: &Dir, recovery: &RecoveryNamespace) -> io::Result<()> {
+    use cap_std::fs::MetadataExt as _;
+
+    let metadata = parent.symlink_metadata(RECOVERY_DIRECTORY)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "recovery namespace path changed before publication",
+        ));
+    }
+    let slot = parent.open_dir(RECOVERY_DIRECTORY)?;
+    let slot_metadata = slot.metadata(".")?;
+    let handle_metadata = recovery.directory.metadata(".")?;
+    if slot_metadata.dev() != recovery.device
+        || slot_metadata.ino() != recovery.inode
+        || handle_metadata.dev() != recovery.device
+        || handle_metadata.ino() != recovery.inode
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "recovery namespace identity changed before publication",
+        ));
+    }
+    ensure_recovery_gitignore(&recovery.directory)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1802,6 +1857,62 @@ mod tests {
 
         assert_invalid_recovery_namespace_does_not_publish(&root);
 
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn recovery_namespace_identity_drift_is_rejected_before_publication() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-drift-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let metadata = workspace
+            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
+            .expect("metadata validates");
+        let staged = workspace
+            .stage_content(&directory, b"patched\n", Some(&metadata))
+            .expect("content is staged");
+        let recovery =
+            super::open_recovery_namespace(&directory).expect("recovery namespace opens");
+        directory
+            .rename(super::RECOVERY_DIRECTORY, &directory, "moved-recovery")
+            .expect("opened recovery namespace is renamed");
+        directory
+            .create_dir(super::RECOVERY_DIRECTORY)
+            .expect("replacement namespace is created");
+
+        workspace
+            .commit_existing_file(
+                &directory,
+                &recovery,
+                staged,
+                std::path::Path::new("target.txt"),
+                metadata,
+            )
+            .expect_err("namespace identity drift must reject publication");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(std::fs::read_dir(root.join("moved-recovery"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".young-agent-patch-displaced-")));
+
+        drop((recovery, directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 

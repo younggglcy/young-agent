@@ -146,6 +146,12 @@ fn search_directory(
             continue;
         }
         let file_name = entry.file_name();
+        if file_name
+            .to_string_lossy()
+            .starts_with(".young-agent-patch-")
+        {
+            continue;
+        }
         let entry_path = frame.relative_path.join(&file_name);
         if file_type.is_dir() {
             if file_name == ".git" || file_name == RECOVERY_DIRECTORY {
