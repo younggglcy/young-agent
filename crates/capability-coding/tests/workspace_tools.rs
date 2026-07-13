@@ -1485,6 +1485,11 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
     assert_eq!(metadata["stdout_truncated"], json!(false));
     assert_eq!(metadata["stderr_truncated"], json!(false));
     assert_eq!(metadata["process_scope"], json!("process_group"));
+    assert_eq!(metadata["direct_shell_jobs_waited"], json!(true));
+    assert_eq!(
+        metadata["residual_process_group_policy"],
+        json!("terminated_before_leader_reap")
+    );
     assert_eq!(metadata["detached_processes_tracked"], json!(false));
     assert!(extensions.is_empty());
 }
@@ -1718,7 +1723,11 @@ fn run_command_waits_for_a_same_group_background_process_with_closed_pipes() {
 
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert!(
+        matches!(result.output, ToolOutput::Success { .. }),
+        "unexpected command result: {:?}",
+        result.output
+    );
     assert_eq!(
         std::fs::read_to_string(test_workspace.path().join("same-group-finished")).unwrap(),
         "complete"
@@ -1726,13 +1735,13 @@ fn run_command_waits_for_a_same_group_background_process_with_closed_pipes() {
 }
 
 #[test]
-fn run_command_cancels_a_same_group_background_process_after_the_leader_exits() {
-    let test_workspace = TestWorkspace::new("command-background-cancel-after-leader");
+fn run_command_cancels_a_direct_background_job_waited_by_the_supervisor() {
+    let test_workspace = TestWorkspace::new("command-background-cancel-supervised");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
     register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
     let call = ToolCall {
-        id: ToolCallId::new("call-background-cancel-after-leader"),
+        id: ToolCallId::new("call-background-cancel-supervised"),
         tool_name: "run_command".to_string(),
         arguments: json!({
             "command": "(printf ready > background-ready; sleep 10; printf leaked > background-leaked) >/dev/null 2>&1 &"
@@ -1766,11 +1775,53 @@ fn run_command_cancels_a_same_group_background_process_after_the_leader_exits() 
     trigger.join().expect("cancellation trigger finishes");
     assert!(started.elapsed() < Duration::from_secs(2));
     let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("cancellation after leader exit must fail closed");
+        panic!("cancellation while a supervised background job runs must fail closed");
     };
     assert_eq!(error.code, "command_termination_unverified");
     std::thread::sleep(Duration::from_millis(250));
     assert!(!test_workspace.path().join("background-leaked").exists());
+}
+
+#[test]
+fn run_command_seals_residual_group_members_across_repeated_early_exit_races() {
+    let test_workspace = TestWorkspace::new("command-residual-group-seal");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    for attempt in 0..30 {
+        let call = ToolCall {
+            id: ToolCallId::new(format!("call-residual-group-seal-{attempt}")),
+            tool_name: "run_command".to_string(),
+            arguments: json!({
+                "command": format!(
+                    "(sleep 0.15; printf leaked > residual-leaked-{attempt}) >/dev/null 2>&1 & exit 0"
+                )
+            }),
+        };
+        let result = runtime.dispatch(
+            call.clone(),
+            ToolExecutionAuthorization::ApprovalGranted {
+                call_id: call.id.clone(),
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            matches!(result.output, ToolOutput::Success { .. }),
+            "attempt {attempt} failed: {:?}",
+            result.output
+        );
+    }
+
+    std::thread::sleep(Duration::from_millis(250));
+    for attempt in 0..30 {
+        assert!(
+            !test_workspace
+                .path()
+                .join(format!("residual-leaked-{attempt}"))
+                .exists(),
+            "attempt {attempt} leaked a residual group member"
+        );
+    }
 }
 
 #[test]

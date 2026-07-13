@@ -23,8 +23,6 @@ use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
-#[cfg(target_os = "macos")]
-const MAX_PROCESS_GROUP_MEMBERS: usize = 65_536;
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -87,6 +85,11 @@ pub(crate) fn execute(
                 json!(outcome.output_incomplete),
             ),
             ("process_scope".to_string(), json!("process_group")),
+            ("direct_shell_jobs_waited".to_string(), json!(true)),
+            (
+                "residual_process_group_policy".to_string(),
+                json!("terminated_before_leader_reap"),
+            ),
             ("detached_processes_tracked".to_string(), json!(false)),
             ("workspace".to_string(), workspace.metadata()),
         ]),
@@ -164,7 +167,6 @@ fn run_shell_command(
     let mut stream_error = None;
     let mut status = None;
     let mut leader_terminal = false;
-    let mut process_group_tracker = ProcessGroupTracker::default();
     let mut drain_started_at = None;
     let mut output_incomplete = false;
     let mut cancelled = false;
@@ -194,10 +196,9 @@ fn run_shell_command(
             if status.is_none() && !leader_terminal {
                 leader_terminal = command_leader_terminal(&child)?;
             }
-            if status.is_none()
-                && leader_terminal
-                && !process_group_has_members_other_than_leader(&child, &mut process_group_tracker)?
-            {
+            if status.is_none() && leader_terminal {
+                terminate_command_group(&mut child)?;
+                termination_sent = true;
                 status = Some(wait_for_command_group(&mut child)?);
             }
 
@@ -265,10 +266,7 @@ fn ensure_process_tracking_supported() -> Result<(), CommandError> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn ensure_process_tracking_supported() -> Result<(), CommandError> {
-    Err(CommandError::InspectProcessGroup(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "stable command process-group tracking is not supported on this platform",
-    )))
+    Err(CommandError::UnsupportedProcessTracking)
 }
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
@@ -356,165 +354,6 @@ fn command_leader_terminal(_child: &GroupChild) -> Result<bool, CommandError> {
     Err(CommandError::Wait(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "non-reaping command status observation is not supported on this platform",
-    )))
-}
-
-#[derive(Default)]
-struct ProcessGroupTracker {
-    #[cfg(target_os = "linux")]
-    known_member: Option<u32>,
-}
-
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn process_group_has_members_other_than_leader(
-    child: &GroupChild,
-    _tracker: &mut ProcessGroupTracker,
-) -> Result<bool, CommandError> {
-    use std::ffi::{c_int, c_void};
-
-    #[link(name = "proc")]
-    unsafe extern "C" {
-        fn proc_listpgrppids(pgrpid: c_int, buffer: *mut c_void, buffersize: c_int) -> c_int;
-    }
-
-    let group_id = i32::try_from(child.id()).map_err(|_| {
-        CommandError::InspectProcessGroup(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "command process-group id does not fit in i32",
-        ))
-    })?;
-    let mut capacity = 32usize;
-    loop {
-        let mut pids = vec![0i32; capacity];
-        let buffer_bytes = pids
-            .len()
-            .checked_mul(std::mem::size_of::<i32>())
-            .and_then(|bytes| i32::try_from(bytes).ok())
-            .ok_or_else(|| {
-                CommandError::InspectProcessGroup(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    "command process-group member buffer exceeded platform limits",
-                ))
-            })?;
-        // SAFETY: `pids` is writable for exactly `buffer_bytes`, and libproc only
-        // writes pid_t values within that buffer. The process-group id is retained
-        // by the unreaped leader while this query runs.
-        let pids_written = unsafe {
-            proc_listpgrppids(group_id, pids.as_mut_ptr().cast::<c_void>(), buffer_bytes)
-        };
-        if pids_written < 0 {
-            return Err(CommandError::InspectProcessGroup(
-                std::io::Error::last_os_error(),
-            ));
-        }
-        let pids_written = usize::try_from(pids_written).map_err(|_| {
-            CommandError::InspectProcessGroup(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "libproc returned an invalid process-group member count",
-            ))
-        })?;
-        if pids_written >= capacity {
-            if capacity >= MAX_PROCESS_GROUP_MEMBERS {
-                return Err(CommandError::InspectProcessGroup(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    "command process group exceeds the supported member limit",
-                )));
-            }
-            capacity = capacity.checked_mul(2).ok_or_else(|| {
-                CommandError::InspectProcessGroup(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    "command process-group member buffer capacity overflowed",
-                ))
-            })?;
-            continue;
-        }
-        return Ok(pids[..pids_written]
-            .iter()
-            .copied()
-            .any(|pid| pid != 0 && pid != group_id));
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_group_has_members_other_than_leader(
-    child: &GroupChild,
-    tracker: &mut ProcessGroupTracker,
-) -> Result<bool, CommandError> {
-    let group_id = child.id();
-    if let Some(pid) = tracker.known_member.take() {
-        if linux_process_group(pid)? == Some(group_id) {
-            tracker.known_member = Some(pid);
-            return Ok(true);
-        }
-    }
-    let entries = std::fs::read_dir("/proc").map_err(CommandError::InspectProcessGroup)?;
-    for entry in entries {
-        let entry = entry.map_err(CommandError::InspectProcessGroup)?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == group_id {
-            continue;
-        }
-        if linux_process_group(pid)? == Some(group_id) {
-            tracker.known_member = Some(pid);
-            return Ok(true);
-        }
-    }
-    // `/proc` enumeration is not an atomic snapshot. The unreaped leader still
-    // owns the process-group id here, so one final group signal safely closes a
-    // fork/exit transition that the directory walk could otherwise miss. A
-    // terminal leader ignores the signal; any missed residual member cannot
-    // mutate the workspace after a successful return.
-    kill_process_group_by_id(group_id).map_err(CommandError::Kill)?;
-    Ok(false)
-}
-
-#[cfg(target_os = "linux")]
-fn linux_process_group(pid: u32) -> Result<Option<u32>, CommandError> {
-    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
-        Err(source) => return Err(CommandError::InspectProcessGroup(source)),
-    };
-    let delimiter = stat
-        .windows(2)
-        .rposition(|window| window == b") ")
-        .ok_or_else(|| {
-            CommandError::InspectProcessGroup(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("process {pid} returned malformed /proc stat data"),
-            ))
-        })?;
-    let group = stat[delimiter + 2..]
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .nth(2)
-        .and_then(|field| std::str::from_utf8(field).ok())
-        .and_then(|field| field.parse::<u32>().ok())
-        .ok_or_else(|| {
-            CommandError::InspectProcessGroup(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("process {pid} returned an invalid process-group id"),
-            ))
-        })?;
-    Ok(Some(group))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_group_has_members_other_than_leader(
-    _child: &GroupChild,
-    _tracker: &mut ProcessGroupTracker,
-) -> Result<bool, CommandError> {
-    Err(CommandError::InspectProcessGroup(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "stable command process-group membership inspection is not supported on this platform",
     )))
 }
 
@@ -650,8 +489,15 @@ fn make_nonblocking<F>(_file: &F) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
+    const SUPERVISOR: &str = "/bin/sh -c \"$1\" /bin/sh\n__young_agent_supervisor_status=$?\n(sleep 2147483647) >/dev/null 2>&1 &\nexit \"$__young_agent_supervisor_status\"\n";
+
+    let mut inner = String::with_capacity(command.len() + 96);
+    inner.push_str(command);
+    inner.push_str(
+        "\n__young_agent_foreground_status=$?\nwait\nexit \"$__young_agent_foreground_status\"\n",
+    );
     let mut process = Command::new("/bin/sh");
-    process.args(["-c", command]);
+    process.args(["-c", SUPERVISOR, "/bin/sh", &inner]);
     process
 }
 
@@ -775,7 +621,6 @@ pub(crate) enum CommandError {
     Spawn(std::io::Error),
     WorkspaceChanged(std::io::Error),
     ConfigureOutput(std::io::Error),
-    InspectProcessGroup(std::io::Error),
     Kill(std::io::Error),
     Wait(std::io::Error),
     ReadOutput(std::io::Error),
@@ -783,6 +628,8 @@ pub(crate) enum CommandError {
     Cancelled,
     OutputIncomplete,
     TerminationUnverified,
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    UnsupportedProcessTracking,
 }
 
 impl CommandError {
@@ -791,7 +638,6 @@ impl CommandError {
             Self::Spawn(_) => "command_spawn_failed",
             Self::WorkspaceChanged(_) => "workspace_changed",
             Self::ConfigureOutput(_)
-            | Self::InspectProcessGroup(_)
             | Self::Kill(_)
             | Self::Wait(_)
             | Self::ReadOutput(_)
@@ -799,6 +645,8 @@ impl CommandError {
             Self::Cancelled => "tool_cancelled",
             Self::OutputIncomplete => "command_output_incomplete",
             Self::TerminationUnverified => "command_termination_unverified",
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            Self::UnsupportedProcessTracking => "command_process_tracking_unsupported",
         }
     }
 
@@ -806,7 +654,6 @@ impl CommandError {
         matches!(
             self,
             Self::ConfigureOutput(source)
-            | Self::InspectProcessGroup(source)
             | Self::Kill(source)
             | Self::Wait(source)
             | Self::ReadOutput(source)
@@ -831,9 +678,6 @@ impl fmt::Display for CommandError {
                     "failed to configure command output capture: {source}"
                 )
             }
-            Self::InspectProcessGroup(source) => {
-                write!(formatter, "failed to inspect command process group: {source}")
-            }
             Self::Kill(source) => write!(formatter, "failed to terminate command group: {source}"),
             Self::Wait(source) => write!(formatter, "failed to wait for command: {source}"),
             Self::ReadOutput(source) => {
@@ -845,6 +689,10 @@ impl fmt::Display for CommandError {
                 .write_str("command output remained open after the command process group exited"),
             Self::TerminationUnverified => formatter.write_str(
                 "command process group was terminated, but detached descendants could not be verified",
+            ),
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            Self::UnsupportedProcessTracking => formatter.write_str(
+                "stable command process-group tracking is not supported on this platform",
             ),
         }
     }
