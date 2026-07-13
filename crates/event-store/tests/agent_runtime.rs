@@ -12,7 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use young_agent_runtime::{
     AgentEvent, AgentEventSink, AgentRuntime, AgentRuntimeError, ApprovalDecision, ApprovalRequest,
-    RunControl, RunControlFlow, RunId, RunRequest, RunStatus, RunStopToken, TerminalRunStatus,
+    EventDurability, RunControl, RunControlFlow, RunId, RunRequest, RunStatus, RunStopToken,
+    TerminalRunStatus,
 };
 use young_event_store::JsonlEventStore;
 use young_model_runtime::{
@@ -176,6 +177,64 @@ struct FailOnRunFinishedSink {
     events: Rc<RefCell<Vec<AgentEvent>>>,
 }
 
+#[derive(Clone, Copy)]
+enum AmbiguousFailureTiming {
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[derive(Clone, Copy)]
+enum AmbiguousFailureTarget {
+    ApprovalResolved,
+    Error,
+}
+
+struct AmbiguousNonCloneSink {
+    events: Vec<AgentEvent>,
+    timing: AmbiguousFailureTiming,
+    target: AmbiguousFailureTarget,
+    failed: bool,
+}
+
+impl AmbiguousNonCloneSink {
+    fn new(timing: AmbiguousFailureTiming, target: AmbiguousFailureTarget) -> Self {
+        Self {
+            events: Vec::new(),
+            timing,
+            target,
+            failed: false,
+        }
+    }
+
+    fn is_target(&self, event: &AgentEvent) -> bool {
+        matches!(
+            (self.target, event),
+            (
+                AmbiguousFailureTarget::ApprovalResolved,
+                AgentEvent::ApprovalResolved { .. }
+            ) | (AmbiguousFailureTarget::Error, AgentEvent::Error { .. })
+        )
+    }
+
+    fn append_ambiguously(&mut self, event: &AgentEvent) -> Result<(), TestSinkError> {
+        if !self.failed && self.is_target(event) {
+            self.failed = true;
+            if matches!(self.timing, AmbiguousFailureTiming::AfterCommit) {
+                self.events.push(event.clone());
+            }
+            return Err(TestSinkError);
+        }
+        self.events.push(event.clone());
+        Ok(())
+    }
+
+    fn reconcile(&mut self, event: &AgentEvent) {
+        if !self.events.contains(event) {
+            self.events.push(event.clone());
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct DurabilitySpySink {
     events: Rc<RefCell<Vec<(AgentEvent, bool)>>>,
@@ -234,6 +293,18 @@ impl AgentEventSink for FailOnRunFinishedSink {
         }
         self.events.borrow_mut().push(event.clone());
         Ok(())
+    }
+}
+
+impl AgentEventSink for AmbiguousNonCloneSink {
+    type Error = TestSinkError;
+
+    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.append_ambiguously(event)
+    }
+
+    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.append_ambiguously(event)
     }
 }
 
@@ -1044,7 +1115,12 @@ fn terminal_persistence_failure_returns_the_event_for_reconciliation() {
         .expect_err("terminal durability failure must require reconciliation");
 
     let terminal_event = match error {
-        AgentRuntimeError::TerminalPersistenceIndeterminate { event, .. } => *event,
+        AgentRuntimeError::EventPersistenceIndeterminate {
+            event, durability, ..
+        } => {
+            assert_eq!(durability, EventDurability::Durable);
+            *event
+        }
         other => panic!("expected terminal persistence recovery error, got {other:?}"),
     };
     assert!(matches!(
@@ -1096,7 +1172,12 @@ fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_t
         .expect_err("ToolResult persistence failure must stop the run");
 
     let recovery_event = match error {
-        AgentRuntimeError::ToolResultPersistenceIndeterminate { event, .. } => *event,
+        AgentRuntimeError::EventPersistenceIndeterminate {
+            event, durability, ..
+        } => {
+            assert_eq!(durability, EventDurability::Durable);
+            *event
+        }
         other => panic!("expected ToolResult recovery error, got {other:?}"),
     };
     assert!(matches!(
@@ -1118,6 +1199,163 @@ fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_t
             call_ids: vec![runtime.tool_executor().calls()[0].id.clone()],
         }
     );
+}
+
+struct DenyingControl;
+
+impl RunControl for DenyingControl {
+    fn checkpoint(&mut self) -> RunControlFlow {
+        RunControlFlow::Continue
+    }
+
+    fn decide_approval(
+        &mut self,
+        _request: &ApprovalRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Deny {
+            reason: "policy denied this exact invocation at decision time".to_string(),
+        }
+    }
+}
+
+#[test]
+fn approval_resolution_persistence_failure_preserves_the_decision_and_is_reconcilable() {
+    for timing in [
+        AmbiguousFailureTiming::BeforeCommit,
+        AmbiguousFailureTiming::AfterCommit,
+    ] {
+        let model = FakeModelClient::new([ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-call-001"),
+                name: "run_command".to_string(),
+                arguments: json!({ "command": "cargo test" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ])]);
+        let tools = FakeToolExecutor::requiring_approval(
+            "command requires approval",
+            [ToolOutput::Success {
+                content: Vec::new(),
+                metadata: no_extensions(),
+                extensions: no_extensions(),
+            }],
+        );
+        let sink = AmbiguousNonCloneSink::new(timing, AmbiguousFailureTarget::ApprovalResolved);
+        let mut runtime = AgentRuntime::new(model, tools, sink);
+
+        let error = runtime
+            .run_with_control(
+                run_request("run-approval-resolution-persistence-failure"),
+                &mut DenyingControl,
+            )
+            .expect_err("ambiguous approval resolution persistence must stop the run");
+
+        let recovery_event = match error {
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                event, durability, ..
+            } => {
+                assert_eq!(durability, EventDurability::Durable);
+                *event
+            }
+            other => panic!("expected event persistence recovery error, got {other:?}"),
+        };
+        assert!(matches!(
+            &recovery_event,
+            AgentEvent::ApprovalResolved {
+                decision: ApprovalDecision::Deny { reason },
+                ..
+            } if reason == "policy denied this exact invocation at decision time"
+        ));
+        assert!(runtime.tool_executor().calls().is_empty());
+
+        runtime.event_sink_mut().reconcile(&recovery_event);
+        assert_eq!(
+            runtime
+                .event_sink()
+                .events
+                .iter()
+                .filter(|event| **event == recovery_event)
+                .count(),
+            1
+        );
+
+        let (_, _, recovered_sink) = runtime.into_parts();
+        assert_eq!(
+            recovered_sink
+                .events
+                .iter()
+                .filter(|event| **event == recovery_event)
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn buffered_error_persistence_failure_carries_the_attempted_event_for_reconciliation() {
+    for timing in [
+        AmbiguousFailureTiming::BeforeCommit,
+        AmbiguousFailureTiming::AfterCommit,
+    ] {
+        let model = FakeModelClient::new([ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-call-001"),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "missing" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ])]);
+        let tools = FakeToolExecutor::new([ToolOutput::Failure {
+            error: ToolError {
+                code: "not_found".to_string(),
+                message: "missing file".to_string(),
+                retryable: false,
+            },
+            extensions: no_extensions(),
+        }]);
+        let sink = AmbiguousNonCloneSink::new(timing, AmbiguousFailureTarget::Error);
+        let mut runtime = AgentRuntime::new(model, tools, sink);
+
+        let error = runtime
+            .run(run_request("run-error-persistence-failure"))
+            .expect_err("ambiguous Error persistence must stop the run");
+
+        let recovery_event = match error {
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                event, durability, ..
+            } => {
+                assert_eq!(durability, EventDurability::Buffered);
+                *event
+            }
+            other => panic!("expected event persistence recovery error, got {other:?}"),
+        };
+        assert!(matches!(
+            &recovery_event,
+            AgentEvent::Error { error, .. }
+                if error.code == "not_found" && error.message == "missing file"
+        ));
+        assert_eq!(runtime.tool_executor().calls().len(), 1);
+
+        runtime.event_sink_mut().reconcile(&recovery_event);
+        assert_eq!(
+            runtime
+                .event_sink()
+                .events
+                .iter()
+                .filter(|event| **event == recovery_event)
+                .count(),
+            1
+        );
+    }
 }
 
 #[derive(Default)]

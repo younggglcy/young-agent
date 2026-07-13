@@ -31,6 +31,15 @@ pub trait AgentEventSink {
     fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error>;
 }
 
+/// The persistence guarantee requested for an Agent Event append.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventDurability {
+    /// The event only needed to reach the sink's normal append boundary.
+    Buffered,
+    /// The event's commit marker needed to reach stable storage.
+    Durable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunControlFlow {
     Continue,
@@ -220,6 +229,25 @@ impl<M, T, S> AgentRuntime<M, T, S> {
 
     pub fn tool_executor(&self) -> &T {
         &self.tool_executor
+    }
+
+    /// Returns the event sink so callers can inspect its canonical log after
+    /// an indeterminate persistence result.
+    pub fn event_sink(&self) -> &S {
+        &self.event_sink
+    }
+
+    /// Returns mutable access to the event sink for explicit reconciliation.
+    /// Callers must inspect the canonical log before retrying an ambiguous
+    /// append, and must not resume the failed runtime step.
+    pub fn event_sink_mut(&mut self) -> &mut S {
+        &mut self.event_sink
+    }
+
+    /// Consumes the runtime and returns all owned adapters. This lets callers
+    /// transfer a non-`Clone` sink to a dedicated recovery workflow.
+    pub fn into_parts(self) -> (M, T, S) {
+        (self.model_client, self.tool_executor, self.event_sink)
     }
 }
 
@@ -611,24 +639,27 @@ where
     }
 
     fn emit(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink
-            .append(event)
-            .map_err(AgentRuntimeError::EventSink)
-    }
-
-    fn emit_durable(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink
-            .append_durable(event)
-            .map_err(AgentRuntimeError::EventSink)
-    }
-
-    fn emit_tool_result(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink.append_durable(event).map_err(|source| {
-            AgentRuntimeError::ToolResultPersistenceIndeterminate {
+        self.event_sink.append(event).map_err(|source| {
+            AgentRuntimeError::EventPersistenceIndeterminate {
                 event: Box::new(event.clone()),
+                durability: EventDurability::Buffered,
                 source,
             }
         })
+    }
+
+    fn emit_durable(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
+        self.event_sink.append_durable(event).map_err(|source| {
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                event: Box::new(event.clone()),
+                durability: EventDurability::Durable,
+                source,
+            }
+        })
+    }
+
+    fn emit_tool_result(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
+        self.emit_durable(event)
     }
 
     fn finish_model_error(
@@ -678,12 +709,7 @@ where
             status: status.clone(),
             extensions: BTreeMap::new(),
         };
-        self.event_sink.append_durable(&event).map_err(|source| {
-            AgentRuntimeError::TerminalPersistenceIndeterminate {
-                event: Box::new(event),
-                source,
-            }
-        })?;
+        self.emit_durable(&event)?;
         Ok(RunOutcome { status })
     }
 }
@@ -732,21 +758,13 @@ fn normalize_tool_output(output: ToolOutput) -> ToolOutput {
 #[derive(Debug)]
 pub enum AgentRuntimeError<E> {
     /// A stop token is a one-run terminal latch and cannot be reused.
-    StopTokenAlreadyBound {
-        run_id: RunId,
-    },
-    EventSink(E),
-    /// The tool returned, but its result could not be recorded. The caller
-    /// must reconcile or retry persistence of `event`; it must not execute the
-    /// tool call again because its external side effects are indeterminate.
-    ToolResultPersistenceIndeterminate {
+    StopTokenAlreadyBound { run_id: RunId },
+    /// The sink returned an error from an append whose commit state may be
+    /// ambiguous. The caller must reconcile the exact `event` at the requested
+    /// durability without resuming or repeating the failed runtime step.
+    EventPersistenceIndeterminate {
         event: Box<AgentEvent>,
-        source: E,
-    },
-    /// The terminal winner was chosen, but its canonical commit may or may not
-    /// have reached stable storage. Reconcile `event` without rerunning.
-    TerminalPersistenceIndeterminate {
-        event: Box<AgentEvent>,
+        durability: EventDurability,
         source: E,
     },
 }
@@ -759,15 +777,24 @@ impl<E: fmt::Display> fmt::Display for AgentRuntimeError<E> {
                 "RunStopToken is already bound to Agent Run '{}'",
                 run_id.as_str()
             ),
-            Self::EventSink(source) => write!(formatter, "failed to append Agent Event: {source}"),
-            Self::ToolResultPersistenceIndeterminate { event, source } => write!(
-                formatter,
-                "tool execution completed but persistence of its result Agent Event is indeterminate; inspect and reconcile the Event Log without re-executing the tool: {event:?}: {source}"
-            ),
-            Self::TerminalPersistenceIndeterminate { event, source } => write!(
-                formatter,
-                "terminal status was chosen but persistence of its RunFinished event is indeterminate; inspect and reconcile the Event Log without rerunning the Agent Run: {event:?}: {source}"
-            ),
+            Self::EventPersistenceIndeterminate {
+                event,
+                durability,
+                source,
+            } => match event.as_ref() {
+                AgentEvent::ToolResult { .. } => write!(
+                    formatter,
+                    "tool execution completed but persistence of its result Agent Event is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without re-executing the tool: {event:?}: {source}"
+                ),
+                AgentEvent::RunFinished { .. } => write!(
+                    formatter,
+                    "terminal status was chosen but persistence of its RunFinished event is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without rerunning the Agent Run: {event:?}: {source}"
+                ),
+                _ => write!(
+                    formatter,
+                    "persistence of an Agent Event is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without resuming the failed runtime step: {event:?}: {source}"
+                ),
+            },
         }
     }
 }
@@ -776,9 +803,7 @@ impl<E: Error + 'static> Error for AgentRuntimeError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::StopTokenAlreadyBound { .. } => None,
-            Self::EventSink(source)
-            | Self::ToolResultPersistenceIndeterminate { source, .. }
-            | Self::TerminalPersistenceIndeterminate { source, .. } => Some(source),
+            Self::EventPersistenceIndeterminate { source, .. } => Some(source),
         }
     }
 }

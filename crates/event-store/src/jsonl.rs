@@ -66,6 +66,53 @@ impl JsonlEventStore {
         self.append_with_durability(event, true)
     }
 
+    /// Idempotently establishes one exact canonical event at the durable
+    /// boundary after an ambiguous append failure.
+    ///
+    /// The caller must ensure no live runtime or other recovery worker can
+    /// append to this log. A committed matching record is synchronized again;
+    /// an uncommitted tail is repaired before a missing record is appended.
+    pub fn reconcile_durable(&self, event: &AgentEvent) -> Result<(), EventStoreError> {
+        if !has_durable_identity(event) {
+            return Err(EventStoreError::UnsupportedReconciliationEvent {
+                path: self.path.clone(),
+                event: Box::new(event.clone()),
+            });
+        }
+        if self.path.exists() {
+            self.repair_truncated_tail()?;
+            if let Some(persisted) = self
+                .read_all()?
+                .into_iter()
+                .find(|persisted| has_same_durable_identity(persisted, event))
+            {
+                if persisted != *event {
+                    return Err(EventStoreError::ReconciliationConflict {
+                        path: self.path.clone(),
+                        persisted: Box::new(persisted),
+                        attempted: Box::new(event.clone()),
+                    });
+                }
+                let file = OpenOptions::new()
+                    .read(true)
+                    .open(&self.path)
+                    .map_err(|source| EventStoreError::OpenForAppend {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                file.sync_data()
+                    .and_then(|()| self.sync_parent_directory())
+                    .map_err(|source| EventStoreError::Append {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                return Ok(());
+            }
+        }
+
+        self.append_durable(event)
+    }
+
     fn append_with_durability(
         &self,
         event: &AgentEvent,
@@ -313,6 +360,79 @@ impl JsonlEventStore {
     }
 }
 
+fn has_durable_identity(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::ToolCallRequested { .. }
+            | AgentEvent::ApprovalRequested { .. }
+            | AgentEvent::ApprovalResolved { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::RunFinished { .. }
+    )
+}
+
+fn has_same_durable_identity(left: &AgentEvent, right: &AgentEvent) -> bool {
+    match (left, right) {
+        (
+            AgentEvent::ToolCallRequested {
+                run_id: left_run,
+                call: left_call,
+                ..
+            },
+            AgentEvent::ToolCallRequested {
+                run_id: right_run,
+                call: right_call,
+                ..
+            },
+        ) => left_run == right_run && left_call.id == right_call.id,
+        (
+            AgentEvent::ApprovalRequested {
+                run_id: left_run,
+                request: left_request,
+                ..
+            },
+            AgentEvent::ApprovalRequested {
+                run_id: right_run,
+                request: right_request,
+                ..
+            },
+        ) => left_run == right_run && left_request.id == right_request.id,
+        (
+            AgentEvent::ApprovalResolved {
+                run_id: left_run,
+                approval_id: left_approval,
+                ..
+            },
+            AgentEvent::ApprovalResolved {
+                run_id: right_run,
+                approval_id: right_approval,
+                ..
+            },
+        ) => left_run == right_run && left_approval == right_approval,
+        (
+            AgentEvent::ToolResult {
+                run_id: left_run,
+                result: left_result,
+                ..
+            },
+            AgentEvent::ToolResult {
+                run_id: right_run,
+                result: right_result,
+                ..
+            },
+        ) => left_run == right_run && left_result.call_id == right_result.call_id,
+        (
+            AgentEvent::RunFinished {
+                run_id: left_run, ..
+            },
+            AgentEvent::RunFinished {
+                run_id: right_run, ..
+            },
+        ) => left_run == right_run,
+        _ => false,
+    }
+}
+
 impl AgentEventSink for JsonlEventStore {
     type Error = EventStoreError;
 
@@ -379,6 +499,15 @@ pub enum EventStoreError {
         path: PathBuf,
         source: ReplayError,
     },
+    UnsupportedReconciliationEvent {
+        path: PathBuf,
+        event: Box<AgentEvent>,
+    },
+    ReconciliationConflict {
+        path: PathBuf,
+        persisted: Box<AgentEvent>,
+        attempted: Box<AgentEvent>,
+    },
 }
 
 impl fmt::Display for EventStoreError {
@@ -444,6 +573,20 @@ impl fmt::Display for EventStoreError {
                 "failed to replay Event Log '{}': {source}",
                 path.display()
             ),
+            Self::UnsupportedReconciliationEvent { path, event } => write!(
+                formatter,
+                "cannot idempotently reconcile Agent Event without a durable identity in '{}': {event:?}",
+                path.display()
+            ),
+            Self::ReconciliationConflict {
+                path,
+                persisted,
+                attempted,
+            } => write!(
+                formatter,
+                "durable Agent Event identity has conflicting payloads in '{}'; persisted {persisted:?}, attempted {attempted:?}",
+                path.display()
+            ),
         }
     }
 }
@@ -459,7 +602,10 @@ impl Error for EventStoreError {
             | Self::Append { source, .. }
             | Self::OpenForRead { source, .. }
             | Self::ReadRecord { source, .. } => Some(source),
-            Self::UnterminatedLog { .. } | Self::TruncatedRecord { .. } => None,
+            Self::UnterminatedLog { .. }
+            | Self::TruncatedRecord { .. }
+            | Self::UnsupportedReconciliationEvent { .. }
+            | Self::ReconciliationConflict { .. } => None,
             Self::Replay { source, .. } => Some(source),
         }
     }

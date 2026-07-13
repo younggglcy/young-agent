@@ -1022,6 +1022,102 @@ fn explicit_tail_repair_discards_only_the_uncommitted_final_record() {
 }
 
 #[test]
+fn durable_event_reconciliation_is_idempotent_before_and_after_commit() {
+    for (name, already_committed) in [
+        ("reconcile-before-commit", false),
+        ("reconcile-after-commit", true),
+    ] {
+        let log = TestLog::new(name);
+        let store = JsonlEventStore::new(log.path());
+        let event = agent_event(json!({
+            "type": "approval_resolved",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "approval_id": "approval-001",
+            "decision": {
+                "decision": "deny",
+                "reason": "policy denied this exact invocation at decision time"
+            }
+        }));
+        if already_committed {
+            store
+                .append_durable(&event)
+                .expect("fixture event should commit durably");
+        }
+
+        store
+            .reconcile_durable(&event)
+            .expect("first reconciliation should establish one durable event");
+        store
+            .reconcile_durable(&event)
+            .expect("repeated reconciliation should be idempotent");
+
+        assert_eq!(
+            store.read_all().expect("reconciled log should read"),
+            [event]
+        );
+    }
+}
+
+#[test]
+fn durable_event_reconciliation_rejects_conflicting_identity() {
+    let log = TestLog::new("reconcile-conflict");
+    let store = JsonlEventStore::new(log.path());
+    let committed = agent_event(json!({
+        "type": "approval_resolved",
+        "run_id": "run-001",
+        "turn_id": "turn-001",
+        "approval_id": "approval-001",
+        "decision": { "decision": "approve" }
+    }));
+    let conflicting = agent_event(json!({
+        "type": "approval_resolved",
+        "run_id": "run-001",
+        "turn_id": "turn-001",
+        "approval_id": "approval-001",
+        "decision": { "decision": "deny", "reason": "late policy result" }
+    }));
+    store
+        .append_durable(&committed)
+        .expect("fixture event should commit");
+
+    let error = store
+        .reconcile_durable(&conflicting)
+        .expect_err("one durable identity cannot resolve to two payloads");
+
+    assert!(matches!(
+        error,
+        EventStoreError::ReconciliationConflict { .. }
+    ));
+    assert_eq!(
+        store.read_all().expect("original log should read"),
+        [committed]
+    );
+}
+
+#[test]
+fn durable_event_reconciliation_rejects_events_without_stable_identity() {
+    let log = TestLog::new("reconcile-unsupported-event");
+    let store = JsonlEventStore::new(log.path());
+    let model_output = agent_event(json!({
+        "type": "model_output",
+        "run_id": "run-001",
+        "turn_id": "turn-001",
+        "event": { "type": "text_delta", "delta": "same" }
+    }));
+
+    let error = store
+        .reconcile_durable(&model_output)
+        .expect_err("repeatable stream events have no idempotent durable identity");
+
+    assert!(matches!(
+        error,
+        EventStoreError::UnsupportedReconciliationEvent { .. }
+    ));
+    assert!(!log.path().exists());
+}
+
+#[test]
 fn unsupported_event_type_reports_its_path_line_and_schema_error() {
     let log = TestLog::new("unsupported");
     std::fs::write(
