@@ -9,7 +9,10 @@ use young_model_runtime::{
     ModelClient, ModelError, ModelMessage, ModelMessageContent, ModelRequest, ModelStreamEvent,
     ModelToolCall, ModelToolSpec,
 };
-use young_tool_runtime::{ToolCall, ToolCallId, ToolContent, ToolExecutor, ToolOutput, ToolResult};
+use young_tool_runtime::{
+    ToolCall, ToolCallId, ToolContent, ToolDispatcher, ToolExecutionAuthorization, ToolOutput,
+    ToolResult,
+};
 
 use crate::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, EventSequence, RunId,
@@ -217,17 +220,17 @@ struct RunSequences {
 
 pub struct AgentRuntime<M, T, S> {
     model_client: M,
-    tool_executor: T,
+    tool_dispatcher: T,
     event_sink: S,
     next_event_sequence: u64,
     started_run_id: Option<RunId>,
 }
 
 impl<M, T, S> AgentRuntime<M, T, S> {
-    pub fn new(model_client: M, tool_executor: T, event_sink: S) -> Self {
+    pub fn new(model_client: M, tool_dispatcher: T, event_sink: S) -> Self {
         Self {
             model_client,
-            tool_executor,
+            tool_dispatcher,
             event_sink,
             next_event_sequence: 1,
             started_run_id: None,
@@ -238,8 +241,8 @@ impl<M, T, S> AgentRuntime<M, T, S> {
         &self.model_client
     }
 
-    pub fn tool_executor(&self) -> &T {
-        &self.tool_executor
+    pub fn tool_dispatcher(&self) -> &T {
+        &self.tool_dispatcher
     }
 
     /// Returns the event sink so callers can inspect its canonical log after
@@ -258,14 +261,14 @@ impl<M, T, S> AgentRuntime<M, T, S> {
     /// Consumes the runtime and returns all owned adapters. This lets callers
     /// transfer a non-`Clone` sink to a dedicated recovery workflow.
     pub fn into_parts(self) -> (M, T, S) {
-        (self.model_client, self.tool_executor, self.event_sink)
+        (self.model_client, self.tool_dispatcher, self.event_sink)
     }
 }
 
 impl<M, T, S> AgentRuntime<M, T, S>
 where
     M: ModelClient,
-    T: ToolExecutor,
+    T: ToolDispatcher,
     S: AgentEventSink,
 {
     pub fn run(&mut self, request: RunRequest) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
@@ -556,11 +559,15 @@ where
             unreachable!("requested_event is constructed as AgentEvent::ToolCallRequested")
         };
 
-        let output = if let Some(reason) = self.tool_executor.approval_reason(&call) {
+        let prepared = self.tool_dispatcher.prepare(call);
+        let call_id = prepared.call().id.clone();
+        let approval_reason = prepared.approval_reason().map(str::to_owned);
+
+        let output = if let Some(reason) = approval_reason {
             sequences.approval += 1;
             let approval = ApprovalRequest {
                 id: format!("{}-approval-{:03}", run_id.as_str(), sequences.approval),
-                call: call.clone(),
+                call: prepared.call().clone(),
                 reason,
             };
             let approval_event = AgentEvent::ApprovalRequested {
@@ -600,8 +607,12 @@ where
                             .finish(run_id, status, stop)
                             .map(ToolCallProgress::Finished);
                     }
-                    normalize_tool_output(
-                        self.tool_executor.execute(&call, stop.cancellation_flag()),
+                    self.tool_dispatcher.execute_prepared(
+                        prepared,
+                        ToolExecutionAuthorization::ApprovalGranted {
+                            call_id: call_id.clone(),
+                        },
+                        stop.cancellation_flag(),
                     )
                 }
                 ApprovalDecision::Deny { reason } => ToolOutput::Failure {
@@ -619,13 +630,14 @@ where
                     .finish(run_id, status, stop)
                     .map(ToolCallProgress::Finished);
             }
-            normalize_tool_output(self.tool_executor.execute(&call, stop.cancellation_flag()))
+            self.tool_dispatcher.execute_prepared(
+                prepared,
+                ToolExecutionAuthorization::NotRequired,
+                stop.cancellation_flag(),
+            )
         };
 
-        let result = ToolResult {
-            call_id: call.id.clone(),
-            output,
-        };
+        let result = ToolResult { call_id, output };
         let result_event = AgentEvent::ToolResult {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
@@ -778,23 +790,6 @@ fn tool_result_content(output: ToolOutput) -> Vec<ModelMessageContent> {
         failure @ ToolOutput::Failure { .. } => vec![ModelMessageContent::json(
             serde_json::to_value(failure).expect("ToolOutput is serializable"),
         )],
-    }
-}
-
-fn normalize_tool_output(output: ToolOutput) -> ToolOutput {
-    match output {
-        ToolOutput::Failure { error, .. } if error.code == "approval_denied" => {
-            ToolOutput::Failure {
-                error: young_tool_runtime::ToolError {
-                    code: "reserved_tool_error_code".to_string(),
-                    message: "tool executor returned reserved error code 'approval_denied'"
-                        .to_string(),
-                    retryable: false,
-                },
-                extensions: BTreeMap::new(),
-            }
-        }
-        output => output,
     }
 }
 

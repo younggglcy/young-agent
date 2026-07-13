@@ -2,16 +2,19 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::execution::{ToolCall, ToolError, ToolExecutor, ToolOutput};
+use crate::execution::{
+    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
+};
 
 #[derive(Clone, Debug, Default)]
-pub struct FakeToolExecutor {
+pub struct FakeToolHandler {
     outputs: VecDeque<ToolOutput>,
     calls: Vec<ToolCall>,
     approval_reason: Option<String>,
 }
 
-impl FakeToolExecutor {
+impl FakeToolHandler {
     pub fn new(outputs: impl IntoIterator<Item = ToolOutput>) -> Self {
         Self {
             outputs: outputs.into_iter().collect(),
@@ -40,7 +43,7 @@ impl FakeToolExecutor {
     }
 }
 
-impl ToolExecutor for FakeToolExecutor {
+impl ToolHandler for FakeToolHandler {
     fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
         self.approval_reason.clone()
     }
@@ -52,10 +55,87 @@ impl ToolExecutor for FakeToolExecutor {
             .unwrap_or_else(|| ToolOutput::Failure {
                 error: ToolError {
                     code: "fake_script_exhausted".to_string(),
-                    message: "FakeToolExecutor has no scripted output left".to_string(),
+                    message: "FakeToolHandler has no scripted output left".to_string(),
                     retryable: false,
                 },
                 extensions: Default::default(),
             })
+    }
+}
+
+/// Dedicated external fake for deterministic Agent Runtime tests.
+#[derive(Debug)]
+pub struct FakeToolDispatcher {
+    dispatcher_identity: ToolDispatcherIdentity,
+    handler: FakeToolHandler,
+}
+
+impl Clone for FakeToolDispatcher {
+    fn clone(&self) -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+impl Default for FakeToolDispatcher {
+    fn default() -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            handler: FakeToolHandler::default(),
+        }
+    }
+}
+
+impl FakeToolDispatcher {
+    pub fn new(outputs: impl IntoIterator<Item = ToolOutput>) -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            handler: FakeToolHandler::new(outputs),
+        }
+    }
+
+    pub fn requiring_approval(
+        reason: impl Into<String>,
+        outputs: impl IntoIterator<Item = ToolOutput>,
+    ) -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            handler: FakeToolHandler::requiring_approval(reason, outputs),
+        }
+    }
+
+    pub fn calls(&self) -> &[ToolCall] {
+        self.handler.calls()
+    }
+
+    pub fn remaining_outputs(&self) -> usize {
+        self.handler.remaining_outputs()
+    }
+}
+
+impl crate::execution::sealed::Sealed for FakeToolDispatcher {}
+
+impl ToolDispatcher for FakeToolDispatcher {
+    fn prepare(&self, call: ToolCall) -> PreparedToolCall {
+        match self.handler.approval_reason(&call) {
+            Some(reason) => {
+                PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
+            }
+            None => PreparedToolCall::ready(self.dispatcher_identity, call),
+        }
+    }
+
+    fn execute_prepared(
+        &mut self,
+        prepared: PreparedToolCall,
+        authorization: ToolExecutionAuthorization,
+        cancellation: Arc<AtomicBool>,
+    ) -> ToolOutput {
+        match prepared.into_authorized_call(self.dispatcher_identity, authorization) {
+            Ok(call) => normalize_dispatcher_output(self.handler.execute(&call, cancellation)),
+            Err(output) => output,
+        }
     }
 }
