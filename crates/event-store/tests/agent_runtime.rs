@@ -21,7 +21,8 @@ use young_model_runtime::{
     ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
 use young_tool_runtime::{
-    FakeToolExecutor, ToolCall, ToolContent, ToolError, ToolExecutor, ToolOutput,
+    CapabilityRef, FakeToolExecutor, ToolApprovalPolicy, ToolCall, ToolContent, ToolDefinition,
+    ToolError, ToolExecutor, ToolOutput, ToolRuntime,
 };
 
 struct TestLog {
@@ -129,6 +130,20 @@ impl ModelClient for BlockingModelClient {
 
 struct BlockingToolExecutor {
     entered: Arc<Barrier>,
+}
+
+struct RecordingToolExecutor {
+    executed: Rc<Cell<bool>>,
+    output: Option<ToolOutput>,
+}
+
+impl ToolExecutor for RecordingToolExecutor {
+    fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
+        self.executed.set(true);
+        self.output
+            .take()
+            .expect("recording executor should run exactly once")
+    }
 }
 
 struct BlockingApprovalControl {
@@ -1693,6 +1708,107 @@ fn approval_is_emitted_before_an_approved_fake_tool_executes() {
         .position(|event| matches!(event, AgentEvent::ToolResult { .. }))
         .expect("tool result should be persisted");
     assert!(approval_index < result_index);
+}
+
+#[test]
+fn approved_agent_run_executes_through_the_policy_aware_tool_runtime() {
+    let log = TestLog::new("approval-tool-runtime");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([
+        ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-call-001"),
+                name: "apply_patch".to_string(),
+                arguments: json!({ "patch": "*** Begin Patch" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+        ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "Patch applied.".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+    ]);
+    let executed = Rc::new(Cell::new(false));
+    let mut tools = ToolRuntime::default();
+    tools
+        .register(
+            ToolDefinition {
+                name: "apply_patch".to_string(),
+                description: "Apply a patch inside the workspace.".to_string(),
+                input_schema: json!({ "type": "object" }),
+                output_schema: None,
+                capability: CapabilityRef {
+                    id: "coding".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                approval_policy: ToolApprovalPolicy::RequiresApproval {
+                    reason: "patching mutates workspace files".to_string(),
+                },
+                mcp: None,
+            },
+            RecordingToolExecutor {
+                executed: executed.clone(),
+                output: Some(ToolOutput::Success {
+                    content: vec![ToolContent::Text {
+                        text: "patch applied".to_string(),
+                    }],
+                    metadata: no_extensions(),
+                    extensions: no_extensions(),
+                }),
+            },
+        )
+        .expect("tool registers");
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+    let mut control = ApprovingControl::default();
+
+    let outcome = runtime
+        .run_with_control(run_request("run-approved-tool-runtime"), &mut control)
+        .expect("approved Tool Runtime dispatch should complete");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Completed {
+            final_message: "Patch applied.".to_string(),
+        }
+    );
+    assert!(
+        executed.get(),
+        "registered executor should run after approval"
+    );
+    let events = store.read_all().expect("approval Event Log should read");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ApprovalRequested { request, .. }
+            if request.reason == "patching mutates workspace files"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ApprovalResolved {
+            decision: ApprovalDecision::Approve,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult { result, .. }
+            if matches!(
+                &result.output,
+                ToolOutput::Success { content, .. }
+                    if content == &vec![ToolContent::Text {
+                        text: "patch applied".to_string(),
+                    }]
+            )
+    )));
 }
 
 #[test]
