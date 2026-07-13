@@ -14,8 +14,10 @@ so normally inherited descendants keep the token alive until exit.
 to `deny` and then allow individual audited blocks. It exposes safe functions only. The cwd hook
 owns a cloned directory handle for the full lifetime of the registered hook. The token hook owns
 its close-on-exec source descriptor, duplicates it without close-on-exec after fork, and transfers
-that duplicate to the exec'd process. All hooks are limited to async-signal-safe syscalls with no
-allocation or shared-state access after fork.
+that duplicate to the exec'd process. `PreparedTrackedCommand::spawn_group` consumes the command
+builder, so the parent-side source is necessarily dropped before the spawned child is returned to
+the capability layer. All hooks are limited to async-signal-safe syscalls with no allocation or
+shared-state access after fork.
 
 All capability, runtime, event-store, model, and surface crates continue to inherit the workspace
 lint unchanged. Any new unsafe block requires updating this ADR's scope and reviewing whether it

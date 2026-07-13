@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use command_group::{CommandGroup, GroupChild};
+#[cfg(not(unix))]
+use command_group::CommandGroup;
+use command_group::GroupChild;
 use serde_json::json;
 #[cfg(all(test, unix))]
 use std::cell::Cell;
@@ -173,19 +175,33 @@ impl CommandProcess {
         let descendant_token = None;
         seal_terminal_process_group(&mut self.child, descendant_token)
     }
-}
 
-impl std::ops::Deref for CommandProcess {
-    type Target = GroupChild;
-
-    fn deref(&self) -> &Self::Target {
-        &self.child
+    fn id(&self) -> u32 {
+        self.child.id()
     }
-}
 
-impl std::ops::DerefMut for CommandProcess {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.child
+    fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.inner().stdout.take()
+    }
+
+    fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.inner().stderr.take()
+    }
+
+    fn terminate_group(&mut self) -> Result<(), CommandError> {
+        terminate_command_group(&mut self.child)
+    }
+
+    fn leader_terminal(&self) -> Result<bool, CommandError> {
+        command_leader_terminal(&self.child)
+    }
+
+    fn wait_for_leader_terminal(&self, grace: Duration) -> Result<bool, CommandError> {
+        wait_for_leader_terminal_bounded(&self.child, grace)
+    }
+
+    fn wait_for_group(&mut self) -> Result<ExitStatus, CommandError> {
+        wait_for_command_group(&mut self.child)
     }
 }
 
@@ -207,17 +223,22 @@ impl DescendantToken {
 
 #[cfg(unix)]
 impl DescendantToken {
-    fn register(command: &mut Command) -> Result<Self, CommandError> {
+    fn prepare(
+        command: Command,
+    ) -> Result<(young_platform_process::PreparedTrackedCommand, Self), CommandError> {
         let (reader, writer) = UnixStream::pair().map_err(CommandError::ConfigureOutput)?;
         reader
             .set_nonblocking(true)
             .map_err(CommandError::ConfigureOutput)?;
-        young_platform_process::inherit_descendant_token(command, writer.into())
+        let command = young_platform_process::PreparedTrackedCommand::new(command, writer.into())
             .map_err(CommandError::ConfigureOutput)?;
-        Ok(Self {
-            reader,
-            closed: false,
-        })
+        Ok((
+            command,
+            Self {
+                reader,
+                closed: false,
+            },
+        ))
     }
 
     fn wait_for_close(&mut self, timeout: Duration) -> Result<bool, CommandError> {
@@ -251,17 +272,21 @@ impl DescendantToken {
             return Ok(true);
         }
         let mut buffer = [0u8; 64];
-        loop {
-            match self.reader.read(&mut buffer) {
-                Ok(0) => {
-                    self.closed = true;
-                    return Ok(true);
-                }
-                Ok(_) => {}
-                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
-                Err(source) => return Err(CommandError::ReadOutput(source)),
+        match self.reader.read(&mut buffer) {
+            Ok(0) => {
+                self.closed = true;
+                Ok(true)
             }
+            Ok(_) => Ok(false),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(source) => Err(CommandError::ReadOutput(source)),
         }
     }
 }
@@ -282,29 +307,23 @@ fn run_shell_command(
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
     configure_command_security(&mut process);
-    #[cfg(unix)]
-    let descendant_token = DescendantToken::register(&mut process)?;
-    let child = process
+    process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .group_spawn();
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let (process, descendant_token) = DescendantToken::prepare(process)?;
+    #[cfg(unix)]
+    let child = process.spawn_group();
+    #[cfg(not(unix))]
+    let child = process.group_spawn();
     let child = child.map_err(CommandError::Spawn)?;
-    drop(process);
     #[cfg(unix)]
     let mut child = CommandProcess::tracked(child, descendant_token);
     #[cfg(not(unix))]
     let mut child = CommandProcess::untracked(child);
-    let mut stdout = child
-        .inner()
-        .stdout
-        .take()
-        .expect("stdout was configured as piped");
-    let mut stderr = child
-        .inner()
-        .stderr
-        .take()
-        .expect("stderr was configured as piped");
+    let mut stdout = child.take_stdout().expect("stdout was configured as piped");
+    let mut stderr = child.take_stderr().expect("stderr was configured as piped");
     #[cfg(all(test, unix))]
     let configure_result =
         if INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE.with(|failure| failure.replace(false)) {
@@ -341,10 +360,10 @@ fn run_shell_command(
             if cancellation.load(Ordering::Relaxed) && !cancelled {
                 cancelled = true;
                 if status.is_none() {
-                    terminate_command_group(&mut child)?;
-                    if wait_for_leader_terminal_bounded(&child, TERMINATION_CONFIRM_GRACE)? {
+                    child.terminate_group()?;
+                    if child.wait_for_leader_terminal(TERMINATION_CONFIRM_GRACE)? {
                         child.seal_terminal_group()?;
-                        status = Some(wait_for_command_group(&mut child)?);
+                        status = Some(child.wait_for_group()?);
                     }
                 }
                 forced_at = Some(Instant::now());
@@ -367,13 +386,13 @@ fn run_shell_command(
             }
 
             if status.is_none() && !leader_terminal {
-                leader_terminal = command_leader_terminal(&child)?;
+                leader_terminal = child.leader_terminal()?;
             }
             if status.is_none() && leader_terminal {
                 // Keep the terminal leader unreaped while already-started descendant
                 // forks settle, then terminate the still-reserved process group once.
                 child.seal_terminal_group()?;
-                status = Some(wait_for_command_group(&mut child)?);
+                status = Some(child.wait_for_group()?);
             }
 
             if status.is_some() && stdout_done && stderr_done {
@@ -547,8 +566,15 @@ fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
         INJECT_GROUP_KILL_WRAPPER_FAILURE.with(|failure| failure.set(false));
         fallback.map_err(|fallback| {
             let wrapper = wrapper_result.expect_err("wrapper failure was checked above");
+            let kind = if group_signal_permission_denied(&wrapper)
+                || group_signal_permission_denied(&fallback)
+            {
+                std::io::ErrorKind::PermissionDenied
+            } else {
+                fallback.kind()
+            };
             CommandError::Kill(std::io::Error::new(
-                fallback.kind(),
+                kind,
                 format!(
                     "command-group wrapper failed ({wrapper}); direct process-group termination also failed ({fallback})"
                 ),
@@ -728,13 +754,13 @@ fn cleanup_process_group(
 ) -> Result<(), CommandError> {
     let mut first_error = None;
     if terminate_group {
-        if let Err(source) = terminate_command_group(&mut child) {
+        if let Err(source) = child.terminate_group() {
             first_error = Some(source);
         }
     }
     if !process_exited {
         if terminate_group {
-            match wait_for_leader_terminal_bounded(&child, TERMINATION_CONFIRM_GRACE) {
+            match child.wait_for_leader_terminal(TERMINATION_CONFIRM_GRACE) {
                 Ok(false) => {
                     return Err(supervise_live_command(
                         child,
@@ -764,7 +790,7 @@ fn cleanup_process_group(
                             None,
                         ));
                     }
-                    if let Err(source) = wait_for_command_group(&mut child) {
+                    if let Err(source) = child.wait_for_group() {
                         return Err(supervise_live_command(
                             child,
                             supervision_permit,
@@ -775,7 +801,7 @@ fn cleanup_process_group(
                 }
             }
         } else {
-            if let Err(source) = wait_for_command_group(&mut child) {
+            if let Err(source) = child.wait_for_group() {
                 return Err(supervise_live_command(
                     child,
                     supervision_permit,
@@ -1268,7 +1294,7 @@ fn supervise_command_once(
     now: Instant,
     _supervisor: &CommandSupervisor,
 ) -> bool {
-    if matches!(command_leader_terminal(&command.child), Ok(true)) {
+    if matches!(command.child.leader_terminal(), Ok(true)) {
         if command.child.seal_terminal_group().is_ok() {
             #[cfg(all(test, unix))]
             _supervisor.wait_attempts.fetch_add(1, Ordering::Relaxed);
@@ -1278,10 +1304,10 @@ fn supervise_command_once(
                     "injected supervisor wait failure",
                 )))
             } else {
-                wait_for_command_group(&mut command.child)
+                command.child.wait_for_group()
             };
             #[cfg(not(all(test, unix)))]
-            let wait = wait_for_command_group(&mut command.child);
+            let wait = command.child.wait_for_group();
             if wait.is_ok() {
                 return false;
             }
@@ -1290,7 +1316,7 @@ fn supervise_command_once(
         return true;
     }
     if command.termination_attempts_remaining > 0 {
-        let _ = terminate_command_group(&mut command.child);
+        let _ = command.child.terminate_group();
         command.termination_attempts_remaining -= 1;
         command.next_action = now + command.retry_delay;
         command.retry_delay = command
@@ -1568,8 +1594,10 @@ impl fmt::Display for CommandError {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1582,8 +1610,8 @@ mod tests {
         cleanup_process_group, command_leader_terminal, command_supervisor,
         next_exit_poll_interval, prepare_command_supervision, prepare_command_supervision_with,
         run_shell_command, shell_command, supervise_live_command, supervise_live_command_with,
-        CommandError, CommandProcess, CommandSupervisor, SupervisorAdmissionHealth,
-        SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
+        CommandError, CommandProcess, CommandSupervisor, DescendantToken,
+        SupervisorAdmissionHealth, SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
@@ -1603,6 +1631,56 @@ mod tests {
             next_exit_poll_interval(interval, true),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn descendant_token_observation_is_bounded_under_continuous_writes() {
+        let (reader, mut writer) = UnixStream::pair().expect("token pair is created");
+        reader
+            .set_nonblocking(true)
+            .expect("token reader is nonblocking");
+        writer
+            .set_nonblocking(true)
+            .expect("token writer is nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer_wrote = wrote.clone();
+        let writer_thread = thread::spawn(move || {
+            let payload = [b'x'; 4096];
+            while !writer_stop.load(Ordering::Relaxed) {
+                match writer.write(&payload) {
+                    Ok(bytes) if bytes > 0 => writer_wrote.store(true, Ordering::Release),
+                    Ok(_) => {}
+                    Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::yield_now();
+                    }
+                    Err(source) => panic!("token writer failed: {source}"),
+                }
+            }
+        });
+        let write_deadline = Instant::now() + Duration::from_secs(1);
+        while !wrote.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < write_deadline,
+                "writer should make progress"
+            );
+            thread::yield_now();
+        }
+        let mut token = DescendantToken {
+            reader,
+            closed: false,
+        };
+
+        let started = Instant::now();
+        let closed = token
+            .wait_for_close(Duration::from_millis(5))
+            .expect("token observation succeeds");
+
+        assert!(!closed);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        stop.store(true, Ordering::Relaxed);
+        writer_thread.join().expect("token writer stops");
     }
 
     fn take_last_supervised_command_id() -> u64 {

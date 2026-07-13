@@ -52,34 +52,50 @@ pub fn block_exec_privilege_gain(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 pub fn block_exec_privilege_gain(_command: &mut Command) {}
 
-/// Gives the child an anonymous descriptor whose lifetime is inherited by its
-/// descendants but not retained by the parent.
-///
-/// The source descriptor is made close-on-exec before the hook is registered.
-/// The post-fork hook duplicates it without close-on-exec immediately before
-/// `exec`, so unrelated concurrent spawns cannot inherit the token from the
-/// parent process.
 #[cfg(unix)]
-pub fn inherit_descendant_token(command: &mut Command, token: OwnedFd) -> io::Result<()> {
-    use std::os::unix::process::CommandExt as _;
+#[must_use = "prepared command must be consumed with spawn_group"]
+pub struct PreparedTrackedCommand {
+    command: Command,
+}
 
-    let flags = rustix::io::fcntl_getfd(&token).map_err(io::Error::from)?;
-    rustix::io::fcntl_setfd(&token, flags | rustix::io::FdFlags::CLOEXEC)
-        .map_err(io::Error::from)?;
+#[cfg(unix)]
+impl PreparedTrackedCommand {
+    /// Prepares a one-shot command whose anonymous token is inherited by its
+    /// descendants but not retained by the parent after `spawn_group` returns.
+    ///
+    /// The source descriptor is made close-on-exec before the hook is
+    /// registered. The post-fork hook duplicates it without close-on-exec
+    /// immediately before `exec`, so unrelated concurrent spawns cannot
+    /// inherit the token from the parent process.
+    pub fn new(mut command: Command, token: OwnedFd) -> io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
 
-    // SAFETY: the owned source descriptor outlives the hook. `dup` is
-    // async-signal-safe, and forgetting the returned descriptor only transfers
-    // its lifetime to the exec'd child and descendants; no allocation or
-    // shared-state access occurs after fork.
-    #[allow(unsafe_code)]
-    unsafe {
-        command.pre_exec(move || {
-            let inherited = rustix::io::dup(&token).map_err(io::Error::from)?;
-            std::mem::forget(inherited);
-            Ok(())
-        });
+        let flags = rustix::io::fcntl_getfd(&token).map_err(io::Error::from)?;
+        rustix::io::fcntl_setfd(&token, flags | rustix::io::FdFlags::CLOEXEC)
+            .map_err(io::Error::from)?;
+
+        // SAFETY: the owned source descriptor outlives the hook. `dup` is
+        // async-signal-safe, and forgetting the returned descriptor only
+        // transfers its lifetime to the exec'd child and descendants; no
+        // allocation or shared-state access occurs after fork.
+        #[allow(unsafe_code)]
+        unsafe {
+            command.pre_exec(move || {
+                let inherited = rustix::io::dup(&token).map_err(io::Error::from)?;
+                std::mem::forget(inherited);
+                Ok(())
+            });
+        }
+        Ok(Self { command })
     }
-    Ok(())
+
+    /// Consumes the prepared command, spawns exactly one foreground process
+    /// group, and drops the parent-side token source before returning it.
+    pub fn spawn_group(mut self) -> io::Result<command_group::GroupChild> {
+        use command_group::CommandGroup as _;
+
+        self.command.group_spawn()
+    }
 }
 
 #[cfg(test)]

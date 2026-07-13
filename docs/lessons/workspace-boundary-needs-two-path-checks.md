@@ -51,6 +51,10 @@ unreaped identity 作为 PGID reservation。仅重复固定次数的 `yield + ki
 完成：最后一次 signal 之后，并发 fork 仍可能才完成。child 应额外继承一个匿名 ownership
 token，正常 fork 会原子继承它；parent 先终止 background 与同组残余成员，只有观察到 token
 EOF 才能完成 leader reap 并返回成功，否则把 child、token 与 permit 一起转交 supervisor。
+token source 必须由消费型 prepared-command API 持有，spawn 返回前自动从 parent 关闭；
+`CommandProcess` 也不能用 `DerefMut` 暴露 raw child，而要用显式的 terminate、observe、seal、
+wait 方法维护“token EOF before reap”不变量。token endpoint 可能被后代写入，因此每次观察还
+必须有固定 read budget；未见 EOF 就返回 pending，不能为了 drain payload 卡死唯一 worker。
 成功提交不应依赖
 `/proc` 或 `libproc` 的非原子成员快照；无法提供非回收终态观察的平台应在 spawn 前拒绝。
 Linux 额外用 `no_new_privs` 阻止后代通过 exec 获得新的 signal 权限；macOS 没有等价的

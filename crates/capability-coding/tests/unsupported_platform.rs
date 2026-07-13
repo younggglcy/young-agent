@@ -34,6 +34,7 @@ impl Drop for TestWorkspace {
     }
 }
 
+#[cfg(not(target_os = "freebsd"))]
 #[test]
 fn existing_file_patch_fails_closed_when_metadata_validation_is_unsupported() {
     let root = TestWorkspace::new();
@@ -67,6 +68,7 @@ fn existing_file_patch_fails_closed_when_metadata_validation_is_unsupported() {
     );
 }
 
+#[cfg(not(target_os = "freebsd"))]
 #[test]
 fn new_file_patch_fails_before_creating_staging_on_unsupported_platforms() {
     let root = TestWorkspace::new();
@@ -103,7 +105,6 @@ fn new_file_patch_fails_before_creating_staging_on_unsupported_platforms() {
     }));
 }
 
-#[cfg(not(unix))]
 #[test]
 fn command_reports_unsupported_process_tracking_before_spawn() {
     let root = TestWorkspace::new();
