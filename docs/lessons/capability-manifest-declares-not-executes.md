@@ -34,8 +34,8 @@ protocol framing。
 
 ## 下次怎么做
 
-- Issue #7 实现真实 coding tools 时，替换 capability 内的显式 stub handler，
-  不要把 workspace 或 git 概念放进通用 Tool Runtime。
+- Issue #7 已把显式 stub handler 替换成绑定 `CodingWorkspace` 的真实 coding
+  tools；workspace 与 git 概念继续留在 capability 内，没有进入通用 Tool Runtime。
 - Issue #8 实现 command policy 时，保持“manifest 声明 `call_dependent`、具体
   handler 分类、Agent Runtime 处理审批事件”的方向，不让 `run_command` 自己
   发 Agent Event。
