@@ -47,7 +47,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "apply_patch"
-description = "Apply a unified diff to UTF-8 files inside the workspace boundary."
+description = "Apply a unified diff to UTF-8 files inside the workspace boundary and report preserved recovery files."
 safety_class = "requires_approval"
 safety_reason = "patching mutates workspace files"
 
@@ -66,7 +66,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "run_command"
-description = "Run a shell command with the workspace root as its working directory."
+description = "Run a shell command in a workspace-bound foreground process group; detached descendants are not tracked."
 safety_class = "call_dependent"
 
 [tools.input_schema]

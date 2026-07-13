@@ -179,7 +179,7 @@ impl CodingWorkspace {
         path: &Path,
         content: &[u8],
         expected_snapshot: FileSnapshot,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<PathBuf>> {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -193,7 +193,9 @@ impl CodingWorkspace {
             return Err(patch_target_changed());
         }
         let staged = self.stage_content(&directory, content, Some(&metadata))?;
-        self.commit_existing_file(&directory, staged, Path::new(file_name), metadata)
+        let recovery =
+            self.commit_existing_file(&directory, staged, Path::new(file_name), metadata)?;
+        Ok(Some(parent.join(recovery)))
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -402,12 +404,12 @@ impl CodingWorkspace {
         mut staged: StagedFile,
         path: &Path,
         mut expected: ReplacementMetadata,
-    ) -> io::Result<()> {
+    ) -> io::Result<PathBuf> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             if let Err(source) = self
                 .validate_staging_slot(directory, &staged)
-                .and_then(|()| validate_replacement_slot_identity(directory, path, &expected))
+                .and_then(|()| validate_replacement_slot(directory, path, &expected))
             {
                 return cleanup_owned_staging_after_error(directory, &staged, source);
             }
@@ -441,10 +443,12 @@ impl CodingWorkspace {
             if let Err(source) = refresh_replacement_after_rename(&mut expected) {
                 return Err(published_target_changed(path, Some(&recovery_path), source));
             }
-            if let Err(source) = remove_claimed_replacement(directory, &recovery_path, &expected) {
+            if let Err(source) =
+                validate_replacement_slot_identity(directory, &recovery_path, &expected)
+            {
                 return Err(published_target_changed(path, Some(&recovery_path), source));
             }
-            Ok(())
+            Ok(recovery_path)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -457,6 +461,13 @@ impl CodingWorkspace {
     }
 
     fn validate_staging_slot(&self, directory: &Dir, staged: &StagedFile) -> io::Result<()> {
+        validate_security_metadata(&staged.file, "patch staging file")?;
+        if Self::file_snapshot(&staged.file)? != staged.snapshot {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "patch staging file changed before commit",
+            ));
+        }
         validate_snapshot_slot(
             directory,
             &staged.path,
@@ -716,6 +727,18 @@ fn validate_replacement_slot_identity(
     )
 }
 
+fn validate_replacement_slot(
+    directory: &Dir,
+    path: &Path,
+    expected: &ReplacementMetadata,
+) -> io::Result<()> {
+    validate_security_metadata(&expected.file, "atomic patch target")?;
+    if CodingWorkspace::file_snapshot(&expected.file)? != expected.snapshot {
+        return Err(patch_target_changed());
+    }
+    validate_replacement_slot_identity(directory, path, expected)
+}
+
 fn validate_installed_staging_slot(
     directory: &Dir,
     path: &Path,
@@ -859,47 +882,6 @@ fn published_target_changed(
     )
 }
 
-fn cleanup_staging_after_error<T>(
-    directory: &Dir,
-    claimed_path: &Path,
-    staging_file: &File,
-    expected: FileSnapshot,
-    source: io::Error,
-) -> io::Result<T> {
-    match claimed_staging_matches(directory, claimed_path, staging_file, expected) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "patch operation failed ({source}); claimed recovery path '{}' changed and was preserved",
-                    claimed_path.display()
-                ),
-            ));
-        }
-        Err(validation) => {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "patch operation failed ({source}); claimed recovery path '{}' could not be validated and was preserved ({validation})",
-                    claimed_path.display()
-                ),
-            ));
-        }
-    }
-    match directory.remove_file(claimed_path) {
-        Ok(()) => Err(source),
-        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(source),
-        Err(cleanup) => Err(io::Error::new(
-            cleanup.kind(),
-            format!(
-                "patch operation failed ({source}); claimed staging file '{}' could not be removed ({cleanup})",
-                claimed_path.display()
-            ),
-        )),
-    }
-}
-
 fn claimed_staging_matches(
     directory: &Dir,
     claimed_path: &Path,
@@ -994,7 +976,13 @@ fn cleanup_expected_staging_after_error<T>(
             ));
         }
     }
-    cleanup_staging_after_error(directory, &claimed, staging_file, expected, source)
+    Err(io::Error::new(
+        source.kind(),
+        format!(
+            "patch operation failed ({source}); owned staging data was preserved as recovery file '{}'",
+            claimed.display()
+        ),
+    ))
 }
 
 fn cleanup_owned_staging_after_error<T>(
@@ -1046,16 +1034,6 @@ fn exchange_files(directory: &Dir, left: &Path, right: &Path) -> io::Result<()> 
         rustix::fs::RenameFlags::EXCHANGE,
     )
     .map_err(io::Error::from)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn remove_claimed_replacement(
-    directory: &Dir,
-    recovery_path: &Path,
-    expected: &ReplacementMetadata,
-) -> io::Result<()> {
-    validate_replacement_slot_identity(directory, recovery_path, expected)?;
-    directory.remove_file(recovery_path)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1602,15 +1580,20 @@ mod tests {
             std::fs::read_to_string(root.join("owned.txt")).unwrap(),
             "concurrent owner\n"
         );
-        assert!(
-            std::fs::read_dir(&root).unwrap().all(|entry| {
-                !entry
-                    .unwrap()
+        let recoveries = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".young-agent-patch-")
-            }),
-            "failed no-replace commits must clean their staging file"
+                    .starts_with(".young-agent-patch-cleanup-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(recoveries[0].path()).unwrap(),
+            "patch content\n"
         );
 
         drop(workspace);
@@ -1861,13 +1844,66 @@ mod tests {
             std::fs::read_to_string(root.join("original.txt")).unwrap(),
             "original\n"
         );
-        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".young-agent-patch-")
-        }));
+        let recoveries = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".young-agent-patch-cleanup-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(recoveries[0].path()).unwrap(),
+            "patched\n"
+        );
+
+        drop((directory, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn existing_commit_rechecks_the_target_digest_before_exchange() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-target-digest-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let mut metadata = workspace
+            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
+            .expect("metadata validates");
+        let staging = workspace
+            .stage_content(&directory, b"patched\n", Some(&metadata))
+            .expect("content is staged");
+        std::fs::write(root.join("target.txt"), "changed!\n")
+            .expect("equal-length concurrent rewrite succeeds");
+        metadata.snapshot.stat =
+            super::file_stat_snapshot(&metadata.file.metadata().expect("target metadata reads"));
+
+        let error = workspace
+            .commit_existing_file(
+                &directory,
+                staging,
+                std::path::Path::new("target.txt"),
+                metadata,
+            )
+            .expect_err("stale digest must fail even when stat metadata matches");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "changed!\n"
+        );
 
         drop((directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");

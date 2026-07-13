@@ -904,13 +904,24 @@ fn apply_patch_updates_a_workspace_file_after_approval() {
         std::fs::read_to_string(notes).expect("patched file is readable"),
         "first\nnew value\nlast\n"
     );
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("apply_patch should return structured JSON");
+    };
+    assert_eq!(value["changed_files"], json!(["notes.txt"]));
+    let recovery_files = value["recovery_files"]
+        .as_array()
+        .expect("recovery files are an array");
+    assert_eq!(recovery_files.len(), 1);
+    let recovery = recovery_files[0]
+        .as_str()
+        .expect("recovery path is a string");
+    assert!(recovery.starts_with(".young-agent-patch-displaced-"));
     assert_eq!(
-        content,
-        vec![ToolContent::Json {
-            value: json!({ "changed_files": ["notes.txt"] }),
-        }]
+        std::fs::read_to_string(test_workspace.path().join(recovery)).unwrap(),
+        "first\nold value\nlast\n"
     );
     assert_eq!(metadata["files_changed"], json!(1));
+    assert_eq!(metadata["recovery_files"], json!(1));
     assert!(extensions.is_empty());
 }
 
@@ -1393,6 +1404,8 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
     assert_eq!(metadata["cwd"], json!(expected_root));
     assert_eq!(metadata["stdout_truncated"], json!(false));
     assert_eq!(metadata["stderr_truncated"], json!(false));
+    assert_eq!(metadata["process_scope"], json!("process_group"));
+    assert_eq!(metadata["detached_processes_tracked"], json!(false));
     assert!(extensions.is_empty());
 }
 
@@ -1524,7 +1537,7 @@ fn run_command_observes_cooperative_cancellation() {
     let ToolOutput::Failure { error, .. } = result.output else {
         panic!("cancelled command must fail");
     };
-    assert_eq!(error.code, "tool_cancelled");
+    assert_eq!(error.code, "command_termination_incomplete");
 }
 
 #[test]
@@ -1559,7 +1572,7 @@ fn run_command_cancellation_terminates_descendant_processes() {
     let ToolOutput::Failure { error, .. } = result.output else {
         panic!("cancelled command must fail");
     };
-    assert_eq!(error.code, "tool_cancelled");
+    assert_eq!(error.code, "command_termination_incomplete");
     thread::sleep(Duration::from_millis(250));
     assert!(
         !test_workspace.path().join("descendant.txt").exists(),
@@ -1597,35 +1610,6 @@ fn run_command_waits_for_an_approved_background_process_with_open_pipes() {
 }
 
 #[test]
-fn run_command_waits_for_an_approved_detached_background_task() {
-    let test_workspace = TestWorkspace::new("command-detached-background");
-    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
-    let mut runtime = ToolRuntime::default();
-    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
-    let call = ToolCall {
-        id: ToolCallId::new("call-detached-background-command"),
-        tool_name: "run_command".to_string(),
-        arguments: json!({
-            "command": "(sleep 0.1; printf survived > background.txt) >/dev/null 2>&1 &"
-        }),
-    };
-
-    let result = runtime.dispatch(
-        call.clone(),
-        ToolExecutionAuthorization::ApprovalGranted {
-            call_id: call.id.clone(),
-        },
-        Arc::new(AtomicBool::new(false)),
-    );
-
-    assert!(matches!(result.output, ToolOutput::Success { .. }));
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("background.txt")).unwrap(),
-        "survived"
-    );
-}
-
-#[test]
 fn run_command_reports_success_only_after_background_work_finishes() {
     let test_workspace = TestWorkspace::new("command-background-completion");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
@@ -1656,45 +1640,9 @@ fn run_command_reports_success_only_after_background_work_finishes() {
     );
 }
 
-#[test]
-fn run_command_waits_for_a_setsid_background_task_with_closed_pipes() {
-    let test_workspace = TestWorkspace::new("command-escaped-pipe");
-    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
-    let mut runtime = ToolRuntime::default();
-    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
-    let call = ToolCall {
-        id: ToolCallId::new("call-escaped-pipe-command"),
-        tool_name: "run_command".to_string(),
-        arguments: json!({
-            "command": "trap 'printf user-trap > user-trap.txt' EXIT; python3 -c 'import os,time; os.setsid(); time.sleep(0.15); open(\"escaped-finished\", \"w\").write(\"done\")' >/dev/null 2>&1 & exit 0"
-        }),
-    };
-    let started = std::time::Instant::now();
-
-    let result = runtime.dispatch(
-        call.clone(),
-        ToolExecutionAuthorization::ApprovalGranted {
-            call_id: call.id.clone(),
-        },
-        Arc::new(AtomicBool::new(false)),
-    );
-
-    assert!(started.elapsed() >= Duration::from_millis(100));
-    assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(matches!(result.output, ToolOutput::Success { .. }));
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("escaped-finished")).unwrap(),
-        "done"
-    );
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("user-trap.txt")).unwrap(),
-        "user-trap"
-    );
-}
-
 #[cfg(unix)]
 #[test]
-fn run_command_does_not_report_cancelled_while_a_setsid_descendant_survives() {
+fn run_command_fails_closed_when_a_close_fds_descendant_survives_cancellation() {
     let test_workspace = TestWorkspace::new("command-escaped-cancellation");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1703,7 +1651,7 @@ fn run_command_does_not_report_cancelled_while_a_setsid_descendant_survives() {
         id: ToolCallId::new("call-escaped-command-cancellation"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import os,time; os.setsid(); open(\"escaped-ready\", \"w\").close(); time.sleep(0.6)' >/dev/null 2>&1 & wait"
+            "command": "python3 -c 'import subprocess,time; subprocess.Popen([\"python3\", \"-c\", \"import time; open(\\\"escaped-ready\\\", \\\"w\\\").close(); time.sleep(0.6); open(\\\"escaped-after-cancel\\\", \\\"w\\\").write(\\\"survived\\\")\"], start_new_session=True, close_fds=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(10)'"
         }),
     };
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -1734,5 +1682,9 @@ fn run_command_does_not_report_cancelled_while_a_setsid_descendant_survives() {
         panic!("incompletely terminated command must fail");
     };
     assert_eq!(error.code, "command_termination_incomplete");
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("escaped-after-cancel")).unwrap(),
+        "survived"
+    );
 }

@@ -39,16 +39,26 @@ pub(crate) fn execute(
         }
         Err(output) => return output,
     };
-    let changed_files = match apply_unified_patch(workspace, patch, cancellation) {
-        Ok(changed_files) => changed_files,
+    let result = match apply_unified_patch(workspace, patch, cancellation) {
+        Ok(result) => result,
         Err(error) => return failure(error.code(), error.to_string(), error.retryable()),
     };
     finalize_output(ToolOutput::Success {
         content: vec![ToolContent::Json {
-            value: json!({ "changed_files": changed_files }),
+            value: json!({
+                "changed_files": result.changed_files,
+                "recovery_files": result.recovery_files,
+            }),
         }],
         metadata: BTreeMap::from([
-            ("files_changed".to_string(), json!(changed_files.len())),
+            (
+                "files_changed".to_string(),
+                json!(result.changed_files.len()),
+            ),
+            (
+                "recovery_files".to_string(),
+                json!(result.recovery_files.len()),
+            ),
             ("workspace".to_string(), workspace.metadata()),
         ]),
         extensions: BTreeMap::new(),
@@ -59,7 +69,7 @@ fn apply_unified_patch(
     workspace: &CodingWorkspace,
     patch: &str,
     cancellation: &AtomicBool,
-) -> Result<Vec<String>, PatchError> {
+) -> Result<PatchResult, PatchError> {
     let mut file_patches = parse_patch(patch, cancellation)?;
     if file_patches.len() != 1 {
         return Err(PatchError::InvalidPatch(
@@ -115,7 +125,7 @@ fn apply_unified_patch(
             resolved.relative_path.display()
         )));
     }
-    match change {
+    let recovery = match change {
         FileChange::Write(content) if resolved.existed => workspace
             .replace_existing_atomically(
                 &resolved.relative_path,
@@ -125,7 +135,10 @@ fn apply_unified_patch(
             .map_err(|source| PatchError::Io {
                 path: resolved.relative_path.clone(),
                 source,
-            })?,
+            })?
+            .into_iter()
+            .map(|path| display_relative_path(&path))
+            .collect(),
         FileChange::Write(content) => {
             workspace
                 .create_new(&resolved.relative_path, content.as_bytes())
@@ -133,9 +146,18 @@ fn apply_unified_patch(
                     path: resolved.relative_path.clone(),
                     source,
                 })?;
+            Vec::new()
         }
-    }
-    Ok(vec![display_relative_path(&resolved.relative_path)])
+    };
+    Ok(PatchResult {
+        changed_files: vec![display_relative_path(&resolved.relative_path)],
+        recovery_files: recovery,
+    })
+}
+
+struct PatchResult {
+    changed_files: Vec<String>,
+    recovery_files: Vec<String>,
 }
 
 #[derive(Debug)]

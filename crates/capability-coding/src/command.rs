@@ -4,7 +4,7 @@ use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,6 @@ use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
-static COMMAND_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -84,6 +83,8 @@ pub(crate) fn execute(
                 "output_incomplete".to_string(),
                 json!(outcome.output_incomplete),
             ),
+            ("process_scope".to_string(), json!("process_group")),
+            ("detached_processes_tracked".to_string(), json!(false)),
             ("workspace".to_string(), workspace.metadata()),
         ]),
         extensions: BTreeMap::new(),
@@ -115,22 +116,12 @@ fn run_shell_command(
     workspace
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
-    // The write end must be inheritable until this one spawn completes. Serialize
-    // that narrow window so concurrent run_command calls cannot inherit each
-    // other's lifecycle sentinels and wait on unrelated command trees.
-    let spawn_guard = COMMAND_SPAWN_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (lifecycle_read, lifecycle_write) =
-        command_lifecycle_pipe().map_err(CommandError::ConfigureLifecycle)?;
     let child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .group_spawn();
     let mut child = child.map_err(CommandError::Spawn)?;
-    drop(lifecycle_write);
-    drop(spawn_guard);
     let stdout = child
         .inner()
         .stdout
@@ -141,13 +132,6 @@ fn run_shell_command(
         .stderr
         .take()
         .expect("stderr was configured as piped");
-    let lifecycle_stop = Arc::new(AtomicBool::new(false));
-    let lifecycle_state = Arc::new(LifecycleState::default());
-    let lifecycle_reader = spawn_lifecycle_reader(
-        lifecycle_read,
-        lifecycle_stop.clone(),
-        lifecycle_state.clone(),
-    );
     #[cfg(all(test, unix))]
     let configure_result =
         if INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE.with(|failure| failure.replace(false)) {
@@ -161,18 +145,6 @@ fn run_shell_command(
     let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
     if let Err(source) = configure_result {
         let cleanup = cleanup_process_group(&mut child, false, true);
-        let lifecycle_complete = wait_for_lifecycle(&lifecycle_state, OUTPUT_DRAIN_GRACE);
-        lifecycle_stop.store(true, Ordering::Relaxed);
-        let lifecycle_joined = lifecycle_reader.join().is_ok();
-        if let Some(source) = lifecycle_state.take_error() {
-            return Err(CommandError::ReadLifecycle(source));
-        }
-        if !lifecycle_complete {
-            return Err(CommandError::TerminationIncomplete);
-        }
-        if !lifecycle_joined {
-            return Err(CommandError::ReaderPanicked);
-        }
         return match cleanup {
             Ok(()) => Err(CommandError::ConfigureOutput(source)),
             Err(cleanup) => Err(cleanup),
@@ -216,18 +188,13 @@ fn run_shell_command(
                 status = try_wait_for_command_group(&mut child)?;
             }
 
-            if let Some(source) = lifecycle_state.take_error() {
-                return Err(CommandError::ReadLifecycle(source));
-            }
-            let lifecycle_complete = lifecycle_state.complete.load(Ordering::Acquire);
-
-            if status.is_some() && streams_done == 2 && lifecycle_complete {
+            if status.is_some() && streams_done == 2 {
                 return Ok(());
             }
             if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
                 return Ok(());
             }
-            if forced_at.is_none() && status.is_some() && lifecycle_complete {
+            if forced_at.is_none() && status.is_some() {
                 let started = drain_started_at.get_or_insert_with(Instant::now);
                 if started.elapsed() >= OUTPUT_DRAIN_GRACE {
                     output_incomplete = true;
@@ -250,11 +217,6 @@ fn run_shell_command(
             stdout: stdout_reader,
             stderr: stderr_reader,
         },
-        LifecycleReaderResources {
-            stop: lifecycle_stop,
-            reader: lifecycle_reader,
-            state: lifecycle_state.clone(),
-        },
     );
     match (control_result, cleanup_result) {
         (Err(_), Err(cleanup)) => return Err(cleanup),
@@ -266,10 +228,7 @@ fn run_shell_command(
         return Err(CommandError::ReadOutput(source));
     }
     if cancelled {
-        if !lifecycle_state.complete.load(Ordering::Acquire) {
-            return Err(CommandError::TerminationIncomplete);
-        }
-        return Err(CommandError::Cancelled);
+        return Err(CommandError::TerminationIncomplete);
     }
     if output_incomplete {
         return Err(CommandError::OutputIncomplete);
@@ -383,7 +342,6 @@ fn cleanup_command_resources(
     process_exited: bool,
     terminate_group: bool,
     output: OutputReaderResources,
-    lifecycle: LifecycleReaderResources,
 ) -> Result<(), CommandError> {
     let mut first_error = cleanup_process_group(child, process_exited, terminate_group).err();
 
@@ -395,16 +353,6 @@ fn cleanup_command_resources(
     if output.stderr.join().is_err() && first_error.is_none() {
         first_error = Some(CommandError::ReaderPanicked);
     }
-    lifecycle.stop.store(true, Ordering::Relaxed);
-    if lifecycle.reader.join().is_err() && first_error.is_none() {
-        first_error = Some(CommandError::ReaderPanicked);
-    }
-    if let Some(source) = lifecycle.state.take_error() {
-        if first_error.is_none() {
-            first_error = Some(CommandError::ReadLifecycle(source));
-        }
-    }
-
     match first_error {
         Some(source) => Err(source),
         None => Ok(()),
@@ -416,12 +364,6 @@ struct OutputReaderResources {
     receiver: Receiver<StreamMessage>,
     stdout: thread::JoinHandle<()>,
     stderr: thread::JoinHandle<()>,
-}
-
-struct LifecycleReaderResources {
-    stop: Arc<AtomicBool>,
-    reader: thread::JoinHandle<()>,
-    state: Arc<LifecycleState>,
 }
 
 fn cleanup_process_group(
@@ -474,97 +416,6 @@ fn make_nonblocking<F: std::os::fd::AsFd>(file: &F) -> std::io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(file).map_err(std::io::Error::from)?;
     rustix::fs::fcntl_setfl(file, flags | rustix::fs::OFlags::NONBLOCK)
         .map_err(std::io::Error::from)
-}
-
-#[derive(Default)]
-struct LifecycleState {
-    complete: AtomicBool,
-    error: Mutex<Option<std::io::Error>>,
-}
-
-impl LifecycleState {
-    fn record_error(&self, source: std::io::Error) {
-        let mut error = self
-            .error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if error.is_none() {
-            *error = Some(source);
-        }
-    }
-
-    fn take_error(&self) -> Option<std::io::Error> {
-        self.error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-    }
-
-    fn has_error(&self) -> bool {
-        self.error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
-    }
-}
-
-#[cfg(unix)]
-fn command_lifecycle_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
-    let (read, write) = rustix::pipe::pipe().map_err(std::io::Error::from)?;
-    rustix::io::fcntl_setfd(&read, rustix::io::FdFlags::CLOEXEC).map_err(std::io::Error::from)?;
-    let flags = rustix::fs::fcntl_getfl(&read).map_err(std::io::Error::from)?;
-    rustix::fs::fcntl_setfl(&read, flags | rustix::fs::OFlags::NONBLOCK)
-        .map_err(std::io::Error::from)?;
-    Ok((std::fs::File::from(read), std::fs::File::from(write)))
-}
-
-#[cfg(not(unix))]
-fn command_lifecycle_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "inherited command lifecycle sentinels are not supported on this platform",
-    ))
-}
-
-fn spawn_lifecycle_reader(
-    mut reader: std::fs::File,
-    stop: Arc<AtomicBool>,
-    state: Arc<LifecycleState>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut buffer = [0u8; 1];
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    state.complete.store(true, Ordering::Release);
-                    return;
-                }
-                Ok(_) => {}
-                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(POLL_INTERVAL);
-                }
-                Err(source) => {
-                    state.record_error(source);
-                    return;
-                }
-            }
-        }
-    })
-}
-
-fn wait_for_lifecycle(state: &LifecycleState, grace: Duration) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < grace {
-        if state.complete.load(Ordering::Acquire) || state.has_error() {
-            return state.complete.load(Ordering::Acquire);
-        }
-        thread::sleep(POLL_INTERVAL);
-    }
-    state.complete.load(Ordering::Acquire)
 }
 
 #[cfg(not(unix))]
@@ -698,12 +549,10 @@ impl CapturedStream {
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
     WorkspaceChanged(std::io::Error),
-    ConfigureLifecycle(std::io::Error),
     ConfigureOutput(std::io::Error),
     Kill(std::io::Error),
     Wait(std::io::Error),
     ReadOutput(std::io::Error),
-    ReadLifecycle(std::io::Error),
     ReaderPanicked,
     Cancelled,
     OutputIncomplete,
@@ -715,12 +564,10 @@ impl CommandError {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
             Self::WorkspaceChanged(_) => "workspace_changed",
-            Self::ConfigureLifecycle(_)
-            | Self::ConfigureOutput(_)
+            Self::ConfigureOutput(_)
             | Self::Kill(_)
             | Self::Wait(_)
             | Self::ReadOutput(_)
-            | Self::ReadLifecycle(_)
             | Self::ReaderPanicked => "command_io_error",
             Self::Cancelled => "tool_cancelled",
             Self::OutputIncomplete => "command_output_incomplete",
@@ -731,12 +578,10 @@ impl CommandError {
     pub(crate) fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::ConfigureLifecycle(source)
-            | Self::ConfigureOutput(source)
+            Self::ConfigureOutput(source)
             | Self::Kill(source)
             | Self::Wait(source)
             | Self::ReadOutput(source)
-            | Self::ReadLifecycle(source)
                 if source.kind() == std::io::ErrorKind::Interrupted
         )
     }
@@ -752,12 +597,6 @@ impl fmt::Display for CommandError {
                     "selected workspace is no longer available: {source}"
                 )
             }
-            Self::ConfigureLifecycle(source) => {
-                write!(
-                    formatter,
-                    "failed to configure command lifecycle tracking: {source}"
-                )
-            }
             Self::ConfigureOutput(source) => {
                 write!(
                     formatter,
@@ -768,9 +607,6 @@ impl fmt::Display for CommandError {
             Self::Wait(source) => write!(formatter, "failed to wait for command: {source}"),
             Self::ReadOutput(source) => {
                 write!(formatter, "failed to capture command output: {source}")
-            }
-            Self::ReadLifecycle(source) => {
-                write!(formatter, "failed to track command descendants: {source}")
             }
             Self::ReaderPanicked => formatter.write_str("command reader panicked"),
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
@@ -824,7 +660,7 @@ mod tests {
         );
 
         trigger.join().expect("cancellation trigger finishes");
-        assert!(matches!(result, Err(CommandError::Cancelled)));
+        assert!(matches!(result, Err(CommandError::TerminationIncomplete)));
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());
