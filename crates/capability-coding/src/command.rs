@@ -28,6 +28,7 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 thread_local! {
     static INJECT_GROUP_KILL_WRAPPER_FAILURE: Cell<bool> = const { Cell::new(false) };
     static INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static COMMAND_GROUP_TERMINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) const APPROVAL_REASON: &str =
@@ -164,12 +165,14 @@ fn run_shell_command(
     let mut output_incomplete = false;
     let mut cancelled = false;
     let mut forced_at = None;
+    let mut termination_sent = false;
 
     let control_result = (|| -> Result<(), CommandError> {
         loop {
             if cancellation.load(Ordering::Relaxed) && !cancelled {
                 cancelled = true;
                 terminate_command_group(&mut child)?;
+                termination_sent = true;
                 if status.is_none() {
                     status = Some(wait_for_command_group(&mut child)?);
                 }
@@ -199,7 +202,6 @@ fn run_shell_command(
                 let started = drain_started_at.get_or_insert_with(Instant::now);
                 if started.elapsed() >= OUTPUT_DRAIN_GRACE {
                     output_incomplete = true;
-                    terminate_command_group(&mut child)?;
                     forced_at = Some(Instant::now());
                 }
             } else {
@@ -211,7 +213,7 @@ fn run_shell_command(
     let cleanup_result = cleanup_command_resources(
         &mut child,
         status.is_some(),
-        control_result.is_err() || forced_at.is_some(),
+        control_result.is_err() && status.is_none() && !termination_sent,
         OutputReaderResources {
             stop: reader_stop,
             receiver,
@@ -248,6 +250,8 @@ fn run_shell_command(
 }
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
+    #[cfg(all(test, unix))]
+    COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
     #[cfg(all(test, unix))]
     let injected_failure = INJECT_GROUP_KILL_WRAPPER_FAILURE.with(Cell::get);
     #[cfg(not(all(test, unix)))]
@@ -663,8 +667,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        run_shell_command, CommandError, INJECT_GROUP_KILL_WRAPPER_FAILURE,
-        INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
+        run_shell_command, CommandError, COMMAND_GROUP_TERMINATION_ATTEMPTS,
+        INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
     };
     use crate::workspace::CodingWorkspace;
 
@@ -686,6 +690,7 @@ mod tests {
             thread::sleep(Duration::from_millis(30));
             trigger_flag.store(true, Ordering::Relaxed);
         });
+        COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.set(0));
         INJECT_GROUP_KILL_WRAPPER_FAILURE.with(|failure| failure.set(true));
         let started = Instant::now();
 
@@ -698,6 +703,11 @@ mod tests {
 
         trigger.join().expect("cancellation trigger finishes");
         assert!(matches!(result, Err(CommandError::TerminationUnverified)));
+        assert_eq!(
+            COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.get()),
+            1,
+            "a reaped group must never be signalled again through its stale process id"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());
