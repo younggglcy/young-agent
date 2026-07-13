@@ -38,6 +38,7 @@ const MAX_COMMAND_SUPERVISION_SLOTS: usize = 64;
 const MAX_COMMAND_PROCESSING_PANICS: u8 = 8;
 const INITIAL_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_COMMAND_BYTES: usize = 64 * 1024;
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -64,7 +65,14 @@ pub(crate) fn execute(
         Err(output) => return output,
     };
     let command = match arguments.required_string("command") {
-        Ok(command) => command,
+        Ok(command) if command.len() <= MAX_COMMAND_BYTES => command,
+        Ok(_) => {
+            return failure(
+                "command_too_large",
+                format!("command exceeds {MAX_COMMAND_BYTES} bytes"),
+                false,
+            )
+        }
         Err(output) => return output,
     };
     let outcome = match run_shell_command(workspace, command, cancellation, MAX_OUTPUT_BYTES) {
@@ -159,7 +167,7 @@ impl CommandProcess {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     fn untracked(child: GroupChild) -> Self {
         Self {
             child,
@@ -313,8 +321,8 @@ fn run_shell_command(
     if cancellation.load(Ordering::Relaxed) {
         return Err(CommandError::Cancelled);
     }
-    let mut process = shell_command(command);
     ensure_process_tracking_supported()?;
+    let mut process = shell_command(command);
     let supervision_permit = prepare_command_supervision()?;
     workspace
         .bind_command_working_directory(&mut process)
@@ -1047,7 +1055,7 @@ impl CommandSupervisor {
             .is_ok()
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
     fn wait_for_completion(&self, id: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut completed = self

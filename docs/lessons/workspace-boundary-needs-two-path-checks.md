@@ -43,8 +43,10 @@ metadata，供 Agent Runtime、Event Log 和后续 Surface 展示。
 命令工具的 cwd 同样不等于 shell sandbox，而且不能先比较 inode 再用 ambient path
 启动进程，否则仍有 check-then-use 窗口。Unix child 在 `pre_exec` 中只执行
 async-signal-safe 的 `fchdir`，直接绑定已打开的 workspace handle；无法提供等价语义的
-平台应安全拒绝。Issue #7 还限制完整序列化输出、把取消传播到整个进程组，并让 pipe
-reader 可停止回收。进程组 leader 退出后不能先 reap 再继续用它的 PID 作为 PGID：
+平台应安全拒绝。命令源码在构造 shell `Command`、占用 supervision slot 或启动进程前还要
+按 UTF-8 bytes 限制为 64 KiB；不支持稳定进程跟踪的平台也应在复制命令进 builder 前完成
+preflight。Issue #7 还限制完整序列化输出、把取消传播到整个进程组，并让 pipe reader
+可停止回收。进程组 leader 退出后不能先 reap 再继续用它的 PID 作为 PGID：
 该数值可能被复用，后续探测或取消会等待、甚至终止无关进程。macOS/Linux 实现应先用
 `waitid(..., WNOWAIT)` 观察终态。用户 shell 源码保持原样；leader 终态后仍保留其
 unreaped identity 作为 PGID reservation。仅重复固定次数的 `yield + killpg` 不能证明 cleanup

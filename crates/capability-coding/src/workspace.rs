@@ -1004,7 +1004,7 @@ fn file_stat_snapshot(metadata: &Metadata) -> FileStatSnapshot {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 fn file_digest(file: &File, size: u64) -> io::Result<[u8; 32]> {
     use cap_std::fs::FileExt as _;
 
@@ -1034,7 +1034,7 @@ fn file_digest(file: &File, size: u64) -> io::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl FileSnapshot {
     fn same_payload_and_metadata(&self, other: &Self) -> bool {
         self.digest == other.digest
@@ -1243,7 +1243,7 @@ fn validate_snapshot_slot(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn random_patch_path(kind: &str) -> io::Result<PathBuf> {
     let mut random = [0u8; 16];
     getrandom::fill(&mut random)
@@ -1936,9 +1936,9 @@ fn restore_claimed_path(
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn has_extended_acl(file: &File) -> io::Result<bool> {
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
 
     #[cfg(target_os = "macos")]
@@ -1948,16 +1948,12 @@ fn has_extended_acl(file: &File) -> io::Result<bool> {
             .to_string_lossy()
             .into_owned(),
     );
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    let path = if cfg!(target_os = "linux") {
-        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
-    } else {
-        PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
-    };
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
     let entries = exacl::getfacl(path, None)?;
     #[cfg(target_os = "macos")]
     return Ok(!entries.is_empty());
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[cfg(target_os = "linux")]
     return Ok(entries.iter().any(|entry| {
         !entry.name.is_empty()
             || !entry.flags.is_empty()
@@ -1987,17 +1983,6 @@ fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
         return Ok(true);
     }
     Ok(false)
-}
-
-#[cfg(all(
-    unix,
-    not(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))
-))]
-fn has_extended_acl(_file: &File) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic patch ACL validation is not supported on this platform",
-    ))
 }
 
 impl fmt::Debug for CodingWorkspace {
@@ -2392,11 +2377,11 @@ impl Error for CodingWorkspaceError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::git_probe_command;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(unix)]
     use super::CodingWorkspace;
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2985,7 +2970,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn file_snapshot_digest_detects_equal_length_rewrites() {
         let nonce = SystemTime::now()
@@ -3047,7 +3032,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn file_snapshot_rejects_files_above_the_transaction_limit() {
         let nonce = SystemTime::now()
