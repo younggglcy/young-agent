@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -188,16 +190,12 @@ fn sequenced_event_logs_reject_gaps_duplicates_and_mixed_legacy_records() {
         } else {
             store.append(&first).expect("legacy fixture should append");
         }
-        <JsonlEventStore as AgentEventSink>::append(
+        let error = <JsonlEventStore as AgentEventSink>::append(
             &mut store,
             EventSequence::new(second_sequence.expect("second record is sequenced")),
             &second,
         )
-        .expect("invalid physical sequence fixture should append");
-
-        let error = store
-            .read_all()
-            .expect_err("non-canonical event sequence must fail decoding");
+        .expect_err("invalid sequence must be rejected before writing");
 
         assert!(matches!(
             error,
@@ -209,7 +207,61 @@ fn sequenced_event_logs_reject_gaps_duplicates_and_mixed_legacy_records() {
             } if actual_expected.map(EventSequence::as_u64) == expected
                 && actual_found.map(EventSequence::as_u64) == found
         ));
+        let expected_first = first_sequence
+            .map(|sequence| {
+                first
+                    .clone()
+                    .with_event_sequence(EventSequence::new(sequence))
+            })
+            .unwrap_or_else(|| first.clone());
+        assert_eq!(
+            store.read_all().expect("unchanged log should remain valid"),
+            [expected_first]
+        );
+        assert_eq!(
+            std::fs::read_to_string(log.path())
+                .expect("unchanged log bytes should read")
+                .lines()
+                .count(),
+            1
+        );
     }
+}
+
+#[test]
+fn independent_store_instances_atomically_reject_the_same_sequence() {
+    let log = TestLog::new("concurrent-sequence");
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for message in ["first", "second"] {
+        let path = log.path().to_path_buf();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            let mut store = JsonlEventStore::new(path);
+            let event = agent_event(json!({
+                "type": "run_started",
+                "run_id": message
+            }));
+            barrier.wait();
+            <JsonlEventStore as AgentEventSink>::append(&mut store, EventSequence::new(1), &event)
+        }));
+    }
+    barrier.wait();
+
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("append worker should not panic"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(
+        JsonlEventStore::new(log.path())
+            .read_all()
+            .expect("winning event should remain canonical")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -719,113 +771,71 @@ fn replay_rejects_tool_events_for_a_turn_that_never_started() {
 }
 
 #[test]
-fn replay_rejects_every_cross_turn_tool_lifecycle_edge() {
-    let run_started = agent_event(json!({ "type": "run_started", "run_id": "run-001" }));
-    let turn_one = agent_event(json!({
-        "type": "turn_started",
-        "run_id": "run-001",
-        "turn_id": "turn-001"
-    }));
-    let turn_two = agent_event(json!({
-        "type": "turn_started",
-        "run_id": "run-001",
-        "turn_id": "turn-002"
-    }));
-    let requested = agent_event(json!({
-        "type": "tool_call_requested",
-        "run_id": "run-001",
-        "turn_id": "turn-001",
-        "model_tool_call_id": "model-call-001",
-        "call": {
-            "id": "tool-call-001",
-            "tool_name": "run_command",
-            "arguments": { "command": "cargo test" }
-        }
-    }));
-    let approval_on_turn_one = agent_event(json!({
-        "type": "approval_requested",
-        "run_id": "run-001",
-        "turn_id": "turn-001",
-        "request": {
-            "id": "approval-001",
+fn replay_rejects_starting_a_new_turn_with_an_unresolved_tool_call() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
             "call": {
                 "id": "tool-call-001",
                 "tool_name": "run_command",
                 "arguments": { "command": "cargo test" }
-            },
-            "reason": "command requires approval"
-        }
-    }));
-    let cases = [
-        (
-            vec![agent_event(json!({
-                "type": "approval_requested",
-                "run_id": "run-001",
-                "turn_id": "turn-002",
-                "request": {
-                    "id": "approval-001",
-                    "call": {
-                        "id": "tool-call-001",
-                        "tool_name": "run_command",
-                        "arguments": { "command": "cargo test" }
-                    },
-                    "reason": "command requires approval"
-                }
-            }))],
-            5,
-        ),
-        (
-            vec![
-                approval_on_turn_one,
-                agent_event(json!({
-                    "type": "approval_resolved",
-                    "run_id": "run-001",
-                    "turn_id": "turn-002",
-                    "approval_id": "approval-001",
-                    "decision": { "decision": "approve" }
-                })),
-            ],
-            6,
-        ),
-        (
-            vec![agent_event(json!({
-                "type": "tool_result",
-                "run_id": "run-001",
-                "turn_id": "turn-002",
-                "result": {
-                    "call_id": "tool-call-001",
-                    "output": { "status": "success", "content": [] }
-                }
-            }))],
-            5,
-        ),
+            }
+        })),
+        agent_event(json!({
+            "type": "turn_started",
+            "run_id": "run-001",
+            "turn_id": "turn-002"
+        })),
     ];
 
-    for (suffix, expected_event_number) in cases {
-        let mut events = vec![
-            run_started.clone(),
-            turn_one.clone(),
-            turn_two.clone(),
-            requested.clone(),
-        ];
-        events.extend(suffix);
+    let error = young_event_store::replay_events(events)
+        .expect_err("a new turn cannot bypass unresolved side effects");
 
-        let error = young_event_store::replay_events(events)
-            .expect_err("a tool lifecycle cannot cross turn boundaries");
+    assert!(matches!(
+        error,
+        ReplayError::TurnStartedWithUnresolvedToolCalls {
+            event_number: 4,
+            ref turn_id,
+            ref call_ids,
+        } if turn_id.as_str() == "turn-002"
+            && call_ids == &[young_tool_runtime::ToolCallId::new("tool-call-001")]
+    ));
+}
 
-        assert!(matches!(
-            error,
-            ReplayError::MismatchedToolLifecycleTurn {
-                event_number,
-                ref call_id,
-                ref expected,
-                ref found,
-            } if event_number == expected_event_number
-                && call_id.as_str() == "tool-call-001"
-                && expected.as_str() == "turn-001"
-                && found.as_str() == "turn-002"
-        ));
-    }
+#[test]
+fn replay_rejects_events_that_flow_back_to_an_inactive_turn() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
+        agent_event(json!({
+            "type": "turn_started",
+            "run_id": "run-001",
+            "turn_id": "turn-002"
+        })),
+        agent_event(json!({
+            "type": "model_output",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "event": { "type": "text_delta", "delta": "late" }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("events cannot flow back after the next turn starts");
+
+    assert!(matches!(
+        error,
+        ReplayError::EventForInactiveTurn {
+            event_number: 4,
+            ref expected,
+            ref found,
+        } if expected.as_str() == "turn-002" && found.as_str() == "turn-001"
+    ));
 }
 
 #[test]
@@ -1262,7 +1272,7 @@ fn durable_event_reconciliation_is_idempotent_before_and_after_commit() {
 
         assert_eq!(
             store.read_all().expect("reconciled log should read"),
-            [event]
+            [event.with_event_sequence(sequence)]
         );
     }
 }
@@ -1308,7 +1318,10 @@ fn durable_event_reconciliation_rejects_a_later_conflicting_identity() {
     ));
     assert_eq!(
         store.read_all().expect("conflicting log should read"),
-        [committed, conflicting]
+        [
+            committed.with_event_sequence(EventSequence::new(1)),
+            conflicting.with_event_sequence(EventSequence::new(2)),
+        ]
     );
 }
 
@@ -1338,7 +1351,10 @@ fn durable_event_reconciliation_rejects_a_later_exact_duplicate() {
     ));
     assert_eq!(
         store.read_all().expect("duplicate log should read"),
-        [event.clone(), event]
+        [
+            event.clone().with_event_sequence(EventSequence::new(1)),
+            event.with_event_sequence(EventSequence::new(2)),
+        ]
     );
 }
 

@@ -12,7 +12,8 @@ use young_model_runtime::{
 use young_tool_runtime::{ToolCall, ToolCallId, ToolContent, ToolExecutor, ToolOutput, ToolResult};
 
 use crate::{
-    AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, TerminalRunStatus, TurnId,
+    AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, EventSequence, RunId,
+    TerminalRunStatus, TurnId,
 };
 
 const MAX_TURNS: usize = 128;
@@ -35,21 +36,6 @@ pub trait AgentEventSink {
         sequence: EventSequence,
         event: &AgentEvent,
     ) -> Result<(), Self::Error>;
-}
-
-/// Monotonic identity assigned to each append attempt within one Event Log.
-/// It lets recovery distinguish equal adjacent event payloads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EventSequence(u64);
-
-impl EventSequence {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
 }
 
 /// The persistence guarantee requested for an Agent Event append.
@@ -234,6 +220,7 @@ pub struct AgentRuntime<M, T, S> {
     tool_executor: T,
     event_sink: S,
     next_event_sequence: u64,
+    started_run_id: Option<RunId>,
 }
 
 impl<M, T, S> AgentRuntime<M, T, S> {
@@ -243,6 +230,7 @@ impl<M, T, S> AgentRuntime<M, T, S> {
             tool_executor,
             event_sink,
             next_event_sequence: 1,
+            started_run_id: None,
         }
     }
 
@@ -324,8 +312,15 @@ where
             metadata,
         } = request;
 
+        if let Some(started_run_id) = &self.started_run_id {
+            return Err(AgentRuntimeError::RuntimeAlreadyUsed {
+                run_id: started_run_id.clone(),
+            });
+        }
+
         stop.bind(&run_id)
             .map_err(|run_id| AgentRuntimeError::StopTokenAlreadyBound { run_id })?;
+        self.started_run_id = Some(run_id.clone());
 
         let mut model_request = ModelRequest {
             model,
@@ -336,6 +331,7 @@ where
 
         self.emit(&AgentEvent::RunStarted {
             run_id: run_id.clone(),
+            event_sequence: None,
             extensions: BTreeMap::new(),
         })?;
 
@@ -350,6 +346,7 @@ where
             self.emit(&AgentEvent::TurnStarted {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             })?;
 
@@ -441,6 +438,7 @@ where
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 event: model_event,
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             };
             self.emit(&model_output_event)?;
@@ -550,6 +548,7 @@ where
             turn_id: turn_id.clone(),
             model_tool_call_id: model_tool_call.id.clone(),
             call,
+            event_sequence: None,
             extensions: BTreeMap::new(),
         };
         self.emit_durable(&requested_event)?;
@@ -568,6 +567,7 @@ where
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 request: approval,
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             };
             self.emit_durable(&approval_event)?;
@@ -589,6 +589,7 @@ where
                 turn_id: turn_id.clone(),
                 approval_id: approval.id,
                 decision: decision.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             })?;
 
@@ -629,6 +630,7 @@ where
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
             result,
+            event_sequence: None,
             extensions: BTreeMap::new(),
         };
         self.emit_tool_result(&result_event)?;
@@ -650,6 +652,7 @@ where
                     message: error.message.clone(),
                     recoverable: true,
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             })?;
         }
@@ -730,6 +733,7 @@ where
             run_id: run_id.clone(),
             turn_id,
             error: error.clone(),
+            event_sequence: None,
             extensions: BTreeMap::new(),
         })?;
         self.finish(run_id, TerminalRunStatus::Failed { error }, stop)
@@ -745,6 +749,7 @@ where
         let event = AgentEvent::RunFinished {
             run_id: run_id.clone(),
             status: status.clone(),
+            event_sequence: None,
             extensions: BTreeMap::new(),
         };
         self.emit_durable(&event)?;
@@ -795,6 +800,8 @@ fn normalize_tool_output(output: ToolOutput) -> ToolOutput {
 
 #[derive(Debug)]
 pub enum AgentRuntimeError<E> {
+    /// An AgentRuntime owns exactly one canonical timeline.
+    RuntimeAlreadyUsed { run_id: RunId },
     /// A stop token is a one-run terminal latch and cannot be reused.
     StopTokenAlreadyBound { run_id: RunId },
     /// The sink returned an error from an append whose commit state may be
@@ -811,6 +818,11 @@ pub enum AgentRuntimeError<E> {
 impl<E: fmt::Display> fmt::Display for AgentRuntimeError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RuntimeAlreadyUsed { run_id } => write!(
+                formatter,
+                "AgentRuntime already started Agent Run '{}' and cannot own another timeline",
+                run_id.as_str()
+            ),
             Self::StopTokenAlreadyBound { run_id } => write!(
                 formatter,
                 "RunStopToken is already bound to Agent Run '{}'",
@@ -842,7 +854,7 @@ impl<E: fmt::Display> fmt::Display for AgentRuntimeError<E> {
 impl<E: Error + 'static> Error for AgentRuntimeError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::StopTokenAlreadyBound { .. } => None,
+            Self::RuntimeAlreadyUsed { .. } | Self::StopTokenAlreadyBound { .. } => None,
             Self::EventPersistenceIndeterminate { source, .. } => Some(source),
         }
     }

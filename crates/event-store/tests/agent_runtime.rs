@@ -1210,6 +1210,60 @@ fn terminal_persistence_failure_returns_the_event_for_reconciliation() {
 }
 
 #[test]
+fn agent_runtime_is_one_shot_and_rejects_a_second_run_before_appending() {
+    let log = TestLog::new("one-shot-runtime");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([
+        ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "first".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+        ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "second".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+    ]);
+    let mut runtime = AgentRuntime::new(model, FakeToolExecutor::default(), store.clone());
+
+    runtime
+        .run(run_request("run-first"))
+        .expect("the first run should complete");
+    let error = runtime
+        .run(run_request("run-second"))
+        .expect_err("one runtime must not append a second Agent Run");
+
+    assert!(matches!(
+        error,
+        AgentRuntimeError::RuntimeAlreadyUsed { ref run_id }
+            if run_id.as_str() == "run-first"
+    ));
+    assert_eq!(runtime.model_client().request_count(), 1);
+    assert_eq!(
+        store
+            .replay()
+            .expect("first run should remain replayable")
+            .status(),
+        &RunStatus::Finished {
+            terminal_status: TerminalRunStatus::Completed {
+                final_message: "first".to_string(),
+            },
+        }
+    );
+}
+
+#[test]
 fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_tool() {
     let sink = FailOnceOnToolResultSink::new();
     let observed_events = sink.events.clone();
@@ -1520,6 +1574,15 @@ fn repeated_buffered_events_reconcile_by_sequence_on_the_real_jsonl_store() {
             })
             .collect::<Vec<_>>();
         assert_eq!(sequences, [3, 4]);
+
+        for line in std::fs::read_to_string(log.path())
+            .expect("runtime log should read as text")
+            .lines()
+        {
+            let event: AgentEvent = serde_json::from_str(line)
+                .expect("every runtime JSONL line remains a public AgentEvent");
+            assert!(event.event_sequence().is_some());
+        }
     }
 }
 

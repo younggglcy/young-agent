@@ -195,6 +195,7 @@ fn replay_events_with_mode(
     let mut run_finished = false;
     let mut approval_log_format = ApprovalLogFormat::Undetermined;
     let mut started_turns = HashSet::<TurnId>::new();
+    let mut active_turn = None::<TurnId>;
 
     for (index, event) in events.iter().enumerate().skip(1) {
         let event_number = index + 1;
@@ -220,6 +221,27 @@ fn replay_events_with_mode(
                         turn_id: turn_id.clone(),
                     });
                 }
+                let call_ids = tool_calls
+                    .iter()
+                    .filter(|tool_call| tool_call.result_event.is_none())
+                    .map(|tool_call| {
+                        ReplayedToolCall {
+                            events: &events,
+                            index: tool_call,
+                        }
+                        .call()
+                        .id
+                        .clone()
+                    })
+                    .collect::<Vec<_>>();
+                if !call_ids.is_empty() {
+                    return Err(ReplayError::TurnStartedWithUnresolvedToolCalls {
+                        event_number,
+                        turn_id: turn_id.clone(),
+                        call_ids,
+                    });
+                }
+                active_turn = Some(turn_id.clone());
             }
             AgentEvent::ModelOutput { turn_id, .. }
             | AgentEvent::ToolCallRequested { turn_id, .. }
@@ -234,6 +256,15 @@ fn replay_events_with_mode(
                     return Err(ReplayError::EventForUnknownTurn {
                         event_number,
                         turn_id: turn_id.clone(),
+                    });
+                }
+                if active_turn.as_ref() != Some(turn_id) {
+                    return Err(ReplayError::EventForInactiveTurn {
+                        event_number,
+                        expected: active_turn
+                            .clone()
+                            .expect("a known turn implies an active turn"),
+                        found: turn_id.clone(),
                     });
                 }
             }
@@ -547,6 +578,16 @@ pub enum ReplayError {
         event_number: usize,
         turn_id: TurnId,
     },
+    EventForInactiveTurn {
+        event_number: usize,
+        expected: TurnId,
+        found: TurnId,
+    },
+    TurnStartedWithUnresolvedToolCalls {
+        event_number: usize,
+        turn_id: TurnId,
+        call_ids: Vec<ToolCallId>,
+    },
     MismatchedToolLifecycleTurn {
         event_number: usize,
         call_id: ToolCallId,
@@ -653,6 +694,26 @@ impl fmt::Display for ReplayError {
                 formatter,
                 "Event Log event {event_number} belongs to turn '{}' before that turn started",
                 turn_id.as_str()
+            ),
+            Self::EventForInactiveTurn {
+                event_number,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} flows back to inactive turn '{}' while turn '{}' is active",
+                found.as_str(),
+                expected.as_str()
+            ),
+            Self::TurnStartedWithUnresolvedToolCalls {
+                event_number,
+                turn_id,
+                call_ids,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} starts turn '{}' while {} tool call(s) remain unresolved",
+                turn_id.as_str(),
+                call_ids.len()
             ),
             Self::MismatchedToolLifecycleTurn {
                 event_number,

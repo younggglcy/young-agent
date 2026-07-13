@@ -24,6 +24,14 @@ pub struct JsonlEventStore {
 struct AppendFile {
     file: File,
     parent_directory_needs_sync: bool,
+    fully_validated: bool,
+    line_count: usize,
+}
+
+enum AppendPosition {
+    Empty,
+    Legacy,
+    Sequenced(EventSequence),
 }
 
 struct PersistedAgentEvent {
@@ -83,6 +91,7 @@ impl JsonlEventStore {
         event: &AgentEvent,
         durability: EventDurability,
     ) -> Result<(), EventStoreError> {
+        let attempted_event = event.clone().with_event_sequence(sequence);
         let records = if self.path.exists() {
             self.repair_truncated_tail()?;
             self.read_all_records()?
@@ -94,7 +103,7 @@ impl JsonlEventStore {
                 path: self.path.clone(),
                 sequence,
                 persisted: records.into_iter().map(|record| record.event).collect(),
-                attempted: Box::new(event.clone()),
+                attempted: Box::new(attempted_event),
             });
         }
 
@@ -103,12 +112,12 @@ impl JsonlEventStore {
             .filter(|record| {
                 record.sequence == Some(sequence)
                     || (durability == EventDurability::Durable
-                        && has_same_durable_identity(&record.event, event))
+                        && has_same_durable_identity(&record.event, &attempted_event))
             })
             .collect::<Vec<_>>();
         if persisted.len() == 1
             && persisted[0].sequence == Some(sequence)
-            && persisted[0].event == *event
+            && persisted[0].event == attempted_event
         {
             if durability == EventDurability::Durable {
                 self.sync_existing_log()?;
@@ -123,7 +132,7 @@ impl JsonlEventStore {
                     .into_iter()
                     .map(|record| record.event.clone())
                     .collect(),
-                attempted: Box::new(event.clone()),
+                attempted: Box::new(attempted_event.clone()),
             });
         }
         let next_sequence = EventSequence::new(records.len() as u64 + 1);
@@ -135,7 +144,7 @@ impl JsonlEventStore {
                     .last()
                     .map(|record| vec![record.event.clone()])
                     .unwrap_or_default(),
-                attempted: Box::new(event.clone()),
+                attempted: Box::new(attempted_event),
             });
         }
 
@@ -152,20 +161,9 @@ impl JsonlEventStore {
         event: &AgentEvent,
         durable: bool,
     ) -> Result<(), EventStoreError> {
+        let sequence = sequence.or_else(|| event.event_sequence());
         let mut record = if let Some(sequence) = sequence {
-            let mut value =
-                serde_json::to_value(event).map_err(|source| EventStoreError::Encode {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            value
-                .as_object_mut()
-                .expect("AgentEvent serializes as a JSON object")
-                .insert(
-                    "event_sequence".to_string(),
-                    serde_json::Value::from(sequence.as_u64()),
-                );
-            serde_json::to_vec(&value)
+            serde_json::to_vec(&event.clone().with_event_sequence(sequence))
         } else {
             serde_json::to_vec(event)
         }
@@ -183,29 +181,196 @@ impl JsonlEventStore {
             *append_file = Some(self.open_append_file()?);
         }
 
-        let state = append_file.as_mut().expect("append file is initialized");
-        let result = (|| {
-            state.file.write_all(&record)?;
-            state.file.flush()?;
-            if durable {
-                state.file.sync_data()?;
-                if state.parent_directory_needs_sync {
-                    self.sync_parent_directory()?;
-                    state.parent_directory_needs_sync = false;
+        let result = {
+            let state = append_file.as_mut().expect("append file is initialized");
+            state
+                .file
+                .lock()
+                .map_err(|source| EventStoreError::InspectForAppend {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let append_result = (|| {
+                self.validate_append_sequence(state, sequence)?;
+                state
+                    .file
+                    .write_all(&record)
+                    .and_then(|()| state.file.flush())
+                    .map_err(|source| EventStoreError::Append {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                if durable {
+                    state
+                        .file
+                        .sync_data()
+                        .map_err(|source| EventStoreError::Append {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    if state.parent_directory_needs_sync {
+                        self.sync_parent_directory()
+                            .map_err(|source| EventStoreError::Append {
+                                path: self.path.clone(),
+                                source,
+                            })?;
+                        state.parent_directory_needs_sync = false;
+                    }
                 }
-            }
-            Ok(())
-        })();
-        if let Err(source) = result {
+                state.line_count += 1;
+                Ok(())
+            })();
+            let unlock_result = state
+                .file
+                .unlock()
+                .map_err(|source| EventStoreError::Append {
+                    path: self.path.clone(),
+                    source,
+                });
+            append_result.and(unlock_result)
+        };
+        if let Err(error) = result {
             // Force the next append to re-open and validate the commit marker;
             // a failed write may have left an uncommitted partial record.
             *append_file = None;
-            return Err(EventStoreError::Append {
-                path: self.path.clone(),
-                source,
-            });
+            return Err(error);
         }
         Ok(())
+    }
+
+    fn validate_append_sequence(
+        &self,
+        state: &mut AppendFile,
+        found: Option<EventSequence>,
+    ) -> Result<(), EventStoreError> {
+        let (position, line) = self.inspect_append_position(state)?;
+        let expected = match position {
+            AppendPosition::Empty => {
+                let first = EventSequence::new(1);
+                if found.is_none() || found == Some(first) {
+                    return Ok(());
+                }
+                Some(first)
+            }
+            AppendPosition::Legacy => {
+                if found.is_none() {
+                    return Ok(());
+                }
+                None
+            }
+            AppendPosition::Sequenced(expected) => {
+                if found == Some(expected) {
+                    return Ok(());
+                }
+                Some(expected)
+            }
+        };
+        Err(EventStoreError::InvalidEventSequence {
+            path: self.path.clone(),
+            line,
+            expected,
+            found,
+        })
+    }
+
+    fn inspect_append_position(
+        &self,
+        state: &mut AppendFile,
+    ) -> Result<(AppendPosition, usize), EventStoreError> {
+        let file_length = state.file.seek(SeekFrom::End(0)).map_err(|source| {
+            EventStoreError::InspectForAppend {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        if file_length == 0 {
+            state.fully_validated = true;
+            state.line_count = 0;
+            return Ok((AppendPosition::Empty, 1));
+        }
+
+        let mut last_byte = [0_u8; 1];
+        state
+            .file
+            .seek(SeekFrom::End(-1))
+            .and_then(|_| state.file.read_exact(&mut last_byte))
+            .map_err(|source| EventStoreError::InspectForAppend {
+                path: self.path.clone(),
+                source,
+            })?;
+        if last_byte[0] != b'\n' {
+            return Err(EventStoreError::UnterminatedLog {
+                path: self.path.clone(),
+            });
+        }
+
+        let last_event = if state.fully_validated {
+            self.read_last_event(&mut state.file, file_length, state.line_count.max(1))?
+        } else {
+            let records = self.read_all_records()?;
+            state.line_count = records.len();
+            state.fully_validated = true;
+            records
+                .last()
+                .expect("a non-empty log has a final record")
+                .event
+                .clone()
+        };
+        let line = match last_event.event_sequence() {
+            Some(sequence) => sequence.as_u64().saturating_add(1) as usize,
+            None => state.line_count.saturating_add(1),
+        };
+        let position = match last_event.event_sequence() {
+            Some(sequence) => {
+                AppendPosition::Sequenced(EventSequence::new(sequence.as_u64().saturating_add(1)))
+            }
+            None => AppendPosition::Legacy,
+        };
+        Ok((position, line))
+    }
+
+    fn read_last_event(
+        &self,
+        file: &mut File,
+        file_length: u64,
+        line: usize,
+    ) -> Result<AgentEvent, EventStoreError> {
+        const SEARCH_CHUNK_SIZE: usize = 8 * 1024;
+        let mut search_end = file_length - 1;
+        let mut record_start = 0_u64;
+        let mut buffer = [0_u8; SEARCH_CHUNK_SIZE];
+        while search_end > 0 {
+            let chunk_start = search_end.saturating_sub(SEARCH_CHUNK_SIZE as u64);
+            let chunk_length = (search_end - chunk_start) as usize;
+            file.seek(SeekFrom::Start(chunk_start))
+                .and_then(|_| file.read_exact(&mut buffer[..chunk_length]))
+                .map_err(|source| EventStoreError::InspectForAppend {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if let Some(newline_index) = buffer[..chunk_length]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+            {
+                record_start = chunk_start + newline_index as u64 + 1;
+                break;
+            }
+            search_end = chunk_start;
+        }
+
+        let record_length = (file_length - record_start - 1) as usize;
+        let mut record = vec![0_u8; record_length];
+        file.seek(SeekFrom::Start(record_start))
+            .and_then(|_| file.read_exact(&mut record))
+            .map_err(|source| EventStoreError::InspectForAppend {
+                path: self.path.clone(),
+                source,
+            })?;
+        serde_json::from_slice(&record).map_err(|source| EventStoreError::DecodeRecord {
+            path: self.path.clone(),
+            line,
+            source,
+        })
     }
 
     fn sync_existing_log(&self) -> Result<(), EventStoreError> {
@@ -234,7 +399,7 @@ impl JsonlEventStore {
     }
 
     fn open_append_file(&self) -> Result<AppendFile, EventStoreError> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
@@ -244,30 +409,11 @@ impl JsonlEventStore {
                 source,
             })?;
 
-        let file_length =
-            file.seek(SeekFrom::End(0))
-                .map_err(|source| EventStoreError::InspectForAppend {
-                    path: self.path.clone(),
-                    source,
-                })?;
-        if file_length > 0 {
-            let mut last_byte = [0_u8; 1];
-            file.seek(SeekFrom::End(-1))
-                .and_then(|_| file.read_exact(&mut last_byte))
-                .map_err(|source| EventStoreError::InspectForAppend {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            if last_byte[0] != b'\n' {
-                return Err(EventStoreError::UnterminatedLog {
-                    path: self.path.clone(),
-                });
-            }
-        }
-
         Ok(AppendFile {
             file,
             parent_directory_needs_sync: true,
+            fully_validated: false,
+            line_count: 0,
         })
     }
 
@@ -382,27 +528,14 @@ impl JsonlEventStore {
                 record.pop();
             }
 
-            let mut value: serde_json::Value =
-                serde_json::from_slice(&record).map_err(|source| {
-                    EventStoreError::DecodeRecord {
-                        path: self.path.clone(),
-                        line: line_number,
-                        source,
-                    }
-                })?;
-            let sequence = value
-                .as_object_mut()
-                .and_then(|object| object.remove("event_sequence"))
-                .map(|value| {
-                    serde_json::from_value::<u64>(value)
-                        .map(EventSequence::new)
-                        .map_err(|source| EventStoreError::DecodeRecord {
-                            path: self.path.clone(),
-                            line: line_number,
-                            source,
-                        })
-                })
-                .transpose()?;
+            let event: AgentEvent = serde_json::from_slice(&record).map_err(|source| {
+                EventStoreError::DecodeRecord {
+                    path: self.path.clone(),
+                    line: line_number,
+                    source,
+                }
+            })?;
+            let sequence = event.event_sequence();
             match expected_sequence {
                 None => {
                     if let Some(found) = sequence {
@@ -430,12 +563,6 @@ impl JsonlEventStore {
             expected_sequence = Some(
                 sequence.map(|sequence| EventSequence::new(sequence.as_u64().saturating_add(1))),
             );
-            let event =
-                serde_json::from_value(value).map_err(|source| EventStoreError::DecodeRecord {
-                    path: self.path.clone(),
-                    line: line_number,
-                    source,
-                })?;
             if !is_terminated {
                 return Err(EventStoreError::TruncatedRecord {
                     path: self.path.clone(),
