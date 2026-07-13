@@ -151,7 +151,11 @@ fn search_directory(
             if file_name == ".git" {
                 continue;
             }
-            if stack.len() == MAX_SEARCH_DEPTH || !results.record_directory() {
+            if stack.len() == MAX_SEARCH_DEPTH {
+                results.mark_limit_reached();
+                return Ok(());
+            }
+            if !results.record_directory() {
                 return Ok(());
             }
             let directory = entry.open_dir().map_err(|source| {
@@ -414,8 +418,7 @@ struct SearchCheckpoint {
 impl SearchResults {
     fn record_directory(&mut self) -> bool {
         if self.directories_visited == MAX_SEARCH_DIRECTORIES {
-            self.truncated = true;
-            self.limit_reached = true;
+            self.mark_limit_reached();
             return false;
         }
         self.directories_visited = self.directories_visited.saturating_add(1);
@@ -424,12 +427,16 @@ impl SearchResults {
 
     fn record_entry(&mut self) -> bool {
         if self.entries_visited == MAX_SEARCH_ENTRIES {
-            self.truncated = true;
-            self.limit_reached = true;
+            self.mark_limit_reached();
             return false;
         }
         self.entries_visited = self.entries_visited.saturating_add(1);
         true
+    }
+
+    fn mark_limit_reached(&mut self) {
+        self.truncated = true;
+        self.limit_reached = true;
     }
 
     fn checkpoint(&self) -> SearchCheckpoint {

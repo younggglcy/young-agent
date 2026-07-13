@@ -563,6 +563,45 @@ fn search_files_returns_structured_matches_through_the_tool_runtime() {
 }
 
 #[test]
+fn search_files_marks_results_truncated_at_the_directory_depth_limit() {
+    let test_workspace = TestWorkspace::new("search-depth-limit");
+    let mut deepest = test_workspace.path().to_path_buf();
+    for _ in 0..257 {
+        deepest.push("d");
+        std::fs::create_dir(&deepest).expect("nested fixture directory is created");
+    }
+    std::fs::write(deepest.join("match.txt"), "deep needle\n").expect("deep fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-depth-limit"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "needle" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success {
+        content, metadata, ..
+    } = result.output
+    else {
+        panic!("bounded deep search should succeed");
+    };
+    assert_eq!(
+        content,
+        vec![ToolContent::Json {
+            value: json!({ "matches": [] }),
+        }]
+    );
+    assert_eq!(metadata["truncated"], json!(true));
+    assert_eq!(metadata["directories_visited"], json!(256));
+}
+
+#[test]
 fn search_files_marks_a_truncated_matching_line() {
     let test_workspace = TestWorkspace::new("search-truncation");
     let long_line = format!("needle{}\n", "x".repeat(9_000));
