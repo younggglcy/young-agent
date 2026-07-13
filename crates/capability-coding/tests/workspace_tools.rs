@@ -1726,6 +1726,54 @@ fn run_command_waits_for_a_same_group_background_process_with_closed_pipes() {
 }
 
 #[test]
+fn run_command_cancels_a_same_group_background_process_after_the_leader_exits() {
+    let test_workspace = TestWorkspace::new("command-background-cancel-after-leader");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-background-cancel-after-leader"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "(printf ready > background-ready; sleep 10; printf leaked > background-leaked) >/dev/null 2>&1 &"
+        }),
+    };
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation_trigger = cancellation.clone();
+    let ready = test_workspace.path().join("background-ready");
+    let trigger = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while !ready.exists() && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "background process must start before cancellation"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation_trigger.store(true, Ordering::Relaxed);
+    });
+    let started = std::time::Instant::now();
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        cancellation,
+    );
+
+    trigger.join().expect("cancellation trigger finishes");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("cancellation after leader exit must fail closed");
+    };
+    assert_eq!(error.code, "command_termination_unverified");
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!test_workspace.path().join("background-leaked").exists());
+}
+
+#[test]
 fn run_command_reports_success_only_after_background_work_finishes() {
     let test_workspace = TestWorkspace::new("command-background-completion");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");

@@ -13,7 +13,8 @@ use crate::tool_support::{
     ToolArguments,
 };
 use crate::workspace::{
-    AtomicReplaceError, CodingWorkspace, WorkspacePathError, MAX_FILE_SNAPSHOT_BYTES,
+    AtomicReplaceError, CodingWorkspace, PublishedRecovery, WorkspacePathError,
+    MAX_FILE_SNAPSHOT_BYTES,
 };
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -148,12 +149,10 @@ fn apply_unified_patch(
                     source,
                     target,
                     recovery,
-                    recovery_policy_verified,
                 } => PatchError::Published {
                     source,
                     target,
                     recovery,
-                    recovery_policy_verified,
                 },
             })?
             .into_iter()
@@ -621,8 +620,7 @@ pub(crate) enum PatchError {
     },
     Published {
         target: PathBuf,
-        recovery: Option<PathBuf>,
-        recovery_policy_verified: bool,
+        recovery: PublishedRecovery,
         source: std::io::Error,
     },
     Cancelled,
@@ -634,40 +632,49 @@ impl PatchError {
             Self::Published {
                 target,
                 recovery,
-                recovery_policy_verified,
                 source,
             } => {
                 let changed = display_relative_path(&target);
-                let recoveries = recovery
-                    .as_deref()
-                    .map(display_relative_path)
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                let (code, publication_state, recoveries, recovery_state, recovery_policy) =
+                    match recovery {
+                        PublishedRecovery::LocatedVerified(path) => (
+                            "patch_published_with_recovery",
+                            "published_with_recovery",
+                            vec![display_relative_path(&path)],
+                            "located_verified",
+                            "verified_search_and_git_ignored",
+                        ),
+                        PublishedRecovery::LocatedPolicyUnverified(path) => (
+                            "patch_published_with_recovery",
+                            "published_with_recovery",
+                            vec![display_relative_path(&path)],
+                            "located_policy_unverified",
+                            "unverified",
+                        ),
+                        PublishedRecovery::Unlocated => (
+                            "patch_published_recovery_unlocated",
+                            "published_recovery_unlocated",
+                            Vec::new(),
+                            "unlocated",
+                            "unverified",
+                        ),
+                    };
                 let message = format!(
                     "patch was published at '{changed}', but commit validation failed: {source}"
                 );
                 let (message, _) = truncate_json_string(&message, 8 * 1024);
                 ToolOutput::Failure {
                     error: ToolError {
-                        code: "patch_published_with_recovery".to_string(),
+                        code: code.to_string(),
                         message: message.to_string(),
                         retryable: false,
                     },
                     extensions: BTreeMap::from([
-                        (
-                            "publication_state".to_string(),
-                            json!("published_with_recovery"),
-                        ),
+                        ("publication_state".to_string(), json!(publication_state)),
                         ("changed_files".to_string(), json!([changed])),
                         ("recovery_files".to_string(), json!(recoveries)),
-                        (
-                            "recovery_policy".to_string(),
-                            json!(if recovery_policy_verified {
-                                "verified_search_and_git_ignored"
-                            } else {
-                                "unverified"
-                            }),
-                        ),
+                        ("recovery_state".to_string(), json!(recovery_state)),
+                        ("recovery_policy".to_string(), json!(recovery_policy)),
                     ]),
                 }
             }
@@ -691,6 +698,10 @@ impl PatchError {
                 "patch_conflict"
             }
             Self::Io { .. } => "workspace_io_error",
+            Self::Published {
+                recovery: PublishedRecovery::Unlocated,
+                ..
+            } => "patch_published_recovery_unlocated",
             Self::Published { .. } => "patch_published_with_recovery",
             Self::Cancelled => "tool_cancelled",
         }
@@ -734,17 +745,16 @@ mod tests {
     use serde_json::json;
     use young_tool_runtime::ToolOutput;
 
-    use super::PatchError;
+    use super::{PatchError, PublishedRecovery};
 
     #[test]
     fn published_failure_exposes_nested_recovery_state_as_extensions() {
         let output = PatchError::Published {
             target: "src/target.txt".into(),
-            recovery: Some(
+            recovery: PublishedRecovery::LocatedPolicyUnverified(
                 "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp"
                     .into(),
             ),
-            recovery_policy_verified: false,
             source: std::io::Error::other("injected policy drift"),
         }
         .into_output();
@@ -764,6 +774,32 @@ mod tests {
                 "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp"
             ])
         );
+        assert_eq!(
+            extensions["recovery_state"],
+            json!("located_policy_unverified")
+        );
+        assert_eq!(extensions["recovery_policy"], json!("unverified"));
+    }
+
+    #[test]
+    fn published_failure_distinguishes_an_unlocated_recovery() {
+        let output = PatchError::Published {
+            target: "src/target.txt".into(),
+            recovery: PublishedRecovery::Unlocated,
+            source: std::io::Error::other("injected namespace identity loss"),
+        }
+        .into_output();
+
+        let ToolOutput::Failure { error, extensions } = output else {
+            panic!("published patch validation must fail structurally");
+        };
+        assert_eq!(error.code, "patch_published_recovery_unlocated");
+        assert_eq!(
+            extensions["publication_state"],
+            json!("published_recovery_unlocated")
+        );
+        assert_eq!(extensions["recovery_files"], json!([]));
+        assert_eq!(extensions["recovery_state"], json!("unlocated"));
         assert_eq!(extensions["recovery_policy"], json!("unverified"));
     }
 }

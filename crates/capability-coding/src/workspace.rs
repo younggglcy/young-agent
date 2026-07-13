@@ -226,15 +226,10 @@ impl CodingWorkspace {
                 CommitError::BeforePublication(source) => {
                     AtomicReplaceError::BeforePublication(source)
                 }
-                CommitError::Published {
-                    source,
-                    recovery,
-                    recovery_policy_verified,
-                } => AtomicReplaceError::Published {
+                CommitError::Published { source, recovery } => AtomicReplaceError::Published {
                     source,
                     target: path.to_path_buf(),
-                    recovery: recovery.map(|recovery| parent.join(recovery)),
-                    recovery_policy_verified,
+                    recovery: recovery.within_parent(parent),
                 },
             })?;
         Ok(Some(parent.join(recovery)))
@@ -645,17 +640,32 @@ pub(crate) enum AtomicReplaceError {
     Published {
         source: io::Error,
         target: PathBuf,
-        recovery: Option<PathBuf>,
-        recovery_policy_verified: bool,
+        recovery: PublishedRecovery,
     },
+}
+
+#[derive(Debug)]
+pub(crate) enum PublishedRecovery {
+    LocatedVerified(PathBuf),
+    LocatedPolicyUnverified(PathBuf),
+    Unlocated,
+}
+
+impl PublishedRecovery {
+    fn within_parent(self, parent: &Path) -> Self {
+        match self {
+            Self::LocatedVerified(path) => Self::LocatedVerified(parent.join(path)),
+            Self::LocatedPolicyUnverified(path) => Self::LocatedPolicyUnverified(parent.join(path)),
+            Self::Unlocated => Self::Unlocated,
+        }
+    }
 }
 
 enum CommitError {
     BeforePublication(io::Error),
     Published {
         source: io::Error,
-        recovery: Option<PathBuf>,
-        recovery_policy_verified: bool,
+        recovery: PublishedRecovery,
     },
 }
 
@@ -1108,24 +1118,25 @@ fn published_commit_failure(
     match validate_recovery_namespace_slot(parent, recovery) {
         Ok(()) => CommitError::Published {
             source,
-            recovery: Some(PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path)),
-            recovery_policy_verified: true,
+            recovery: PublishedRecovery::LocatedVerified(
+                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
+            ),
         },
         Err(RecoveryNamespaceError::Policy(policy)) => CommitError::Published {
             source: io::Error::new(
                 source.kind(),
                 format!("{source}; recovery policy validation failed ({policy})"),
             ),
-            recovery: Some(PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path)),
-            recovery_policy_verified: false,
+            recovery: PublishedRecovery::LocatedPolicyUnverified(
+                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
+            ),
         },
         Err(RecoveryNamespaceError::Identity(identity)) => CommitError::Published {
             source: io::Error::new(
                 source.kind(),
                 format!("{source}; recovery namespace identity was lost ({identity})"),
             ),
-            recovery: None,
-            recovery_policy_verified: false,
+            recovery: PublishedRecovery::Unlocated,
         },
     }
 }
@@ -1135,13 +1146,13 @@ fn published_namespace_failure(staged: &StagedFile, error: RecoveryNamespaceErro
     match error {
         RecoveryNamespaceError::Policy(source) => CommitError::Published {
             source,
-            recovery: Some(PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path)),
-            recovery_policy_verified: false,
+            recovery: PublishedRecovery::LocatedPolicyUnverified(
+                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
+            ),
         },
         RecoveryNamespaceError::Identity(source) => CommitError::Published {
             source,
-            recovery: None,
-            recovery_policy_verified: false,
+            recovery: PublishedRecovery::Unlocated,
         },
     }
 }
@@ -2120,18 +2131,16 @@ mod tests {
             .expect_err("post-publication policy drift must be structured");
 
         let super::AtomicReplaceError::Published {
-            target,
-            recovery,
-            recovery_policy_verified,
-            ..
+            target, recovery, ..
         } = error
         else {
             panic!("failure must retain published state");
         };
         assert_eq!(target, std::path::Path::new("src/target.txt"));
-        let recovery = recovery.expect("stable namespace retains recovery path");
+        let super::PublishedRecovery::LocatedPolicyUnverified(recovery) = recovery else {
+            panic!("stable namespace with invalid policy retains an unverified recovery path");
+        };
         assert!(recovery.starts_with("src/.young-agent-recovery"));
-        assert!(!recovery_policy_verified);
         assert_eq!(
             std::fs::read_to_string(root.join("src/target.txt")).unwrap(),
             "patched\n"
