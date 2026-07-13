@@ -33,13 +33,23 @@ pub enum RunControlFlow {
     Cancel { reason: String },
 }
 
+/// Synchronous control seam for the deterministic proof runtime.
+/// Interactive surfaces should eventually provide async approval and stop
+/// handling rather than treating this trait as stable.
 pub trait RunControl {
     /// Synchronous checkpoint evaluated between runtime steps. Use
     /// `RunStopToken` when another thread must stop provider or tool work that
     /// is currently pending.
     fn checkpoint(&mut self) -> RunControlFlow;
 
-    fn decide_approval(&mut self, _request: &ApprovalRequest) -> ApprovalDecision {
+    /// Waits for an approval decision. Implementations that block on a human
+    /// or external policy service must observe `cancellation` and return
+    /// promptly once it is set.
+    fn decide_approval(
+        &mut self,
+        _request: &ApprovalRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
         ApprovalDecision::Deny {
             reason: "no approval handler accepted the tool call".to_string(),
         }
@@ -214,12 +224,19 @@ where
         let RunRequest {
             run_id,
             model,
-            mut messages,
+            messages,
             tools,
             metadata,
         } = request;
 
-        self.emit(AgentEvent::RunStarted {
+        let mut model_request = ModelRequest {
+            model,
+            messages,
+            tools,
+            metadata,
+        };
+
+        self.emit(&AgentEvent::RunStarted {
             run_id: run_id.clone(),
             extensions: BTreeMap::new(),
         })?;
@@ -232,20 +249,14 @@ where
             }
 
             let turn_id = TurnId::new(format!("turn-{turn_number:03}"));
-            self.emit(AgentEvent::TurnStarted {
+            self.emit(&AgentEvent::TurnStarted {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 extensions: BTreeMap::new(),
             })?;
 
-            let model_request = ModelRequest {
-                model: model.clone(),
-                messages: messages.clone(),
-                tools: tools.clone(),
-                metadata: metadata.clone(),
-            };
             let collected =
-                match self.collect_model_turn(&run_id, &turn_id, model_request, control, stop)? {
+                match self.collect_model_turn(&run_id, &turn_id, &model_request, control, stop)? {
                     ModelTurnProgress::Collected(collected) => collected,
                     ModelTurnProgress::Finished(outcome) => return Ok(outcome),
                 };
@@ -257,7 +268,7 @@ where
                 return self.finish(&run_id, status);
             }
 
-            messages.push(if collected.text.is_empty() {
+            model_request.messages.push(if collected.text.is_empty() {
                 ModelMessage::assistant_tool_calls(collected.tool_calls.clone())
             } else {
                 ModelMessage::assistant_with_tool_calls(
@@ -275,7 +286,7 @@ where
                     control,
                     stop,
                 )? {
-                    ToolCallProgress::Message(message) => messages.push(message),
+                    ToolCallProgress::Message(message) => model_request.messages.push(message),
                     ToolCallProgress::Finished(outcome) => return Ok(outcome),
                 }
             }
@@ -296,7 +307,7 @@ where
         &mut self,
         run_id: &RunId,
         turn_id: &TurnId,
-        request: ModelRequest,
+        request: &ModelRequest,
         control: &mut C,
         stop: &RunStopToken,
     ) -> Result<ModelTurnProgress, AgentRuntimeError<S::Error>>
@@ -324,12 +335,19 @@ where
                 return self.finish(run_id, status).map(ModelTurnProgress::Finished);
             }
 
-            self.emit(AgentEvent::ModelOutput {
+            let model_output_event = AgentEvent::ModelOutput {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
-                event: model_event.clone(),
+                event: model_event,
                 extensions: BTreeMap::new(),
-            })?;
+            };
+            self.emit(&model_output_event)?;
+            let AgentEvent::ModelOutput {
+                event: model_event, ..
+            } = model_output_event
+            else {
+                unreachable!("model_output_event is constructed as AgentEvent::ModelOutput")
+            };
 
             match model_event {
                 ModelStreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
@@ -403,7 +421,7 @@ where
             tool_name: model_tool_call.name.clone(),
             arguments: model_tool_call.arguments,
         };
-        self.emit(AgentEvent::ToolCallRequested {
+        self.emit(&AgentEvent::ToolCallRequested {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
             model_tool_call_id: model_tool_call.id.clone(),
@@ -411,22 +429,25 @@ where
             extensions: BTreeMap::new(),
         })?;
 
-        let result = if let Some(reason) = self.tool_executor.approval_reason(&call) {
+        let output = if let Some(reason) = self.tool_executor.approval_reason(&call) {
             sequences.approval += 1;
             let approval = ApprovalRequest {
                 id: format!("{}-approval-{:03}", run_id.as_str(), sequences.approval),
                 call: call.clone(),
                 reason,
             };
-            self.emit(AgentEvent::ApprovalRequested {
+            self.emit(&AgentEvent::ApprovalRequested {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 request: approval.clone(),
                 extensions: BTreeMap::new(),
             })?;
 
-            let decision = control.decide_approval(&approval);
-            self.emit(AgentEvent::ApprovalResolved {
+            let decision = control.decide_approval(&approval, stop.cancellation_flag());
+            if let Some(status) = stop.status() {
+                return self.finish(run_id, status).map(ToolCallProgress::Finished);
+            }
+            self.emit(&AgentEvent::ApprovalResolved {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 approval_id: approval.id,
@@ -441,16 +462,13 @@ where
                     }
                     self.tool_executor.execute(&call, stop.cancellation_flag())
                 }
-                ApprovalDecision::Deny { reason } => ToolResult {
-                    call_id: call.id.clone(),
-                    output: ToolOutput::Failure {
-                        error: young_tool_runtime::ToolError {
-                            code: "approval_denied".to_string(),
-                            message: reason,
-                            retryable: false,
-                        },
-                        extensions: BTreeMap::new(),
+                ApprovalDecision::Deny { reason } => ToolOutput::Failure {
+                    error: young_tool_runtime::ToolError {
+                        code: "approval_denied".to_string(),
+                        message: reason,
+                        retryable: false,
                     },
+                    extensions: BTreeMap::new(),
                 },
             }
         } else {
@@ -460,18 +478,26 @@ where
             self.tool_executor.execute(&call, stop.cancellation_flag())
         };
 
-        self.emit_tool_result(AgentEvent::ToolResult {
+        let result = ToolResult {
+            call_id: call.id.clone(),
+            output,
+        };
+        let result_event = AgentEvent::ToolResult {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
-            result: result.clone(),
+            result,
             extensions: BTreeMap::new(),
-        })?;
+        };
+        self.emit_tool_result(&result_event)?;
+        let AgentEvent::ToolResult { result, .. } = result_event else {
+            unreachable!("result_event is constructed as AgentEvent::ToolResult")
+        };
 
         if let Some(status) = stop.status() {
             return self.finish(run_id, status).map(ToolCallProgress::Finished);
         }
         if let ToolOutput::Failure { error, .. } = &result.output {
-            self.emit(AgentEvent::Error {
+            self.emit(&AgentEvent::Error {
                 run_id: run_id.clone(),
                 turn_id: Some(turn_id.clone()),
                 error: AgentError {
@@ -484,22 +510,22 @@ where
         }
 
         Ok(ToolCallProgress::Message(ModelMessage::Tool {
-            content: tool_result_content(&result),
+            content: tool_result_content(result.output),
             name: model_tool_call.name,
             tool_call_id: model_tool_call.id,
         }))
     }
 
-    fn emit(&mut self, event: AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
+    fn emit(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
         self.event_sink
-            .append(&event)
+            .append(event)
             .map_err(AgentRuntimeError::EventSink)
     }
 
-    fn emit_tool_result(&mut self, event: AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink.append(&event).map_err(|source| {
+    fn emit_tool_result(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
+        self.event_sink.append(event).map_err(|source| {
             AgentRuntimeError::ToolResultPersistenceIndeterminate {
-                event: Box::new(event),
+                event: Box::new(event.clone()),
                 source,
             }
         })
@@ -528,7 +554,7 @@ where
         turn_id: Option<TurnId>,
         error: AgentError,
     ) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
-        self.emit(AgentEvent::Error {
+        self.emit(&AgentEvent::Error {
             run_id: run_id.clone(),
             turn_id,
             error: error.clone(),
@@ -542,7 +568,7 @@ where
         run_id: &RunId,
         status: TerminalRunStatus,
     ) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
-        self.emit(AgentEvent::RunFinished {
+        self.emit(&AgentEvent::RunFinished {
             run_id: run_id.clone(),
             status: status.clone(),
             extensions: BTreeMap::new(),
@@ -552,24 +578,25 @@ where
 }
 
 fn stopped_status(control: RunControlFlow, stop: &RunStopToken) -> Option<TerminalRunStatus> {
-    stop.status().or(match control {
-        RunControlFlow::Continue => None,
-        RunControlFlow::Interrupt { reason } => Some(TerminalRunStatus::Interrupted { reason }),
-        RunControlFlow::Cancel { reason } => Some(TerminalRunStatus::Cancelled { reason }),
-    })
+    match control {
+        RunControlFlow::Continue => {}
+        RunControlFlow::Interrupt { reason } => stop.interrupt(reason),
+        RunControlFlow::Cancel { reason } => stop.cancel(reason),
+    }
+    stop.status()
 }
 
-fn tool_result_content(result: &ToolResult) -> Vec<ModelMessageContent> {
-    match &result.output {
+fn tool_result_content(output: ToolOutput) -> Vec<ModelMessageContent> {
+    match output {
         ToolOutput::Success { content, .. } => content
-            .iter()
+            .into_iter()
             .map(|content| match content {
-                ToolContent::Text { text } => ModelMessageContent::text(text.clone()),
-                ToolContent::Json { value } => ModelMessageContent::json(value.clone()),
+                ToolContent::Text { text } => ModelMessageContent::text(text),
+                ToolContent::Json { value } => ModelMessageContent::json(value),
             })
             .collect(),
-        ToolOutput::Failure { .. } => vec![ModelMessageContent::json(
-            serde_json::to_value(&result.output).expect("ToolOutput is serializable"),
+        failure @ ToolOutput::Failure { .. } => vec![ModelMessageContent::json(
+            serde_json::to_value(failure).expect("ToolOutput is serializable"),
         )],
     }
 }

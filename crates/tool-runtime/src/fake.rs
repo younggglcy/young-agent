@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::execution::{ToolCall, ToolError, ToolExecutor, ToolOutput, ToolResult};
+use crate::execution::{ToolCall, ToolError, ToolExecutor, ToolOutput};
 
 #[derive(Clone, Debug, Default)]
 pub struct FakeToolExecutor {
@@ -45,10 +45,9 @@ impl ToolExecutor for FakeToolExecutor {
         self.approval_reason.clone()
     }
 
-    fn execute(&mut self, call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolResult {
+    fn execute(&mut self, call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
         self.calls.push(call.clone());
-        let output = self
-            .outputs
+        self.outputs
             .pop_front()
             .unwrap_or_else(|| ToolOutput::Failure {
                 error: ToolError {
@@ -57,11 +56,6 @@ impl ToolExecutor for FakeToolExecutor {
                     retryable: false,
                 },
                 extensions: Default::default(),
-            });
-
-        ToolResult {
-            call_id: call.id.clone(),
-            output,
-        }
+            })
     }
 }

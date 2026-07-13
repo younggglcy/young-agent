@@ -30,6 +30,10 @@ pub struct ToolCall {
 
 /// Execution boundary consumed by the Agent Runtime. Tool lookup, policy, and
 /// concrete implementations remain owned by the Tool Runtime.
+///
+/// This synchronous trait is an intentionally unstable first-phase proof
+/// boundary for deterministic fake tools. Long-lived or remote tool execution
+/// should move this seam to an async future before it becomes a stable API.
 pub trait ToolExecutor {
     fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
         None
@@ -38,7 +42,9 @@ pub trait ToolExecutor {
     /// Executes one invocation. Implementations that can block on external
     /// work must observe `cancellation` and return promptly once it is set;
     /// cancellation is cooperative, not forced.
-    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolResult;
+    /// Returns only the tool-owned output. The Agent Runtime attaches the
+    /// kernel-owned `ToolCall.id`, so executors cannot forge result correlation.
+    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

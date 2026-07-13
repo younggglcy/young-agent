@@ -20,7 +20,7 @@ use young_model_runtime::{
     ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
 use young_tool_runtime::{
-    FakeToolExecutor, ToolCall, ToolContent, ToolError, ToolExecutor, ToolOutput, ToolResult,
+    FakeToolExecutor, ToolCall, ToolContent, ToolError, ToolExecutor, ToolOutput,
 };
 
 struct TestLog {
@@ -78,7 +78,7 @@ impl ModelClient for BlockingStreamCreationModelClient {
 
     fn stream(
         &mut self,
-        _request: ModelRequest,
+        _request: &ModelRequest,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Self::Stream, ModelError> {
         self.entered.wait();
@@ -115,7 +115,7 @@ impl ModelClient for BlockingModelClient {
 
     fn stream(
         &mut self,
-        _request: ModelRequest,
+        _request: &ModelRequest,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Self::Stream, ModelError> {
         Ok(BlockingModelStream {
@@ -128,6 +128,30 @@ impl ModelClient for BlockingModelClient {
 
 struct BlockingToolExecutor {
     entered: Arc<Barrier>,
+}
+
+struct BlockingApprovalControl {
+    entered: Arc<Barrier>,
+}
+
+impl RunControl for BlockingApprovalControl {
+    fn checkpoint(&mut self) -> RunControlFlow {
+        RunControlFlow::Continue
+    }
+
+    fn decide_approval(
+        &mut self,
+        _request: &ApprovalRequest,
+        cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
+        self.entered.wait();
+        while !cancellation.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        ApprovalDecision::Deny {
+            reason: "approval wait cancelled".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -169,21 +193,18 @@ impl AgentEventSink for FailOnceOnToolResultSink {
 }
 
 impl ToolExecutor for BlockingToolExecutor {
-    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolResult {
+    fn execute(&mut self, _call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {
         self.entered.wait();
         while !cancellation.load(Ordering::Acquire) {
             thread::yield_now();
         }
-        ToolResult {
-            call_id: call.id.clone(),
-            output: ToolOutput::Failure {
-                error: ToolError {
-                    code: "cancelled".to_string(),
-                    message: "tool observed cancellation".to_string(),
-                    retryable: false,
-                },
-                extensions: no_extensions(),
+        ToolOutput::Failure {
+            error: ToolError {
+                code: "cancelled".to_string(),
+                message: "tool observed cancellation".to_string(),
+                retryable: false,
             },
+            extensions: no_extensions(),
         }
     }
 }
@@ -615,6 +636,104 @@ fn cooperative_tool_observes_external_cancellation_while_execution_is_pending() 
 }
 
 #[test]
+fn cooperative_approval_wait_observes_external_cancellation() {
+    let log = TestLog::new("cancel-pending-approval");
+    let store = JsonlEventStore::new(log.path());
+    let entered = Arc::new(Barrier::new(2));
+    let stop = RunStopToken::default();
+    let cancellation = stop.clone();
+    let canceller_entered = entered.clone();
+    let canceller = thread::spawn(move || {
+        canceller_entered.wait();
+        cancellation.cancel("user cancelled pending approval");
+    });
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("model-call-001"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "cargo test" }),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::Completed {
+            finish_reason: Some("tool_calls".to_string()),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let tools = FakeToolExecutor::requiring_approval(
+        "command requires approval",
+        [ToolOutput::Success {
+            content: Vec::new(),
+            metadata: no_extensions(),
+            extensions: no_extensions(),
+        }],
+    );
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+    let mut control = BlockingApprovalControl { entered };
+
+    let outcome = runtime
+        .run_with_control_and_stop(
+            run_request("run-cancel-pending-approval"),
+            &mut control,
+            &stop,
+        )
+        .expect("cooperative approval wait should observe cancellation");
+    canceller.join().expect("canceller should finish");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Cancelled {
+            reason: "user cancelled pending approval".to_string(),
+        }
+    );
+    assert!(runtime.tool_executor().calls().is_empty());
+    let events = store.read_all().expect("cancelled Event Log should read");
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ApprovalRequested { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ApprovalResolved { .. })));
+}
+
+#[test]
+fn the_first_stop_request_is_shared_across_control_and_stop_token() {
+    let first_log = TestLog::new("first-stop-control");
+    let first_store = JsonlEventStore::new(first_log.path());
+    let stop = RunStopToken::default();
+    let mut control = || RunControlFlow::Interrupt {
+        reason: "control interrupted first".to_string(),
+    };
+    let mut first_runtime = AgentRuntime::new(
+        FakeModelClient::default(),
+        FakeToolExecutor::default(),
+        first_store,
+    );
+
+    let first_outcome = first_runtime
+        .run_with_control_and_stop(run_request("run-first-stop"), &mut control, &stop)
+        .expect("control interruption should finish the run");
+    assert_eq!(
+        first_outcome.status(),
+        &TerminalRunStatus::Interrupted {
+            reason: "control interrupted first".to_string(),
+        }
+    );
+    assert!(stop.is_requested());
+
+    stop.cancel("later cancellation must not replace the first stop");
+    let second_log = TestLog::new("first-stop-token");
+    let mut second_runtime = AgentRuntime::new(
+        FakeModelClient::default(),
+        FakeToolExecutor::default(),
+        JsonlEventStore::new(second_log.path()),
+    );
+    let second_outcome = second_runtime
+        .run_with_stop_token(run_request("run-first-stop-reused"), &stop)
+        .expect("the shared token should preserve its first terminal status");
+    assert_eq!(second_outcome.status(), first_outcome.status());
+}
+
+#[test]
 fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_tool() {
     let sink = FailOnceOnToolResultSink::new();
     let observed_events = sink.events.clone();
@@ -656,8 +775,12 @@ fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_t
 
     let replay = young_event_store::replay_events(observed_events.borrow().clone())
         .expect("pre-execution intent should remain replayable");
+    assert_eq!(replay.status(), &RunStatus::Running);
+
+    let recovery = young_event_store::replay_events_for_recovery(observed_events.borrow().clone())
+        .expect("an inactive incomplete run should expose recovery work");
     assert_eq!(
-        replay.status(),
+        recovery.status(),
         &RunStatus::RecoveryRequired {
             call_ids: vec![runtime.tool_executor().calls()[0].id.clone()],
         }
@@ -685,7 +808,11 @@ impl RunControl for ApproveThenCancelControl {
         }
     }
 
-    fn decide_approval(&mut self, _request: &ApprovalRequest) -> ApprovalDecision {
+    fn decide_approval(
+        &mut self,
+        _request: &ApprovalRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
         self.approved = true;
         ApprovalDecision::Approve
     }
@@ -696,7 +823,11 @@ impl RunControl for ApprovingControl {
         RunControlFlow::Continue
     }
 
-    fn decide_approval(&mut self, request: &ApprovalRequest) -> ApprovalDecision {
+    fn decide_approval(
+        &mut self,
+        request: &ApprovalRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
         self.requests.push(request.clone());
         ApprovalDecision::Approve
     }

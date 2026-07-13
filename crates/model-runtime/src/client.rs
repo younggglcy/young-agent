@@ -9,6 +9,11 @@ use crate::id::ModelToolCallId;
 use crate::stream::{ModelError, ModelStreamEvent};
 
 /// Provider-neutral boundary consumed by the Agent Runtime.
+///
+/// This synchronous trait is an intentionally unstable first-phase proof
+/// boundary for deterministic fakes and local adapters. Real provider
+/// networking is out of scope for this phase and should move this seam to an
+/// async stream before the trait is treated as a stable adapter API.
 pub trait ModelClient {
     type Stream: Iterator<Item = ModelStreamEvent>;
 
@@ -17,7 +22,7 @@ pub trait ModelClient {
     /// promptly once it is set; cancellation is cooperative, not forced.
     fn stream(
         &mut self,
-        request: ModelRequest,
+        request: &ModelRequest,
         cancellation: Arc<AtomicBool>,
     ) -> Result<Self::Stream, ModelError>;
 }

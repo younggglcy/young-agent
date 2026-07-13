@@ -8,7 +8,7 @@ use young_agent_runtime::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
 };
 use young_model_runtime::ModelToolCallId;
-use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolResult};
+use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolOutput, ToolResult};
 
 /// The observed lifecycle of one tool invocation during replay.
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +91,20 @@ impl RunReplay {
 
 /// Folds an ordered event timeline into its observable run state.
 pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> {
+    replay_events_with_mode(events, false)
+}
+
+/// Folds an inactive run's timeline and marks tool calls without results as
+/// recovery work. Callers must first ensure no live runtime can still append to
+/// the log; use [`replay_events`] for concurrent, read-only observation.
+pub fn replay_events_for_recovery(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> {
+    replay_events_with_mode(events, true)
+}
+
+fn replay_events_with_mode(
+    events: Vec<AgentEvent>,
+    detect_recovery: bool,
+) -> Result<RunReplay, ReplayError> {
     let run_id = match events.first() {
         Some(AgentEvent::RunStarted { run_id, .. }) => run_id.clone(),
         Some(_) => return Err(ReplayError::FirstEventIsNotRunStarted),
@@ -206,6 +220,12 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
                         approval_id: approval_id.clone(),
                     });
                 }
+                if replayed_call.result.is_some() {
+                    return Err(ReplayError::ApprovalResolutionAfterToolResult {
+                        event_number,
+                        approval_id: approval_id.clone(),
+                    });
+                }
 
                 replayed_call.approval_decision = Some(decision.clone());
                 pending_approvals.remove(&replayed_call.call.id);
@@ -224,6 +244,20 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
 
                 if replayed_call.result.is_some() {
                     return Err(ReplayError::DuplicateToolResult {
+                        event_number,
+                        call_id: result.call_id.clone(),
+                    });
+                }
+                let is_canonical_denial_result = matches!(
+                    &result.output,
+                    ToolOutput::Failure { error, .. } if error.code == "approval_denied"
+                );
+                if matches!(
+                    replayed_call.approval_decision,
+                    Some(ApprovalDecision::Deny { .. })
+                ) && !is_canonical_denial_result
+                {
+                    return Err(ReplayError::ToolResultAfterApprovalDenied {
                         event_number,
                         call_id: result.call_id.clone(),
                     });
@@ -249,7 +283,7 @@ pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> 
         }
     }
 
-    if matches!(status, RunStatus::Running) {
+    if detect_recovery && matches!(status, RunStatus::Running) {
         let call_ids = tool_calls
             .iter()
             .filter(|tool_call| tool_call.result.is_none())
@@ -321,6 +355,14 @@ pub enum ReplayError {
     DuplicateApprovalResolution {
         event_number: usize,
         approval_id: String,
+    },
+    ApprovalResolutionAfterToolResult {
+        event_number: usize,
+        approval_id: String,
+    },
+    ToolResultAfterApprovalDenied {
+        event_number: usize,
+        call_id: ToolCallId,
     },
     DuplicateToolResult {
         event_number: usize,
@@ -421,6 +463,21 @@ impl fmt::Display for ReplayError {
             } => write!(
                 formatter,
                 "Event Log event {event_number} repeats resolution for approval '{approval_id}'"
+            ),
+            Self::ApprovalResolutionAfterToolResult {
+                event_number,
+                approval_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} resolves approval '{approval_id}' after its tool call already has a result"
+            ),
+            Self::ToolResultAfterApprovalDenied {
+                event_number,
+                call_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} records a result for denied tool call '{}'",
+                call_id.as_str()
             ),
             Self::DuplicateToolResult {
                 event_number,

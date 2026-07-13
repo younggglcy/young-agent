@@ -49,10 +49,10 @@ impl ModelClient for FakeModelClient {
 
     fn stream(
         &mut self,
-        request: ModelRequest,
+        request: &ModelRequest,
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Self::Stream, ModelError> {
-        self.requests.push(request);
+        self.requests.push(request.clone());
         match self.turns.pop_front() {
             Some(ScriptedModelTurn::Events(events)) => Ok(events.into_iter()),
             Some(ScriptedModelTurn::Error(error)) => Err(error),

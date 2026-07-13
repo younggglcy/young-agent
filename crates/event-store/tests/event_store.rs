@@ -420,6 +420,130 @@ fn replay_rejects_approval_after_the_tool_call_has_a_result() {
 }
 
 #[test]
+fn replay_rejects_approval_resolution_after_a_tool_result() {
+    let events = vec![
+        agent_event(json!({
+            "type": "run_started",
+            "run_id": "run-001"
+        })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": {
+                    "id": "tool-call-001",
+                    "tool_name": "run_command",
+                    "arguments": { "command": "cargo test" }
+                },
+                "reason": "command requires approval"
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": { "status": "success", "content": [] }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_resolved",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "approval_id": "approval-001",
+            "decision": { "decision": "deny", "reason": "not allowed" }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("approval resolution after a tool result should fail");
+
+    assert!(matches!(
+        error,
+        ReplayError::ApprovalResolutionAfterToolResult {
+            event_number: 5,
+            ref approval_id,
+        } if approval_id == "approval-001"
+    ));
+}
+
+#[test]
+fn replay_rejects_a_tool_result_after_approval_was_denied() {
+    let events = vec![
+        agent_event(json!({
+            "type": "run_started",
+            "run_id": "run-001"
+        })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": {
+                    "id": "tool-call-001",
+                    "tool_name": "run_command",
+                    "arguments": { "command": "cargo test" }
+                },
+                "reason": "command requires approval"
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_resolved",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "approval_id": "approval-001",
+            "decision": { "decision": "deny", "reason": "not allowed" }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": { "status": "success", "content": [] }
+            }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("a denied tool call must not have an execution result");
+
+    assert!(matches!(
+        error,
+        ReplayError::ToolResultAfterApprovalDenied {
+            event_number: 5,
+            ref call_id,
+        } if call_id.as_str() == "tool-call-001"
+    ));
+}
+
+#[test]
 fn malformed_record_reports_its_path_line_and_syntax_error() {
     let log = TestLog::new("malformed");
     std::fs::write(
@@ -497,6 +621,78 @@ fn syntactically_complete_record_without_newline_is_still_truncated() {
         ),
         other => panic!("expected truncated record error, got {other:?}"),
     }
+}
+
+#[test]
+fn explicit_tail_repair_discards_only_the_uncommitted_final_record() {
+    let log = TestLog::new("repair-truncated-tail");
+    let committed_events = [
+        agent_event(json!({
+            "type": "run_started",
+            "run_id": "run-001"
+        })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "touch important-file" }
+            }
+        })),
+    ];
+    let committed = committed_events
+        .iter()
+        .map(|event| format!("{}\n", serde_json::to_string(event).expect("event encodes")))
+        .collect::<String>();
+    let recovered_result = agent_event(json!({
+        "type": "tool_result",
+        "run_id": "run-001",
+        "turn_id": "turn-001",
+        "result": {
+            "call_id": "tool-call-001",
+            "output": { "status": "success", "content": [] }
+        }
+    }));
+    let result_record = serde_json::to_string(&recovered_result).expect("result encodes");
+    let partial = &result_record[..result_record.len() / 2];
+    std::fs::write(log.path(), format!("{committed}{partial}")).expect("fixture should write");
+    let store = JsonlEventStore::new(log.path());
+
+    let removed = store
+        .repair_truncated_tail()
+        .expect("exclusive repair should truncate the uncommitted tail");
+
+    assert_eq!(removed, partial.len() as u64);
+    assert_eq!(
+        std::fs::read_to_string(log.path()).expect("repaired log should read"),
+        committed
+    );
+    assert_eq!(
+        store
+            .replay_for_recovery()
+            .expect("inactive repaired log should expose recovery work")
+            .status(),
+        &RunStatus::RecoveryRequired {
+            call_ids: vec![young_tool_runtime::ToolCallId::new("tool-call-001")],
+        }
+    );
+    store
+        .append(&recovered_result)
+        .expect("reconciled result should append without executing the tool again");
+    store
+        .append(&agent_event(json!({
+            "type": "run_finished",
+            "run_id": "run-001",
+            "status": { "status": "completed", "final_message": "done" }
+        })))
+        .expect("append should resume after explicit repair");
+    assert!(matches!(
+        store.replay().expect("repaired log should replay").status(),
+        RunStatus::Finished { .. }
+    ));
 }
 
 #[test]

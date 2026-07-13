@@ -4,7 +4,9 @@ pub mod jsonl;
 pub mod replay;
 
 pub use jsonl::{EventStoreError, JsonlEventStore};
-pub use replay::{replay_events, ReplayError, ReplayedToolCall, RunReplay};
+pub use replay::{
+    replay_events, replay_events_for_recovery, ReplayError, ReplayedToolCall, RunReplay,
+};
 
 #[cfg(test)]
 mod tests {
