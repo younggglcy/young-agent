@@ -4,7 +4,9 @@
 
 ## Workspace
 
-The workspace contains kernel crates, one built-in capability crate, and one proof surface crate. The CLI is a surface that consumes the kernel boundary; it is not part of the Agent Kernel concept.
+The workspace contains kernel crates, one audited platform adapter, one built-in capability crate,
+and one proof surface crate. The CLI is a surface that consumes the kernel boundary; it is not
+part of the Agent Kernel concept.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -12,6 +14,7 @@ The workspace contains kernel crates, one built-in capability crate, and one pro
 | `young-agent-runtime` | Agent Run orchestration boundary. |
 | `young-tool-runtime` | Tool definition, policy, and execution boundary. |
 | `young-event-store` | Canonical Event Log storage boundary. |
+| `young-platform-process` | Audited safe API over the local process pre-exec boundary. |
 | `young-capability-coding` | Built-in Coding Capability boundary. |
 | `young-cli-proof-surface` | Rust CLI Proof Surface scaffold. |
 

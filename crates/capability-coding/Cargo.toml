@@ -12,6 +12,7 @@ command-group.workspace = true
 getrandom.workspace = true
 serde_json.workspace = true
 young-tool-runtime = { path = "../tool-runtime" }
+young-platform-process.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
@@ -22,5 +23,5 @@ cap-fs-ext.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))'.dependencies]
 exacl.workspace = true
 
-[lints.rust]
-unsafe_code = "deny"
+[lints]
+workspace = true

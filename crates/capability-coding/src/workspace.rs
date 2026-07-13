@@ -226,18 +226,8 @@ impl CodingWorkspace {
         self.root_dir.open_dir(path)
     }
 
-    #[cfg(unix)]
-    #[allow(unsafe_code)]
     pub(crate) fn bind_command_working_directory(&self, command: &mut Command) -> io::Result<()> {
         bind_process_working_directory(command, &self.root_dir)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn bind_command_working_directory(&self, _command: &mut Command) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "handle-bound command working directories are not supported on this platform",
-        ))
     }
 
     pub(crate) fn replace_existing_atomically(
@@ -2255,18 +2245,8 @@ fn git_probe_command() -> Command {
     command
 }
 
-#[cfg(unix)]
-#[allow(unsafe_code)]
 fn bind_process_working_directory(command: &mut Command, directory: &Dir) -> io::Result<()> {
-    use std::os::unix::process::CommandExt;
-
-    let directory = directory.try_clone()?;
-    // SAFETY: the closure performs only the async-signal-safe fchdir syscall on an
-    // already-open directory handle. It allocates nothing and touches no shared state.
-    unsafe {
-        command.pre_exec(move || rustix::process::fchdir(&directory).map_err(io::Error::from));
-    }
-    Ok(())
+    young_platform_process::bind_working_directory(command, directory)
 }
 
 fn ensure_opened_root_matches_path(

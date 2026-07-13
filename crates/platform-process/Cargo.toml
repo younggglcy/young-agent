@@ -1,0 +1,17 @@
+[package]
+name = "young-platform-process"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Audited platform process hooks for the Agent Kernel."
+
+[dependencies]
+cap-std.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+# ADR-0009 confines the workspace's necessary pre-exec unsafe boundary to this
+# crate. All other workspace crates continue to inherit `unsafe_code = forbid`.
+[lints.rust]
+unsafe_code = "deny"

@@ -51,8 +51,11 @@ portable primitive，因此 manifest 与 output 只能承诺向仍可 signal 的
 即使 wrapper 与 direct group kill 同时失败，也不能在 leader 仍存活时直接 drop child handle：
 应把 ownership 交给单一的进程级 supervisor registry/event loop，做有界 termination retry，
 之后继续持有并最终 reap；不能为每条失败命令创建一个可能永久存活的 detached thread。
-当前调用则明确报告仍可能存在 live command；即使 supervisor worker 无法启动，registry 也要
-保留 ownership，避免 caller 因同步兜底而无限阻塞。fail-closed 的非 Unix 路径也必须能通过编译，
+supervisor 必须在 child spawn 前通过可重试的启动 preflight，启动失败时不创建命令；handoff
+仍需保留 ownership，避免 caller 因同步兜底而无限阻塞，并让后续 preflight 能恢复 worker。
+测试不能用固定 sleep 猜测这条异步路径已经完成：先用 non-reaping 观察确认 fixture leader
+terminal，再等待对应 registry entry 的 completion barrier，才能证明 supervisor 已 seal 并 reap。
+fail-closed 的非 Unix 路径也必须能通过编译，
 因此 Unix-only snapshot protocol 在其他平台需要可解析的 opaque token，即使调用总是返回
 `Unsupported`。
 cleanup 与 supervisor 也必须用 `waitid(..., WNOWAIT)` 观察 leader 终态；即使一次 group kill

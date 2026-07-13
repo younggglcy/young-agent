@@ -4,6 +4,8 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(all(test, unix))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -41,6 +43,7 @@ thread_local! {
     static INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE: Cell<bool> = const { Cell::new(false) };
     static COMMAND_GROUP_TERMINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
     static LIVE_COMMAND_SUPERVISOR_HANDOFFS: Cell<usize> = const { Cell::new(0) };
+    static LAST_SUPERVISED_COMMAND_ID: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 #[cfg(all(test, unix))]
@@ -146,6 +149,7 @@ fn run_shell_command(
     }
     let mut process = shell_command(command);
     ensure_process_tracking_supported()?;
+    ensure_command_supervisor_available()?;
     workspace
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
@@ -331,20 +335,15 @@ fn ensure_process_tracking_supported() -> Result<(), CommandError> {
     Err(CommandError::UnsupportedProcessTracking)
 }
 
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn configure_command_security(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    // SAFETY: rustix issues the single `prctl(PR_SET_NO_NEW_PRIVS)` syscall and
-    // does not allocate or touch shared process state in the post-fork child.
-    unsafe {
-        command.pre_exec(|| rustix::thread::set_no_new_privs(true).map_err(std::io::Error::from));
-    }
+fn ensure_command_supervisor_available() -> Result<(), CommandError> {
+    command_supervisor()
+        .ensure_worker_started()
+        .map_err(CommandError::SupervisorUnavailable)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn configure_command_security(_command: &mut Command) {}
+fn configure_command_security(command: &mut Command) {
+    young_platform_process::block_exec_privilege_gain(command);
+}
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
     #[cfg(all(test, unix))]
@@ -624,11 +623,17 @@ fn supervise_live_command(
         format!("; nonblocking reap inspection also failed ({source})")
     });
     let supervisor = command_supervisor();
+    #[cfg(all(test, unix))]
+    let command_id = supervisor.enqueue(child);
+    #[cfg(not(all(test, unix)))]
     supervisor.enqueue(child);
-    let supervision = if supervisor.worker_started.load(Ordering::Acquire) {
-        "a live command may remain while the process-wide supervisor retries termination and retains reaping ownership"
-    } else {
-        "the process-wide supervisor worker is unavailable; live-command ownership remains retained in its registry without automatic retries"
+    #[cfg(all(test, unix))]
+    LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(Some(command_id)));
+    let supervision = match supervisor.ensure_worker_started() {
+        Ok(()) => "a live command may remain while the process-wide supervisor retries termination and retains reaping ownership".to_string(),
+        Err(source) => format!(
+            "the process-wide supervisor worker is unavailable ({source}); live-command ownership remains retained and the next command preflight will retry worker startup"
+        ),
     };
     CommandError::TerminationSupervised(format!("{termination_error}{wait_context}; {supervision}"))
 }
@@ -636,10 +641,42 @@ fn supervise_live_command(
 struct CommandSupervisor {
     registry: std::sync::Mutex<Vec<SupervisedCommand>>,
     wake: std::sync::Condvar,
-    worker_started: AtomicBool,
+    worker_state: std::sync::Mutex<SupervisorWorkerState>,
+    #[cfg(all(test, unix))]
+    next_command_id: AtomicU64,
+    #[cfg(all(test, unix))]
+    completed: std::sync::Mutex<std::collections::HashSet<u64>>,
+    #[cfg(all(test, unix))]
+    completion_wake: std::sync::Condvar,
 }
 
 impl CommandSupervisor {
+    fn new() -> Self {
+        Self {
+            registry: std::sync::Mutex::new(Vec::new()),
+            wake: std::sync::Condvar::new(),
+            worker_state: std::sync::Mutex::new(SupervisorWorkerState::Stopped),
+            #[cfg(all(test, unix))]
+            next_command_id: AtomicU64::new(1),
+            #[cfg(all(test, unix))]
+            completed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(all(test, unix))]
+            completion_wake: std::sync::Condvar::new(),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn enqueue(&self, child: GroupChild) -> u64 {
+        let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(SupervisedCommand::new(id, child));
+        self.wake.notify_one();
+        id
+    }
+
+    #[cfg(not(all(test, unix)))]
     fn enqueue(&self, child: GroupChild) {
         self.registry
             .lock()
@@ -647,9 +684,84 @@ impl CommandSupervisor {
             .push(SupervisedCommand::new(child));
         self.wake.notify_one();
     }
+
+    fn ensure_worker_started(self: &std::sync::Arc<Self>) -> std::io::Result<()> {
+        self.ensure_worker_started_with(|worker| {
+            let spawn = thread::Builder::new()
+                .name("young-command-supervisor".to_string())
+                .spawn(move || command_supervisor_worker(worker))
+                .map(|_| ());
+            #[cfg(all(test, unix))]
+            if spawn.is_ok() {
+                COMMAND_SUPERVISOR_WORKER_STARTS.fetch_add(1, Ordering::Relaxed);
+            }
+            spawn
+        })
+    }
+
+    fn ensure_worker_started_with<F>(self: &std::sync::Arc<Self>, start: F) -> std::io::Result<()>
+    where
+        F: FnOnce(std::sync::Arc<Self>) -> std::io::Result<()>,
+    {
+        let mut state = self
+            .worker_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == SupervisorWorkerState::Running {
+            return Ok(());
+        }
+        *state = SupervisorWorkerState::Running;
+        if let Err(source) = start(self.clone()) {
+            *state = SupervisorWorkerState::Stopped;
+            return Err(source);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, unix))]
+    fn wait_for_completion(&self, id: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !completed.contains(&id) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let waited = self.completion_wake.wait_timeout(completed, remaining);
+            let (guard, result) = match waited {
+                Ok(value) => value,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            completed = guard;
+            if result.timed_out() && !completed.contains(&id) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(all(test, unix))]
+    fn mark_completed(&self, id: u64) {
+        self.completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+        self.completion_wake.notify_all();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupervisorWorkerState {
+    Stopped,
+    Running,
 }
 
 struct SupervisedCommand {
+    #[cfg(all(test, unix))]
+    id: u64,
     child: GroupChild,
     termination_attempts_remaining: u8,
     retry_delay: Duration,
@@ -657,6 +769,18 @@ struct SupervisedCommand {
 }
 
 impl SupervisedCommand {
+    #[cfg(all(test, unix))]
+    fn new(id: u64, child: GroupChild) -> Self {
+        Self {
+            id,
+            child,
+            termination_attempts_remaining: 8,
+            retry_delay: Duration::from_millis(10),
+            next_action: Instant::now(),
+        }
+    }
+
+    #[cfg(not(all(test, unix)))]
     fn new(child: GroupChild) -> Self {
         Self {
             child,
@@ -670,24 +794,32 @@ impl SupervisedCommand {
 fn command_supervisor() -> &'static std::sync::Arc<CommandSupervisor> {
     static SUPERVISOR: std::sync::OnceLock<std::sync::Arc<CommandSupervisor>> =
         std::sync::OnceLock::new();
-    SUPERVISOR.get_or_init(|| {
-        let supervisor = std::sync::Arc::new(CommandSupervisor {
-            registry: std::sync::Mutex::new(Vec::new()),
-            wake: std::sync::Condvar::new(),
-            worker_started: AtomicBool::new(false),
-        });
-        let worker = supervisor.clone();
-        let started = thread::Builder::new()
-            .name("young-command-supervisor".to_string())
-            .spawn(move || command_supervisor_loop(worker))
-            .is_ok();
-        supervisor.worker_started.store(started, Ordering::Release);
-        #[cfg(all(test, unix))]
-        if started {
-            COMMAND_SUPERVISOR_WORKER_STARTS.fetch_add(1, Ordering::Relaxed);
+    SUPERVISOR.get_or_init(|| std::sync::Arc::new(CommandSupervisor::new()))
+}
+
+struct SupervisorWorkerGuard(std::sync::Arc<CommandSupervisor>);
+
+impl Drop for SupervisorWorkerGuard {
+    fn drop(&mut self) {
+        *self
+            .0
+            .worker_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SupervisorWorkerState::Stopped;
+    }
+}
+
+fn command_supervisor_worker(supervisor: std::sync::Arc<CommandSupervisor>) {
+    let _guard = SupervisorWorkerGuard(supervisor.clone());
+    loop {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            command_supervisor_loop(supervisor.clone());
+        }));
+        if result.is_ok() {
+            return;
         }
-        supervisor
-    })
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn command_supervisor_loop(supervisor: std::sync::Arc<CommandSupervisor>) {
@@ -702,17 +834,25 @@ fn command_supervisor_loop(supervisor: std::sync::Arc<CommandSupervisor>) {
                 .wait(registry)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        let mut commands = std::mem::take(&mut *registry);
+        let commands = std::mem::take(&mut *registry);
         drop(registry);
 
         let now = Instant::now();
-        commands.retain_mut(|command| supervise_command_once(command, now));
+        let mut pending = Vec::with_capacity(commands.len());
+        for mut command in commands {
+            if supervise_command_once(&mut command, now) {
+                pending.push(command);
+            } else {
+                #[cfg(all(test, unix))]
+                supervisor.mark_completed(command.id);
+            }
+        }
 
         let mut registry = supervisor
             .registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.extend(commands);
+        registry.extend(pending);
         if registry.is_empty() {
             continue;
         }
@@ -927,6 +1067,7 @@ impl CapturedStream {
 #[derive(Debug)]
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
+    SupervisorUnavailable(std::io::Error),
     WorkspaceChanged(std::io::Error),
     ConfigureOutput(std::io::Error),
     Kill(std::io::Error),
@@ -944,6 +1085,7 @@ impl CommandError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
+            Self::SupervisorUnavailable(_) => "command_supervisor_unavailable",
             Self::WorkspaceChanged(_) => "workspace_changed",
             Self::ConfigureOutput(_) | Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) => {
                 "command_io_error"
@@ -959,14 +1101,15 @@ impl CommandError {
     }
 
     pub(crate) fn retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::ConfigureOutput(source)
-            | Self::Kill(source)
-            | Self::Wait(source)
-            | Self::ReadOutput(source)
-                if source.kind() == std::io::ErrorKind::Interrupted
-        )
+        matches!(self, Self::SupervisorUnavailable(_))
+            || matches!(
+                self,
+                Self::ConfigureOutput(source)
+                | Self::Kill(source)
+                | Self::Wait(source)
+                | Self::ReadOutput(source)
+                    if source.kind() == std::io::ErrorKind::Interrupted
+            )
     }
 }
 
@@ -974,6 +1117,10 @@ impl fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(source) => write!(formatter, "failed to start command: {source}"),
+            Self::SupervisorUnavailable(source) => write!(
+                formatter,
+                "command supervisor is unavailable; no command was started: {source}"
+            ),
             Self::WorkspaceChanged(source) => {
                 write!(
                     formatter,
@@ -1017,14 +1164,80 @@ mod tests {
     use command_group::CommandGroup as _;
 
     use super::{
-        cleanup_process_group, run_shell_command, shell_command, supervise_live_command,
-        CommandError, COMMAND_GROUP_TERMINATION_ATTEMPTS, COMMAND_SUPERVISOR_WORKER_STARTS,
-        INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
-        INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
-        INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LIVE_COMMAND_SUPERVISOR_HANDOFFS,
-        TERMINAL_GROUP_SEAL_ROUNDS,
+        cleanup_process_group, command_leader_terminal, command_supervisor, run_shell_command,
+        shell_command, supervise_live_command, CommandError, CommandSupervisor,
+        SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
+        COMMAND_SUPERVISOR_WORKER_STARTS, INJECT_GROUP_KILL_WRAPPER_FAILURE,
+        INJECT_NEXT_FULL_GROUP_KILL_FAILURE, INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
+        INJECT_PERSISTENT_GROUP_KILL_FAILURE, INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS,
+        LAST_SUPERVISED_COMMAND_ID, LIVE_COMMAND_SUPERVISOR_HANDOFFS, TERMINAL_GROUP_SEAL_ROUNDS,
     };
     use crate::workspace::CodingWorkspace;
+
+    fn take_last_supervised_command_id() -> u64 {
+        LAST_SUPERVISED_COMMAND_ID.with(|id| {
+            id.replace(None)
+                .expect("the command was handed to the supervisor")
+        })
+    }
+
+    fn wait_for_supervisor_completion(id: u64) {
+        assert!(
+            command_supervisor().wait_for_completion(id, Duration::from_secs(2)),
+            "supervisor did not seal and reap command {id}"
+        );
+    }
+
+    fn wait_for_terminal_leader(child: &command_group::GroupChild) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match command_leader_terminal(child) {
+                Ok(true) => return,
+                Ok(false) if Instant::now() < deadline => thread::yield_now(),
+                Ok(false) => panic!("command leader did not become terminal"),
+                Err(source) => panic!("failed to inspect command leader: {source}"),
+            }
+        }
+    }
+
+    #[test]
+    fn supervisor_worker_start_failure_can_be_retried() {
+        let supervisor = Arc::new(CommandSupervisor::new());
+        let first = supervisor.ensure_worker_started_with(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "injected worker start failure",
+            ))
+        });
+
+        assert_eq!(
+            first.expect_err("first start fails").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            *supervisor
+                .worker_state
+                .lock()
+                .expect("worker state lock remains available"),
+            SupervisorWorkerState::Stopped
+        );
+
+        let started = AtomicBool::new(false);
+        supervisor
+            .ensure_worker_started_with(|_| {
+                started.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+            .expect("a later preflight retries worker startup");
+        assert!(started.load(Ordering::Relaxed));
+        assert_eq!(
+            *supervisor
+                .worker_state
+                .lock()
+                .expect("worker state lock remains available"),
+            SupervisorWorkerState::Running
+        );
+    }
 
     #[test]
     fn process_control_failure_still_runs_the_cleanup_epilogue() {
@@ -1093,6 +1306,7 @@ mod tests {
         });
         INJECT_PERSISTENT_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
         LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.set(0));
+        LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
 
         let result = run_shell_command(
             &workspace,
@@ -1110,7 +1324,7 @@ mod tests {
             LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.get()),
             1
         );
-        thread::sleep(Duration::from_millis(250));
+        wait_for_supervisor_completion(take_last_supervised_command_id());
         assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
@@ -1137,6 +1351,7 @@ mod tests {
         });
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS.with(|failure| failure.set(true));
         LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.set(0));
+        LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
 
         let result = run_shell_command(
             &workspace,
@@ -1154,7 +1369,7 @@ mod tests {
             LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.get()),
             1
         );
-        thread::sleep(Duration::from_millis(700));
+        wait_for_supervisor_completion(take_last_supervised_command_id());
         assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
@@ -1215,13 +1430,14 @@ mod tests {
             .stderr(Stdio::null())
             .group_spawn()
             .expect("test command group starts");
-        thread::sleep(Duration::from_millis(30));
+        wait_for_terminal_leader(&child);
+        LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
 
         let result = supervise_live_command(child, CommandError::TerminationUnverified, None);
 
         assert!(matches!(result, CommandError::TerminationSupervised(_)));
         assert_eq!(COMMAND_SUPERVISOR_WORKER_STARTS.load(Ordering::Relaxed), 1);
-        thread::sleep(Duration::from_millis(200));
+        wait_for_supervisor_completion(take_last_supervised_command_id());
         assert!(!root.join("delayed.txt").exists());
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
