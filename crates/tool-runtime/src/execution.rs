@@ -28,6 +28,27 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Orchestration state showing whether the Agent Runtime granted approval for
+/// one exact Tool Call. This is an in-process correctness guard, not a
+/// cryptographic capability or sandbox boundary.
+///
+/// `NotRequired` is the safe default: a policy-aware Tool Runtime must still
+/// reject a call whose static or call-dependent policy requires approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolExecutionAuthorization {
+    NotRequired,
+    ApprovalGranted { call_id: ToolCallId },
+}
+
+impl ToolExecutionAuthorization {
+    pub(crate) fn is_granted_for(&self, call: &ToolCall) -> bool {
+        matches!(
+            self,
+            Self::ApprovalGranted { call_id } if call_id == &call.id
+        )
+    }
+}
+
 /// Execution boundary consumed by the Agent Runtime. Tool lookup, policy, and
 /// concrete implementations remain owned by the Tool Runtime.
 ///
@@ -45,6 +66,19 @@ pub trait ToolExecutor {
     /// Returns only the tool-owned output. The Agent Runtime attaches the
     /// kernel-owned `ToolCall.id`, so executors cannot forge result correlation.
     fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput;
+
+    /// Executes after the Agent Runtime has resolved any approval request.
+    /// Leaf executors normally inherit this implementation; policy-aware
+    /// dispatchers override it to validate the authorization before invoking
+    /// a registered executor.
+    fn execute_authorized(
+        &mut self,
+        call: &ToolCall,
+        _authorization: ToolExecutionAuthorization,
+        cancellation: Arc<AtomicBool>,
+    ) -> ToolOutput {
+        self.execute(call, cancellation)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

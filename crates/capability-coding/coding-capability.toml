@@ -67,8 +67,7 @@ protocol_version = "reserved"
 [[tools]]
 name = "run_command"
 description = "Run a command inside the workspace boundary."
-safety_class = "requires_approval"
-safety_reason = "commands may mutate the workspace or start processes"
+safety_class = "call_dependent"
 
 [tools.input_schema]
 type = "object"

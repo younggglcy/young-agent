@@ -9,7 +9,10 @@ use young_model_runtime::{
     ModelClient, ModelError, ModelMessage, ModelMessageContent, ModelRequest, ModelStreamEvent,
     ModelToolCall, ModelToolSpec,
 };
-use young_tool_runtime::{ToolCall, ToolCallId, ToolContent, ToolExecutor, ToolOutput, ToolResult};
+use young_tool_runtime::{
+    ToolCall, ToolCallId, ToolContent, ToolExecutionAuthorization, ToolExecutor, ToolOutput,
+    ToolResult,
+};
 
 use crate::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, EventSequence, RunId,
@@ -600,9 +603,13 @@ where
                             .finish(run_id, status, stop)
                             .map(ToolCallProgress::Finished);
                     }
-                    normalize_tool_output(
-                        self.tool_executor.execute(&call, stop.cancellation_flag()),
-                    )
+                    normalize_tool_output(self.tool_executor.execute_authorized(
+                        &call,
+                        ToolExecutionAuthorization::ApprovalGranted {
+                            call_id: call.id.clone(),
+                        },
+                        stop.cancellation_flag(),
+                    ))
                 }
                 ApprovalDecision::Deny { reason } => ToolOutput::Failure {
                     error: young_tool_runtime::ToolError {

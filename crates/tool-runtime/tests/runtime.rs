@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::json;
 use young_tool_runtime::{
     CapabilityRef, FakeToolExecutor, ToolApprovalPolicy, ToolCall, ToolCallId, ToolContent,
-    ToolDefinition, ToolExecutor, ToolOutput, ToolRuntime,
+    ToolDefinition, ToolExecutionAuthorization, ToolExecutor, ToolOutput, ToolRuntime,
 };
 
 fn read_file_definition() -> ToolDefinition {
@@ -51,7 +51,11 @@ fn registered_tool_can_be_looked_up_and_dispatched() {
         tool_name: "read_file".to_string(),
         arguments: json!({ "path": "README.md" }),
     };
-    let result = runtime.dispatch(&call, Arc::new(AtomicBool::new(false)));
+    let result = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
 
     assert_eq!(result.call_id, call.id);
     assert_eq!(result.output, output);
@@ -66,7 +70,11 @@ fn unknown_tool_returns_a_correlated_clear_failure() {
         arguments: json!({}),
     };
 
-    let result = runtime.dispatch(&call, Arc::new(AtomicBool::new(false)));
+    let result = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
 
     assert_eq!(result.call_id, call.id);
     let ToolOutput::Failure { error, extensions } = result.output else {
@@ -135,11 +143,13 @@ fn manifest_policy_drives_the_agent_runtime_approval_seam() {
 }
 
 #[test]
-fn registered_executor_can_escalate_an_always_allow_manifest_policy() {
+fn call_dependent_policy_delegates_to_the_registered_executor() {
+    let mut definition = read_file_definition();
+    definition.approval_policy = ToolApprovalPolicy::CallDependent;
     let mut runtime = ToolRuntime::default();
     runtime
         .register(
-            read_file_definition(),
+            definition,
             FakeToolExecutor::requiring_approval(
                 "the concrete call crosses a dynamic safety boundary",
                 [],
@@ -156,4 +166,93 @@ fn registered_executor_can_escalate_an_always_allow_manifest_policy() {
         runtime.approval_reason(&call).as_deref(),
         Some("the concrete call crosses a dynamic safety boundary")
     );
+}
+
+#[test]
+fn dispatch_cannot_bypass_a_required_approval() {
+    let mut definition = read_file_definition();
+    definition.approval_policy = ToolApprovalPolicy::RequiresApproval {
+        reason: "reading this path requires approval".to_string(),
+    };
+    let expected = ToolOutput::Success {
+        content: vec![ToolContent::Text {
+            text: "secret".to_string(),
+        }],
+        metadata: BTreeMap::new(),
+        extensions: BTreeMap::new(),
+    };
+    let mut runtime = ToolRuntime::default();
+    runtime
+        .register(definition, FakeToolExecutor::new([expected.clone()]))
+        .expect("tool registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-protected"),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "secrets.txt" }),
+    };
+
+    let denied = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Failure { error, .. } = denied.output else {
+        panic!("dispatch without approval must fail");
+    };
+    assert_eq!(error.code, "approval_required");
+    assert_eq!(error.message, "reading this path requires approval");
+
+    let mismatched = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: ToolCallId::new("another-call"),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Failure { error, .. } = mismatched.output else {
+        panic!("approval for another call must not authorize this dispatch");
+    };
+    assert_eq!(error.code, "approval_required");
+
+    let approved = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(approved.output, expected);
+}
+
+#[test]
+fn registered_tool_failure_is_propagated_without_losing_details() {
+    let expected = ToolOutput::Failure {
+        error: young_tool_runtime::ToolError {
+            code: "outside_workspace".to_string(),
+            message: "path escapes the workspace boundary".to_string(),
+            retryable: false,
+        },
+        extensions: BTreeMap::from([("audit_id".to_string(), json!("audit-001"))]),
+    };
+    let mut runtime = ToolRuntime::default();
+    runtime
+        .register(
+            read_file_definition(),
+            FakeToolExecutor::new([expected.clone()]),
+        )
+        .expect("tool registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-failure"),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "../outside" }),
+    };
+
+    let result = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert_eq!(result.call_id, call.id);
+    assert_eq!(result.output, expected);
 }

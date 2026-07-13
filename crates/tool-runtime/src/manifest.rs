@@ -136,7 +136,9 @@ impl CapabilityManifest {
                 let safety_class = match tool.safety_class {
                     ToolSafetyClass::RequiresApproval => "requires_approval",
                     ToolSafetyClass::AlwaysReject => "always_reject",
-                    ToolSafetyClass::AlwaysAllow => unreachable!("allowing tools need no reason"),
+                    ToolSafetyClass::AlwaysAllow | ToolSafetyClass::CallDependent => {
+                        unreachable!("these safety classes need no static reason")
+                    }
                 };
                 return Err(CapabilityManifestError::Invalid {
                     message: format!(
@@ -193,6 +195,7 @@ impl ManifestTool {
                     .clone()
                     .unwrap_or_else(|| format!("tool '{}' requires approval", self.name)),
             },
+            ToolSafetyClass::CallDependent => ToolApprovalPolicy::CallDependent,
             ToolSafetyClass::AlwaysReject => ToolApprovalPolicy::AlwaysReject {
                 reason: self.safety_reason.clone().unwrap_or_else(|| {
                     format!("tool '{}' is rejected by its safety policy", self.name)
@@ -207,6 +210,7 @@ impl ManifestTool {
 pub enum ToolSafetyClass {
     AlwaysAllow,
     RequiresApproval,
+    CallDependent,
     AlwaysReject,
 }
 

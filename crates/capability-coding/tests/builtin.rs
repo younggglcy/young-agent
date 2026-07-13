@@ -4,7 +4,8 @@ use std::sync::Arc;
 use serde_json::json;
 use young_capability_coding::{coding_manifest, register_builtin_coding_capability};
 use young_tool_runtime::{
-    ToolApprovalPolicy, ToolCall, ToolCallId, ToolOutput, ToolRuntime, ToolSafetyClass,
+    ToolApprovalPolicy, ToolCall, ToolCallId, ToolExecutionAuthorization, ToolOutput, ToolRuntime,
+    ToolSafetyClass,
 };
 
 #[test]
@@ -28,6 +29,10 @@ fn coding_capability_loads_its_embedded_builtin_manifest() {
         manifest.tools[2].safety_class,
         ToolSafetyClass::RequiresApproval
     );
+    assert_eq!(
+        manifest.tools[3].safety_class,
+        ToolSafetyClass::CallDependent
+    );
 
     let definitions = manifest.tool_definitions();
     assert_eq!(
@@ -40,9 +45,7 @@ fn coding_capability_loads_its_embedded_builtin_manifest() {
     );
     assert_eq!(
         definitions[3].approval_policy,
-        ToolApprovalPolicy::RequiresApproval {
-            reason: "commands may mutate the workspace or start processes".to_string(),
-        }
+        ToolApprovalPolicy::CallDependent
     );
 }
 
@@ -62,7 +65,11 @@ fn coding_capability_registers_initial_tools_with_explicit_stubs() {
         tool_name: "read_file".to_string(),
         arguments: json!({ "path": "README.md" }),
     };
-    let result = runtime.dispatch(&call, Arc::new(AtomicBool::new(false)));
+    let result = runtime.dispatch(
+        &call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
 
     assert_eq!(result.call_id, call.id);
     let ToolOutput::Failure { error, .. } = result.output else {

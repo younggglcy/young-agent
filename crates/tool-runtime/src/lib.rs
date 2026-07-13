@@ -6,7 +6,8 @@ pub mod manifest;
 pub mod registry;
 
 pub use execution::{
-    ToolCall, ToolCallId, ToolContent, ToolError, ToolExecutor, ToolOutput, ToolResult,
+    ToolCall, ToolCallId, ToolContent, ToolError, ToolExecutionAuthorization, ToolExecutor,
+    ToolOutput, ToolResult,
 };
 pub use fake::FakeToolExecutor;
 pub use manifest::{
@@ -316,14 +317,26 @@ mod tests {
             },
             mcp: None,
         };
+        let call_dependent = ToolDefinition {
+            name: "run_command_dynamic".to_string(),
+            description: "Classify each command before execution.".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            capability: CapabilityRef {
+                id: "coding".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            approval_policy: ToolApprovalPolicy::CallDependent,
+            mcp: None,
+        };
 
-        let encoded = serde_json::to_value((&requires_approval, &always_reject))
+        let encoded = serde_json::to_value((&requires_approval, &always_reject, &call_dependent))
             .expect("definitions serialize");
         assert!(encoded[0].get("output_schema").is_none());
         assert!(encoded[0].get("mcp").is_none());
 
-        let decoded: (ToolDefinition, ToolDefinition) =
+        let decoded: (ToolDefinition, ToolDefinition, ToolDefinition) =
             serde_json::from_value(encoded).expect("definitions deserialize");
-        assert_eq!(decoded, (requires_approval, always_reject));
+        assert_eq!(decoded, (requires_approval, always_reject, call_dependent));
     }
 }

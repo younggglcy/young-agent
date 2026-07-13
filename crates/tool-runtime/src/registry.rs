@@ -7,7 +7,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::execution::{ToolCall, ToolError, ToolExecutor, ToolOutput, ToolResult};
+use crate::execution::{
+    ToolCall, ToolError, ToolExecutionAuthorization, ToolExecutor, ToolOutput, ToolResult,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,8 +42,15 @@ pub struct CapabilityRef {
 #[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolApprovalPolicy {
     AlwaysAllow,
-    RequiresApproval { reason: String },
-    AlwaysReject { reason: String },
+    RequiresApproval {
+        reason: String,
+    },
+    /// The concrete executor classifies each call through
+    /// [`ToolExecutor::approval_reason`].
+    CallDependent,
+    AlwaysReject {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,10 +115,15 @@ impl ToolRuntime {
         self.tools.is_empty()
     }
 
-    /// Dispatches a call after the caller has honored [`Self::approval_reason`].
-    /// Approval prompting stays in the Agent Runtime; this method owns lookup,
-    /// static rejection, implementation dispatch, and result correlation.
-    pub fn dispatch(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolResult {
+    /// Dispatches a call while enforcing its static or call-dependent approval
+    /// policy. Approval prompting stays in the Agent Runtime; this method
+    /// validates the correlated authorization before invoking an executor.
+    pub fn dispatch(
+        &mut self,
+        call: &ToolCall,
+        authorization: ToolExecutionAuthorization,
+        cancellation: Arc<AtomicBool>,
+    ) -> ToolResult {
         let output = match self.tools.get_mut(&call.tool_name) {
             Some(tool) => match &tool.definition.approval_policy {
                 ToolApprovalPolicy::AlwaysReject { reason } => ToolOutput::Failure {
@@ -119,6 +133,17 @@ impl ToolRuntime {
                         retryable: false,
                     },
                     extensions: BTreeMap::new(),
+                },
+                ToolApprovalPolicy::RequiresApproval { reason }
+                    if !authorization.is_granted_for(call) =>
+                {
+                    approval_required(reason.clone())
+                }
+                ToolApprovalPolicy::CallDependent => match tool.executor.approval_reason(call) {
+                    Some(reason) if !authorization.is_granted_for(call) => {
+                        approval_required(reason)
+                    }
+                    _ => tool.executor.execute(call, cancellation),
                 },
                 ToolApprovalPolicy::AlwaysAllow | ToolApprovalPolicy::RequiresApproval { .. } => {
                     tool.executor.execute(call, cancellation)
@@ -146,13 +171,35 @@ impl ToolExecutor for ToolRuntime {
         let tool = self.tools.get(&call.tool_name)?;
         match &tool.definition.approval_policy {
             ToolApprovalPolicy::RequiresApproval { reason } => Some(reason.clone()),
-            ToolApprovalPolicy::AlwaysAllow => tool.executor.approval_reason(call),
+            ToolApprovalPolicy::CallDependent => tool.executor.approval_reason(call),
+            ToolApprovalPolicy::AlwaysAllow => None,
             ToolApprovalPolicy::AlwaysReject { .. } => None,
         }
     }
 
     fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {
-        self.dispatch(call, cancellation).output
+        self.dispatch(call, ToolExecutionAuthorization::NotRequired, cancellation)
+            .output
+    }
+
+    fn execute_authorized(
+        &mut self,
+        call: &ToolCall,
+        authorization: ToolExecutionAuthorization,
+        cancellation: Arc<AtomicBool>,
+    ) -> ToolOutput {
+        self.dispatch(call, authorization, cancellation).output
+    }
+}
+
+fn approval_required(reason: String) -> ToolOutput {
+    ToolOutput::Failure {
+        error: ToolError {
+            code: "approval_required".to_string(),
+            message: reason,
+            retryable: false,
+        },
+        extensions: BTreeMap::new(),
     }
 }
 
