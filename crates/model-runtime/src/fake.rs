@@ -24,19 +24,27 @@ impl ScriptedModelTurn {
 #[derive(Clone, Debug, Default)]
 pub struct FakeModelClient {
     turns: VecDeque<ScriptedModelTurn>,
-    requests: Vec<ModelRequest>,
+    request_count: usize,
+    last_request: Option<ModelRequest>,
 }
 
 impl FakeModelClient {
     pub fn new(turns: impl IntoIterator<Item = ScriptedModelTurn>) -> Self {
         Self {
             turns: turns.into_iter().collect(),
-            requests: Vec::new(),
+            request_count: 0,
+            last_request: None,
         }
     }
 
-    pub fn requests(&self) -> &[ModelRequest] {
-        &self.requests
+    pub fn request_count(&self) -> usize {
+        self.request_count
+    }
+
+    /// Returns only the latest request snapshot so scripted runs use memory
+    /// proportional to current history rather than all cumulative histories.
+    pub fn last_request(&self) -> Option<&ModelRequest> {
+        self.last_request.as_ref()
     }
 
     pub fn remaining_turns(&self) -> usize {
@@ -52,7 +60,8 @@ impl ModelClient for FakeModelClient {
         request: &ModelRequest,
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Self::Stream, ModelError> {
-        self.requests.push(request.clone());
+        self.request_count += 1;
+        self.last_request = Some(request.clone());
         match self.turns.pop_front() {
             Some(ScriptedModelTurn::Events(events)) => Ok(events.into_iter()),
             Some(ScriptedModelTurn::Error(error)) => Err(error),

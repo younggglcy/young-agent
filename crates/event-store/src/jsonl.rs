@@ -9,13 +9,21 @@ use std::sync::{Arc, Mutex};
 
 use young_agent_runtime::{AgentEvent, AgentEventSink};
 
-use crate::replay::{replay_events, replay_events_for_recovery, ReplayError, RunReplay};
+use crate::replay::{
+    replay_events, replay_events_for_recovery, replay_events_with_compatibility,
+    ReplayCompatibility, ReplayError, RunReplay,
+};
 
 /// A path-backed, append-only store with one canonical Agent Event per line.
 #[derive(Clone)]
 pub struct JsonlEventStore {
     path: PathBuf,
-    append_file: Arc<Mutex<Option<File>>>,
+    append_file: Arc<Mutex<Option<AppendFile>>>,
+}
+
+struct AppendFile {
+    file: File,
+    parent_directory_needs_sync: bool,
 }
 
 impl fmt::Debug for JsonlEventStore {
@@ -49,6 +57,20 @@ impl JsonlEventStore {
 
     /// Appends one complete JSON record and flushes it to the operating system.
     pub fn append(&self, event: &AgentEvent) -> Result<(), EventStoreError> {
+        self.append_with_durability(event, false)
+    }
+
+    /// Appends one complete JSON record and synchronizes its bytes and newline
+    /// commit marker to stable storage before returning.
+    pub fn append_durable(&self, event: &AgentEvent) -> Result<(), EventStoreError> {
+        self.append_with_durability(event, true)
+    }
+
+    fn append_with_durability(
+        &self,
+        event: &AgentEvent,
+        durable: bool,
+    ) -> Result<(), EventStoreError> {
         let mut record = serde_json::to_vec(event).map_err(|source| EventStoreError::Encode {
             path: self.path.clone(),
             source,
@@ -63,8 +85,19 @@ impl JsonlEventStore {
             *append_file = Some(self.open_append_file()?);
         }
 
-        let file = append_file.as_mut().expect("append file is initialized");
-        let result = file.write_all(&record).and_then(|()| file.flush());
+        let state = append_file.as_mut().expect("append file is initialized");
+        let result = (|| {
+            state.file.write_all(&record)?;
+            state.file.flush()?;
+            if durable {
+                state.file.sync_data()?;
+                if state.parent_directory_needs_sync {
+                    self.sync_parent_directory()?;
+                    state.parent_directory_needs_sync = false;
+                }
+            }
+            Ok(())
+        })();
         if let Err(source) = result {
             // Force the next append to re-open and validate the commit marker;
             // a failed write may have left an uncommitted partial record.
@@ -77,7 +110,16 @@ impl JsonlEventStore {
         Ok(())
     }
 
-    fn open_append_file(&self) -> Result<File, EventStoreError> {
+    fn sync_parent_directory(&self) -> io::Result<()> {
+        let parent = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)?.sync_all()
+    }
+
+    fn open_append_file(&self) -> Result<AppendFile, EventStoreError> {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -109,7 +151,10 @@ impl JsonlEventStore {
             }
         }
 
-        Ok(file)
+        Ok(AppendFile {
+            file,
+            parent_directory_needs_sync: true,
+        })
     }
 
     /// Removes only the final record when it lacks the newline commit marker.
@@ -242,6 +287,21 @@ impl JsonlEventStore {
         })
     }
 
+    /// Replays a log with an explicit compatibility policy. Prefer strict
+    /// [`Self::replay`]; legacy mode is only for pre-`ApprovalResolved` logs.
+    pub fn replay_with_compatibility(
+        &self,
+        compatibility: ReplayCompatibility,
+    ) -> Result<RunReplay, EventStoreError> {
+        let events = self.read_all()?;
+        replay_events_with_compatibility(events, compatibility).map_err(|source| {
+            EventStoreError::Replay {
+                path: self.path.clone(),
+                source,
+            }
+        })
+    }
+
     /// Replays an inactive log and exposes tool calls whose results require
     /// reconciliation. The caller must ensure no live runtime can append.
     pub fn replay_for_recovery(&self) -> Result<RunReplay, EventStoreError> {
@@ -258,6 +318,10 @@ impl AgentEventSink for JsonlEventStore {
 
     fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
         JsonlEventStore::append(self, event)
+    }
+
+    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        JsonlEventStore::append_durable(self, event)
     }
 }
 

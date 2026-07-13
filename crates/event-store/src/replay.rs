@@ -10,35 +10,63 @@ use young_agent_runtime::{
 use young_model_runtime::ModelToolCallId;
 use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolOutput, ToolResult};
 
-/// The observed lifecycle of one tool invocation during replay.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReplayedToolCall {
-    model_tool_call_id: ModelToolCallId,
-    call: ToolCall,
-    approval: Option<ApprovalRequest>,
-    approval_decision: Option<ApprovalDecision>,
-    result: Option<ToolResult>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplayedToolCallIndex {
+    requested_event: usize,
+    approval_event: Option<usize>,
+    approval_resolution_event: Option<usize>,
+    result_event: Option<usize>,
 }
 
-impl ReplayedToolCall {
+/// Borrowed view of one tool invocation derived from canonical event indexes.
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayedToolCall<'a> {
+    events: &'a [AgentEvent],
+    index: &'a ReplayedToolCallIndex,
+}
+
+impl<'a> ReplayedToolCall<'a> {
     pub fn model_tool_call_id(&self) -> &ModelToolCallId {
-        &self.model_tool_call_id
+        match &self.events[self.index.requested_event] {
+            AgentEvent::ToolCallRequested {
+                model_tool_call_id, ..
+            } => model_tool_call_id,
+            _ => unreachable!("requested_event indexes ToolCallRequested"),
+        }
     }
 
     pub fn call(&self) -> &ToolCall {
-        &self.call
+        match &self.events[self.index.requested_event] {
+            AgentEvent::ToolCallRequested { call, .. } => call,
+            _ => unreachable!("requested_event indexes ToolCallRequested"),
+        }
     }
 
     pub fn approval(&self) -> Option<&ApprovalRequest> {
-        self.approval.as_ref()
+        self.index
+            .approval_event
+            .map(|event_index| match &self.events[event_index] {
+                AgentEvent::ApprovalRequested { request, .. } => request,
+                _ => unreachable!("approval_event indexes ApprovalRequested"),
+            })
     }
 
     pub fn approval_decision(&self) -> Option<&ApprovalDecision> {
-        self.approval_decision.as_ref()
+        self.index
+            .approval_resolution_event
+            .map(|event_index| match &self.events[event_index] {
+                AgentEvent::ApprovalResolved { decision, .. } => decision,
+                _ => unreachable!("approval_resolution_event indexes ApprovalResolved"),
+            })
     }
 
     pub fn result(&self) -> Option<&ToolResult> {
-        self.result.as_ref()
+        self.index
+            .result_event
+            .map(|event_index| match &self.events[event_index] {
+                AgentEvent::ToolResult { result, .. } => result,
+                _ => unreachable!("result_event indexes ToolResult"),
+            })
     }
 }
 
@@ -48,9 +76,9 @@ pub struct RunReplay {
     run_id: RunId,
     status: RunStatus,
     events: Vec<AgentEvent>,
-    tool_calls: Vec<ReplayedToolCall>,
-    approvals: Vec<ApprovalRequest>,
-    errors: Vec<AgentError>,
+    tool_calls: Vec<ReplayedToolCallIndex>,
+    approvals: Vec<usize>,
+    errors: Vec<usize>,
 }
 
 impl RunReplay {
@@ -66,16 +94,29 @@ impl RunReplay {
         &self.events
     }
 
-    pub fn tool_calls(&self) -> &[ReplayedToolCall] {
-        &self.tool_calls
+    pub fn tool_calls(&self) -> impl ExactSizeIterator<Item = ReplayedToolCall<'_>> + '_ {
+        self.tool_calls.iter().map(|index| ReplayedToolCall {
+            events: &self.events,
+            index,
+        })
     }
 
-    pub fn approvals(&self) -> &[ApprovalRequest] {
-        &self.approvals
+    pub fn approvals(&self) -> impl ExactSizeIterator<Item = &ApprovalRequest> + '_ {
+        self.approvals
+            .iter()
+            .map(|event_index| match &self.events[*event_index] {
+                AgentEvent::ApprovalRequested { request, .. } => request,
+                _ => unreachable!("approval index references ApprovalRequested"),
+            })
     }
 
-    pub fn errors(&self) -> &[AgentError] {
-        &self.errors
+    pub fn errors(&self) -> impl ExactSizeIterator<Item = &AgentError> + '_ {
+        self.errors
+            .iter()
+            .map(|event_index| match &self.events[*event_index] {
+                AgentEvent::Error { error, .. } => error,
+                _ => unreachable!("error index references Error"),
+            })
     }
 
     /// Returns the single terminal truth carried by `RunFinished`, if present.
@@ -91,19 +132,36 @@ impl RunReplay {
 
 /// Folds an ordered event timeline into its observable run state.
 pub fn replay_events(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> {
-    replay_events_with_mode(events, false)
+    replay_events_with_mode(events, false, ReplayCompatibility::Strict)
 }
 
 /// Folds an inactive run's timeline and marks tool calls without results as
 /// recovery work. Callers must first ensure no live runtime can still append to
 /// the log; use [`replay_events`] for concurrent, read-only observation.
 pub fn replay_events_for_recovery(events: Vec<AgentEvent>) -> Result<RunReplay, ReplayError> {
-    replay_events_with_mode(events, true)
+    replay_events_with_mode(events, true, ReplayCompatibility::Strict)
+}
+
+/// Replays a timeline with an explicit compatibility policy. Strict replay is
+/// the default; the legacy mode exists only for pre-`ApprovalResolved` logs.
+pub fn replay_events_with_compatibility(
+    events: Vec<AgentEvent>,
+    compatibility: ReplayCompatibility,
+) -> Result<RunReplay, ReplayError> {
+    replay_events_with_mode(events, false, compatibility)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayCompatibility {
+    #[default]
+    Strict,
+    LegacyApprovalWithoutResolution,
 }
 
 fn replay_events_with_mode(
     events: Vec<AgentEvent>,
     detect_recovery: bool,
+    compatibility: ReplayCompatibility,
 ) -> Result<RunReplay, ReplayError> {
     let run_id = match events.first() {
         Some(AgentEvent::RunStarted { run_id, .. }) => run_id.clone(),
@@ -112,10 +170,10 @@ fn replay_events_with_mode(
     };
 
     let mut status = RunStatus::Running;
-    let mut tool_calls = Vec::<ReplayedToolCall>::new();
+    let mut tool_calls = Vec::<ReplayedToolCallIndex>::new();
     let mut tool_call_indexes = HashMap::<ToolCallId, usize>::new();
     let mut approval_indexes = HashMap::<String, usize>::new();
-    let mut pending_approvals = HashSet::<ToolCallId>::new();
+    let mut pending_approvals = HashSet::<usize>::new();
     let mut approvals = Vec::new();
     let mut errors = Vec::new();
     let mut run_finished = false;
@@ -140,11 +198,7 @@ fn replay_events_with_mode(
             AgentEvent::RunStarted { .. } => {
                 return Err(ReplayError::DuplicateRunStarted { event_number });
             }
-            AgentEvent::ToolCallRequested {
-                model_tool_call_id,
-                call,
-                ..
-            } => {
+            AgentEvent::ToolCallRequested { call, .. } => {
                 if tool_call_indexes.contains_key(&call.id) {
                     return Err(ReplayError::DuplicateToolCall {
                         event_number,
@@ -154,12 +208,11 @@ fn replay_events_with_mode(
 
                 let tool_call_index = tool_calls.len();
                 tool_call_indexes.insert(call.id.clone(), tool_call_index);
-                tool_calls.push(ReplayedToolCall {
-                    model_tool_call_id: model_tool_call_id.clone(),
-                    call: call.clone(),
-                    approval: None,
-                    approval_decision: None,
-                    result: None,
+                tool_calls.push(ReplayedToolCallIndex {
+                    requested_event: index,
+                    approval_event: None,
+                    approval_resolution_event: None,
+                    result_event: None,
                 });
             }
             AgentEvent::ApprovalRequested { request, .. } => {
@@ -169,21 +222,24 @@ fn replay_events_with_mode(
                         call_id: request.call.id.clone(),
                     });
                 };
-                let replayed_call = &mut tool_calls[tool_call_index];
+                let replayed_call = ReplayedToolCall {
+                    events: &events,
+                    index: &tool_calls[tool_call_index],
+                };
 
-                if replayed_call.call != request.call {
+                if replayed_call.call() != &request.call {
                     return Err(ReplayError::ApprovalCallMismatch {
                         event_number,
                         call_id: request.call.id.clone(),
                     });
                 }
-                if replayed_call.result.is_some() {
+                if replayed_call.result().is_some() {
                     return Err(ReplayError::ApprovalAfterToolResult {
                         event_number,
                         call_id: request.call.id.clone(),
                     });
                 }
-                if replayed_call.approval.is_some() {
+                if replayed_call.approval().is_some() {
                     return Err(ReplayError::DuplicateApproval {
                         event_number,
                         call_id: request.call.id.clone(),
@@ -196,39 +252,38 @@ fn replay_events_with_mode(
                     });
                 }
 
-                replayed_call.approval = Some(request.clone());
+                tool_calls[tool_call_index].approval_event = Some(index);
                 approval_indexes.insert(request.id.clone(), tool_call_index);
-                approvals.push(request.clone());
-                pending_approvals.insert(request.call.id.clone());
+                approvals.push(index);
+                pending_approvals.insert(tool_call_index);
                 status = RunStatus::AwaitingApproval;
             }
-            AgentEvent::ApprovalResolved {
-                approval_id,
-                decision,
-                ..
-            } => {
+            AgentEvent::ApprovalResolved { approval_id, .. } => {
                 let Some(&tool_call_index) = approval_indexes.get(approval_id) else {
                     return Err(ReplayError::ResolutionForUnknownApproval {
                         event_number,
                         approval_id: approval_id.clone(),
                     });
                 };
-                let replayed_call = &mut tool_calls[tool_call_index];
-                if replayed_call.approval_decision.is_some() {
+                let replayed_call = ReplayedToolCall {
+                    events: &events,
+                    index: &tool_calls[tool_call_index],
+                };
+                if replayed_call.approval_decision().is_some() {
                     return Err(ReplayError::DuplicateApprovalResolution {
                         event_number,
                         approval_id: approval_id.clone(),
                     });
                 }
-                if replayed_call.result.is_some() {
+                if replayed_call.result().is_some() {
                     return Err(ReplayError::ApprovalResolutionAfterToolResult {
                         event_number,
                         approval_id: approval_id.clone(),
                     });
                 }
 
-                replayed_call.approval_decision = Some(decision.clone());
-                pending_approvals.remove(&replayed_call.call.id);
+                tool_calls[tool_call_index].approval_resolution_event = Some(index);
+                pending_approvals.remove(&tool_call_index);
                 if pending_approvals.is_empty() {
                     status = RunStatus::Running;
                 }
@@ -240,40 +295,95 @@ fn replay_events_with_mode(
                         call_id: result.call_id.clone(),
                     });
                 };
-                let replayed_call = &mut tool_calls[tool_call_index];
+                let replayed_call = ReplayedToolCall {
+                    events: &events,
+                    index: &tool_calls[tool_call_index],
+                };
 
-                if replayed_call.result.is_some() {
+                if replayed_call.result().is_some() {
                     return Err(ReplayError::DuplicateToolResult {
                         event_number,
                         call_id: result.call_id.clone(),
                     });
                 }
-                let is_canonical_denial_result = matches!(
-                    &result.output,
-                    ToolOutput::Failure { error, .. } if error.code == "approval_denied"
-                );
-                if matches!(
-                    replayed_call.approval_decision,
-                    Some(ApprovalDecision::Deny { .. })
-                ) && !is_canonical_denial_result
-                {
-                    return Err(ReplayError::ToolResultAfterApprovalDenied {
-                        event_number,
-                        call_id: result.call_id.clone(),
-                    });
+                match replayed_call.approval_decision() {
+                    None if replayed_call.approval().is_some()
+                        && compatibility == ReplayCompatibility::Strict =>
+                    {
+                        return Err(ReplayError::ToolResultBeforeApprovalResolution {
+                            event_number,
+                            call_id: result.call_id.clone(),
+                        });
+                    }
+                    None if replayed_call.approval().is_some() => {
+                        // Explicit compatibility for logs written before
+                        // ApprovalResolved existed.
+                    }
+                    Some(ApprovalDecision::Deny { reason }) => {
+                        let is_canonical = matches!(
+                            &result.output,
+                            ToolOutput::Failure { error, extensions }
+                                if error.code == "approval_denied"
+                                    && error.message == *reason
+                                    && !error.retryable
+                                    && extensions.is_empty()
+                        );
+                        if !is_canonical {
+                            return Err(ReplayError::InvalidApprovalDenialResult {
+                                event_number,
+                                call_id: result.call_id.clone(),
+                            });
+                        }
+                    }
+                    Some(ApprovalDecision::Approve) | None => {
+                        if matches!(
+                            &result.output,
+                            ToolOutput::Failure { error, .. }
+                                if error.code == "approval_denied"
+                        ) {
+                            return Err(ReplayError::InvalidApprovalDenialResult {
+                                event_number,
+                                call_id: result.call_id.clone(),
+                            });
+                        }
+                    }
                 }
 
-                replayed_call.result = Some(result.clone());
-                pending_approvals.remove(&result.call_id);
+                tool_calls[tool_call_index].result_event = Some(index);
+                pending_approvals.remove(&tool_call_index);
                 if pending_approvals.is_empty() {
                     status = RunStatus::Running;
                 }
             }
-            AgentEvent::Error { error, .. } => errors.push(error.clone()),
+            AgentEvent::Error { .. } => errors.push(index),
             AgentEvent::RunFinished {
                 status: terminal_status,
                 ..
             } => {
+                if matches!(
+                    terminal_status,
+                    TerminalRunStatus::Completed { .. } | TerminalRunStatus::Failed { .. }
+                ) {
+                    let call_ids = tool_calls
+                        .iter()
+                        .filter(|tool_call| tool_call.result_event.is_none())
+                        .map(|tool_call| {
+                            ReplayedToolCall {
+                                events: &events,
+                                index: tool_call,
+                            }
+                            .call()
+                            .id
+                            .clone()
+                        })
+                        .collect::<Vec<_>>();
+                    if !call_ids.is_empty() {
+                        return Err(ReplayError::TerminalWithUnresolvedToolCalls {
+                            event_number,
+                            call_ids,
+                        });
+                    }
+                }
                 status = RunStatus::Finished {
                     terminal_status: terminal_status.clone(),
                 };
@@ -286,8 +396,16 @@ fn replay_events_with_mode(
     if detect_recovery && matches!(status, RunStatus::Running) {
         let call_ids = tool_calls
             .iter()
-            .filter(|tool_call| tool_call.result.is_none())
-            .map(|tool_call| tool_call.call.id.clone())
+            .filter(|tool_call| tool_call.result_event.is_none())
+            .map(|tool_call| {
+                ReplayedToolCall {
+                    events: &events,
+                    index: tool_call,
+                }
+                .call()
+                .id
+                .clone()
+            })
             .collect::<Vec<_>>();
         if !call_ids.is_empty() {
             status = RunStatus::RecoveryRequired { call_ids };
@@ -360,9 +478,17 @@ pub enum ReplayError {
         event_number: usize,
         approval_id: String,
     },
-    ToolResultAfterApprovalDenied {
+    ToolResultBeforeApprovalResolution {
         event_number: usize,
         call_id: ToolCallId,
+    },
+    InvalidApprovalDenialResult {
+        event_number: usize,
+        call_id: ToolCallId,
+    },
+    TerminalWithUnresolvedToolCalls {
+        event_number: usize,
+        call_ids: Vec<ToolCallId>,
     },
     DuplicateToolResult {
         event_number: usize,
@@ -471,13 +597,29 @@ impl fmt::Display for ReplayError {
                 formatter,
                 "Event Log event {event_number} resolves approval '{approval_id}' after its tool call already has a result"
             ),
-            Self::ToolResultAfterApprovalDenied {
+            Self::ToolResultBeforeApprovalResolution {
                 event_number,
                 call_id,
             } => write!(
                 formatter,
-                "Event Log event {event_number} records a result for denied tool call '{}'",
+                "Event Log event {event_number} records a result before approval for tool call '{}' was resolved",
                 call_id.as_str()
+            ),
+            Self::InvalidApprovalDenialResult {
+                event_number,
+                call_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} records an invalid approval-denial result for tool call '{}'",
+                call_id.as_str()
+            ),
+            Self::TerminalWithUnresolvedToolCalls {
+                event_number,
+                call_ids,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} finishes successfully or with failure while {} tool call(s) remain unresolved",
+                call_ids.len()
             ),
             Self::DuplicateToolResult {
                 event_number,

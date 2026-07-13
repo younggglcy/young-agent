@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use young_agent_runtime::{AgentEvent, RunStatus, TerminalRunStatus};
-use young_event_store::{EventStoreError, JsonlEventStore, ReplayError};
+use young_event_store::{EventStoreError, JsonlEventStore, ReplayCompatibility, ReplayError};
 
 struct TestLog {
     path: PathBuf,
@@ -35,6 +35,53 @@ impl Drop for TestLog {
 
 fn agent_event(value: Value) -> AgentEvent {
     serde_json::from_value(value).expect("fixture should be a valid AgentEvent")
+}
+
+fn approval_result_events(decision: Value, output: Value) -> Vec<AgentEvent> {
+    vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": {
+                    "id": "tool-call-001",
+                    "tool_name": "run_command",
+                    "arguments": { "command": "cargo test" }
+                },
+                "reason": "command requires approval"
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_resolved",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "approval_id": "approval-001",
+            "decision": decision
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": output
+            }
+        })),
+    ]
 }
 
 #[test]
@@ -179,6 +226,13 @@ fn replay_reconstructs_the_run_state_from_the_ordered_event_log() {
             }
         })),
         agent_event(json!({
+            "type": "approval_resolved",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "approval_id": "approval-001",
+            "decision": { "decision": "approve" }
+        })),
+        agent_event(json!({
             "type": "tool_result",
             "run_id": "run-001",
             "turn_id": "turn-001",
@@ -221,6 +275,9 @@ fn replay_reconstructs_the_run_state_from_the_ordered_event_log() {
     let expected_status = RunStatus::Finished {
         terminal_status: expected_terminal_status.clone(),
     };
+    let replayed_tool_call = replay.tool_calls().next().expect("tool call should replay");
+    let replayed_approval = replay.approvals().next().expect("approval should replay");
+    let replayed_error = replay.errors().next().expect("error should replay");
 
     assert_eq!(
         (
@@ -228,13 +285,13 @@ fn replay_reconstructs_the_run_state_from_the_ordered_event_log() {
             replay.status(),
             replay.events(),
             replay.tool_calls().len(),
-            replay.tool_calls()[0].model_tool_call_id().as_str(),
-            replay.tool_calls()[0].call().id.as_str(),
-            replay.tool_calls()[0]
+            replayed_tool_call.model_tool_call_id().as_str(),
+            replayed_tool_call.call().id.as_str(),
+            replayed_tool_call
                 .result()
                 .map(|result| result.call_id.as_str()),
-            replay.approvals()[0].id.as_str(),
-            replay.errors()[0].code.as_str(),
+            replayed_approval.id.as_str(),
+            replayed_error.code.as_str(),
             replay.terminal_status(),
         ),
         (
@@ -287,15 +344,16 @@ fn replay_reconstructs_a_run_waiting_for_tool_approval() {
     ];
 
     let replay = young_event_store::replay_events(events).expect("events should replay");
+    let replayed_tool_call = replay.tool_calls().next().expect("tool call should replay");
 
     assert_eq!(
         (
             replay.status(),
             replay.terminal_status(),
-            replay.tool_calls()[0]
+            replayed_tool_call
                 .approval()
                 .map(|request| request.id.as_str()),
-            replay.tool_calls()[0].result(),
+            replayed_tool_call.result(),
         ),
         (
             &RunStatus::AwaitingApproval,
@@ -304,6 +362,97 @@ fn replay_reconstructs_a_run_waiting_for_tool_approval() {
             None,
         )
     );
+}
+
+#[test]
+fn strict_replay_requires_approval_resolution_before_a_tool_result() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": {
+                    "id": "tool-call-001",
+                    "tool_name": "run_command",
+                    "arguments": { "command": "cargo test" }
+                },
+                "reason": "command requires approval"
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": { "status": "success", "content": [] }
+            }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events.clone())
+        .expect_err("strict replay must reject an unresolved approval result");
+    assert!(matches!(
+        error,
+        ReplayError::ToolResultBeforeApprovalResolution {
+            event_number: 4,
+            ref call_id,
+        } if call_id.as_str() == "tool-call-001"
+    ));
+
+    let legacy = young_event_store::replay_events_with_compatibility(
+        events,
+        ReplayCompatibility::LegacyApprovalWithoutResolution,
+    )
+    .expect("legacy compatibility must be explicit");
+    assert_eq!(legacy.status(), &RunStatus::Running);
+}
+
+#[test]
+fn replay_rejects_successful_completion_with_an_unresolved_tool_call() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            }
+        })),
+        agent_event(json!({
+            "type": "run_finished",
+            "run_id": "run-001",
+            "status": { "status": "completed", "final_message": "done" }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("completed runs cannot abandon unresolved tool calls");
+    assert!(matches!(
+        error,
+        ReplayError::TerminalWithUnresolvedToolCalls {
+            event_number: 3,
+            ref call_ids,
+        } if call_ids == &[young_tool_runtime::ToolCallId::new("tool-call-001")]
+    ));
 }
 
 #[test]
@@ -469,8 +618,11 @@ fn replay_rejects_approval_resolution_after_a_tool_result() {
         })),
     ];
 
-    let error = young_event_store::replay_events(events)
-        .expect_err("approval resolution after a tool result should fail");
+    let error = young_event_store::replay_events_with_compatibility(
+        events,
+        ReplayCompatibility::LegacyApprovalWithoutResolution,
+    )
+    .expect_err("approval resolution after a tool result should fail");
 
     assert!(matches!(
         error,
@@ -536,7 +688,59 @@ fn replay_rejects_a_tool_result_after_approval_was_denied() {
 
     assert!(matches!(
         error,
-        ReplayError::ToolResultAfterApprovalDenied {
+        ReplayError::InvalidApprovalDenialResult {
+            event_number: 5,
+            ref call_id,
+        } if call_id.as_str() == "tool-call-001"
+    ));
+}
+
+#[test]
+fn replay_requires_the_exact_canonical_result_for_a_denied_approval() {
+    let events = approval_result_events(
+        json!({ "decision": "deny", "reason": "not allowed" }),
+        json!({
+            "status": "failure",
+            "error": {
+                "code": "approval_denied",
+                "message": "different reason",
+                "retryable": true
+            }
+        }),
+    );
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("a forged denial result must fail replay");
+
+    assert!(matches!(
+        error,
+        ReplayError::InvalidApprovalDenialResult {
+            event_number: 5,
+            ref call_id,
+        } if call_id.as_str() == "tool-call-001"
+    ));
+}
+
+#[test]
+fn replay_rejects_the_reserved_denial_result_after_approval() {
+    let events = approval_result_events(
+        json!({ "decision": "approve" }),
+        json!({
+            "status": "failure",
+            "error": {
+                "code": "approval_denied",
+                "message": "not allowed",
+                "retryable": false
+            }
+        }),
+    );
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("approval_denied is reserved for an actual denial decision");
+
+    assert!(matches!(
+        error,
+        ReplayError::InvalidApprovalDenialResult {
             event_number: 5,
             ref call_id,
         } if call_id.as_str() == "tool-call-001"

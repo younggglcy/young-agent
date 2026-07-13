@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,11 @@ pub trait AgentEventSink {
     /// sinks (for example, a flush can fail after bytes were written), so
     /// callers must inspect the Canonical Event Log before retrying.
     fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error>;
+
+    /// Appends an event and makes its commit marker durable before returning.
+    /// In-memory sinks may implement this identically to [`Self::append`], but
+    /// persistent sinks must not return until the commit marker is stable.
+    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,25 +93,44 @@ impl RunStopToken {
         self.cancellation.load(Ordering::Acquire)
     }
 
+    /// Returns the first terminal status chosen for this run, including normal
+    /// completion and failure as well as interruption and cancellation.
+    pub fn terminal_status(&self) -> Option<TerminalRunStatus> {
+        self.terminal_status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn request_stop(&self, status: TerminalRunStatus) {
+        self.resolve_terminal(status);
+    }
+
+    fn resolve_terminal(&self, proposed: TerminalRunStatus) -> TerminalRunStatus {
         let mut terminal_status = self
             .terminal_status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if terminal_status.is_none() {
-            *terminal_status = Some(status);
-            self.cancellation.store(true, Ordering::Release);
+            let is_stop = matches!(
+                proposed,
+                TerminalRunStatus::Interrupted { .. } | TerminalRunStatus::Cancelled { .. }
+            );
+            *terminal_status = Some(proposed);
+            if is_stop {
+                self.cancellation.store(true, Ordering::Release);
+            }
         }
+        terminal_status
+            .clone()
+            .expect("terminal status was initialized")
     }
 
     fn status(&self) -> Option<TerminalRunStatus> {
         if !self.is_requested() {
             return None;
         }
-        self.terminal_status
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.terminal_status()
     }
 
     fn cancellation_flag(&self) -> Arc<AtomicBool> {
@@ -245,7 +269,7 @@ where
 
         for turn_number in 1..=MAX_TURNS {
             if let Some(status) = stopped_status(control.checkpoint(), stop) {
-                return self.finish(&run_id, status);
+                return self.finish(&run_id, status, stop);
             }
 
             let turn_id = TurnId::new(format!("turn-{turn_number:03}"));
@@ -265,7 +289,7 @@ where
                 let status = TerminalRunStatus::Completed {
                     final_message: collected.text,
                 };
-                return self.finish(&run_id, status);
+                return self.finish(&run_id, status, stop);
             }
 
             model_request.messages.push(if collected.text.is_empty() {
@@ -300,6 +324,7 @@ where
                 message: format!("Agent Run exceeded the {MAX_TURNS}-turn safety limit"),
                 recoverable: false,
             },
+            stop,
         )
     }
 
@@ -318,9 +343,9 @@ where
             Ok(stream) => stream,
             Err(error) => {
                 let outcome = if let Some(status) = stop.status() {
-                    self.finish(run_id, status)?
+                    self.finish(run_id, status, stop)?
                 } else {
-                    self.finish_model_error(run_id, Some(turn_id.clone()), error)?
+                    self.finish_model_error(run_id, Some(turn_id.clone()), error, stop)?
                 };
                 return Ok(ModelTurnProgress::Finished(outcome));
             }
@@ -328,11 +353,14 @@ where
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
+        let mut model_tool_call_ids = HashSet::new();
         let mut completed = false;
 
         for model_event in stream {
             if let Some(status) = stopped_status(control.checkpoint(), stop) {
-                return self.finish(run_id, status).map(ModelTurnProgress::Finished);
+                return self
+                    .finish(run_id, status, stop)
+                    .map(ModelTurnProgress::Finished);
             }
 
             let model_output_event = AgentEvent::ModelOutput {
@@ -356,18 +384,37 @@ where
                     name,
                     arguments,
                     ..
-                } => tool_calls.push(ModelToolCall {
-                    id,
-                    name,
-                    arguments,
-                }),
+                } => {
+                    if !model_tool_call_ids.insert(id.clone()) {
+                        return self
+                            .finish_agent_error(
+                                run_id,
+                                Some(turn_id.clone()),
+                                AgentError {
+                                    code: "duplicate_model_tool_call_id".to_string(),
+                                    message: format!(
+                                        "model emitted duplicate tool call id '{}' in one turn",
+                                        id.as_str()
+                                    ),
+                                    recoverable: false,
+                                },
+                                stop,
+                            )
+                            .map(ModelTurnProgress::Finished);
+                    }
+                    tool_calls.push(ModelToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
                 ModelStreamEvent::Completed { .. } => {
                     completed = true;
                     break;
                 }
                 ModelStreamEvent::Failed { error, .. } => {
                     return self
-                        .finish_model_error(run_id, Some(turn_id.clone()), error)
+                        .finish_model_error(run_id, Some(turn_id.clone()), error, stop)
                         .map(ModelTurnProgress::Finished);
                 }
                 ModelStreamEvent::Started { .. }
@@ -377,7 +424,9 @@ where
         }
 
         if let Some(status) = stop.status() {
-            return self.finish(run_id, status).map(ModelTurnProgress::Finished);
+            return self
+                .finish(run_id, status, stop)
+                .map(ModelTurnProgress::Finished);
         }
         if !completed {
             return self
@@ -389,6 +438,7 @@ where
                         message: "model stream ended without a completed event".to_string(),
                         recoverable: false,
                     },
+                    stop,
                 )
                 .map(ModelTurnProgress::Finished);
         }
@@ -421,13 +471,17 @@ where
             tool_name: model_tool_call.name.clone(),
             arguments: model_tool_call.arguments,
         };
-        self.emit(&AgentEvent::ToolCallRequested {
+        let requested_event = AgentEvent::ToolCallRequested {
             run_id: run_id.clone(),
             turn_id: turn_id.clone(),
             model_tool_call_id: model_tool_call.id.clone(),
-            call: call.clone(),
+            call,
             extensions: BTreeMap::new(),
-        })?;
+        };
+        self.emit_durable(&requested_event)?;
+        let AgentEvent::ToolCallRequested { call, .. } = requested_event else {
+            unreachable!("requested_event is constructed as AgentEvent::ToolCallRequested")
+        };
 
         let output = if let Some(reason) = self.tool_executor.approval_reason(&call) {
             sequences.approval += 1;
@@ -436,16 +490,25 @@ where
                 call: call.clone(),
                 reason,
             };
-            self.emit(&AgentEvent::ApprovalRequested {
+            let approval_event = AgentEvent::ApprovalRequested {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
-                request: approval.clone(),
+                request: approval,
                 extensions: BTreeMap::new(),
-            })?;
+            };
+            self.emit(&approval_event)?;
+            let AgentEvent::ApprovalRequested {
+                request: approval, ..
+            } = approval_event
+            else {
+                unreachable!("approval_event is constructed as AgentEvent::ApprovalRequested")
+            };
 
             let decision = control.decide_approval(&approval, stop.cancellation_flag());
             if let Some(status) = stop.status() {
-                return self.finish(run_id, status).map(ToolCallProgress::Finished);
+                return self
+                    .finish(run_id, status, stop)
+                    .map(ToolCallProgress::Finished);
             }
             self.emit(&AgentEvent::ApprovalResolved {
                 run_id: run_id.clone(),
@@ -458,7 +521,9 @@ where
             match decision {
                 ApprovalDecision::Approve => {
                     if let Some(status) = stopped_status(control.checkpoint(), stop) {
-                        return self.finish(run_id, status).map(ToolCallProgress::Finished);
+                        return self
+                            .finish(run_id, status, stop)
+                            .map(ToolCallProgress::Finished);
                     }
                     self.tool_executor.execute(&call, stop.cancellation_flag())
                 }
@@ -473,7 +538,9 @@ where
             }
         } else {
             if let Some(status) = stopped_status(control.checkpoint(), stop) {
-                return self.finish(run_id, status).map(ToolCallProgress::Finished);
+                return self
+                    .finish(run_id, status, stop)
+                    .map(ToolCallProgress::Finished);
             }
             self.tool_executor.execute(&call, stop.cancellation_flag())
         };
@@ -494,7 +561,9 @@ where
         };
 
         if let Some(status) = stop.status() {
-            return self.finish(run_id, status).map(ToolCallProgress::Finished);
+            return self
+                .finish(run_id, status, stop)
+                .map(ToolCallProgress::Finished);
         }
         if let ToolOutput::Failure { error, .. } = &result.output {
             self.emit(&AgentEvent::Error {
@@ -522,8 +591,14 @@ where
             .map_err(AgentRuntimeError::EventSink)
     }
 
+    fn emit_durable(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
+        self.event_sink
+            .append_durable(event)
+            .map_err(AgentRuntimeError::EventSink)
+    }
+
     fn emit_tool_result(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink.append(event).map_err(|source| {
+        self.event_sink.append_durable(event).map_err(|source| {
             AgentRuntimeError::ToolResultPersistenceIndeterminate {
                 event: Box::new(event.clone()),
                 source,
@@ -536,6 +611,7 @@ where
         run_id: &RunId,
         turn_id: Option<TurnId>,
         error: ModelError,
+        stop: &RunStopToken,
     ) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
         self.finish_agent_error(
             run_id,
@@ -545,6 +621,7 @@ where
                 message: error.message,
                 recoverable: false,
             },
+            stop,
         )
     }
 
@@ -553,6 +630,7 @@ where
         run_id: &RunId,
         turn_id: Option<TurnId>,
         error: AgentError,
+        stop: &RunStopToken,
     ) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
         self.emit(&AgentEvent::Error {
             run_id: run_id.clone(),
@@ -560,14 +638,16 @@ where
             error: error.clone(),
             extensions: BTreeMap::new(),
         })?;
-        self.finish(run_id, TerminalRunStatus::Failed { error })
+        self.finish(run_id, TerminalRunStatus::Failed { error }, stop)
     }
 
     fn finish(
         &mut self,
         run_id: &RunId,
-        status: TerminalRunStatus,
+        proposed_status: TerminalRunStatus,
+        stop: &RunStopToken,
     ) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
+        let status = stop.resolve_terminal(proposed_status);
         self.emit(&AgentEvent::RunFinished {
             run_id: run_id.clone(),
             status: status.clone(),

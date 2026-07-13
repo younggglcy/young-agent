@@ -171,6 +171,25 @@ struct FailOnceOnToolResultSink {
     should_fail: Rc<Cell<bool>>,
 }
 
+#[derive(Clone, Default)]
+struct DurabilitySpySink {
+    events: Rc<RefCell<Vec<(AgentEvent, bool)>>>,
+}
+
+impl AgentEventSink for DurabilitySpySink {
+    type Error = TestSinkError;
+
+    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.events.borrow_mut().push((event.clone(), false));
+        Ok(())
+    }
+
+    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.events.borrow_mut().push((event.clone(), true));
+        Ok(())
+    }
+}
+
 impl FailOnceOnToolResultSink {
     fn new() -> Self {
         Self {
@@ -189,6 +208,10 @@ impl AgentEventSink for FailOnceOnToolResultSink {
         }
         self.events.borrow_mut().push(event.clone());
         Ok(())
+    }
+
+    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.append(event)
     }
 }
 
@@ -256,13 +279,67 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
             final_message: "The project is an Agent Kernel.".to_string(),
         }
     );
-    assert_eq!(runtime.model_client().requests().len(), 2);
+    assert_eq!(runtime.model_client().request_count(), 2);
     assert_eq!(runtime.tool_executor().calls().len(), 1);
 
     let replay = store.replay().expect("runtime Event Log should replay");
     assert_eq!(replay.terminal_status(), Some(outcome.status()));
     assert_eq!(replay.tool_calls().len(), 1);
-    assert!(replay.tool_calls()[0].result().is_some());
+    assert!(replay
+        .tool_calls()
+        .next()
+        .expect("tool call should replay")
+        .result()
+        .is_some());
+}
+
+#[test]
+fn tool_intent_and_result_use_the_durable_event_sink_boundary() {
+    let sink = DurabilitySpySink::default();
+    let observed = sink.events.clone();
+    let model = FakeModelClient::new([
+        ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-call-001"),
+                name: "run_command".to_string(),
+                arguments: json!({ "command": "touch important-file" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+        ScriptedModelTurn::events([ModelStreamEvent::Completed {
+            finish_reason: Some("stop".to_string()),
+            extensions: no_extensions(),
+        }]),
+    ]);
+    let tools = FakeToolExecutor::new([ToolOutput::Success {
+        content: Vec::new(),
+        metadata: no_extensions(),
+        extensions: no_extensions(),
+    }]);
+    let mut runtime = AgentRuntime::new(model, tools, sink);
+
+    runtime
+        .run(run_request("run-durable-tool-events"))
+        .expect("run should complete");
+
+    let events = observed.borrow();
+    for expected in ["tool_call_requested", "tool_result"] {
+        assert!(events.iter().any(|(event, durable)| {
+            let matches_kind = matches!(
+                (expected, event),
+                ("tool_call_requested", AgentEvent::ToolCallRequested { .. })
+                    | ("tool_result", AgentEvent::ToolResult { .. })
+            );
+            matches_kind && *durable
+        }));
+    }
+    assert!(events
+        .iter()
+        .any(|(event, durable)| { matches!(event, AgentEvent::ModelOutput { .. }) && !*durable }));
 }
 
 #[test]
@@ -313,6 +390,52 @@ fn completed_model_event_ends_the_turn_before_late_events_can_execute_tools() {
 }
 
 #[test]
+fn duplicate_model_tool_call_ids_fail_before_any_tool_executes() {
+    let log = TestLog::new("duplicate-model-tool-call-id");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("duplicate-id"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "touch first" }),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::ToolCall {
+            id: ModelToolCallId::new("duplicate-id"),
+            name: "run_command".to_string(),
+            arguments: json!({ "command": "touch second" }),
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::Completed {
+            finish_reason: Some("tool_calls".to_string()),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let tools = FakeToolExecutor::new([ToolOutput::Success {
+        content: Vec::new(),
+        metadata: no_extensions(),
+        extensions: no_extensions(),
+    }]);
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+
+    let outcome = runtime
+        .run(run_request("run-duplicate-model-call"))
+        .expect("duplicate provider ids should become a terminal Agent error");
+
+    assert!(matches!(
+        outcome.status(),
+        TerminalRunStatus::Failed { error }
+            if error.code == "duplicate_model_tool_call_id"
+    ));
+    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(!store
+        .read_all()
+        .expect("failed Event Log should read")
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolCallRequested { .. })));
+}
+
+#[test]
 fn model_error_is_persisted_and_finishes_the_run_as_failed() {
     let log = TestLog::new("model-error");
     let store = JsonlEventStore::new(log.path());
@@ -333,8 +456,9 @@ fn model_error_is_persisted_and_finishes_the_run_as_failed() {
 
     let replay = store.replay().expect("failed run should replay");
     assert_eq!(replay.errors().len(), 1);
-    assert_eq!(replay.errors()[0].code, model_error.code);
-    assert_eq!(replay.errors()[0].message, model_error.message);
+    let replayed_error = replay.errors().next().expect("error should replay");
+    assert_eq!(replayed_error.code, model_error.code);
+    assert_eq!(replayed_error.message, model_error.message);
     assert_eq!(replay.terminal_status(), Some(outcome.status()));
     assert!(matches!(outcome.status(), TerminalRunStatus::Failed { .. }));
     assert!(replay.events().iter().any(|event| matches!(
@@ -362,7 +486,10 @@ fn direct_fake_model_error_is_persisted_as_a_failed_run() {
         .expect("direct model error should be a recorded terminal outcome");
 
     let replay = store.replay().expect("failed run should replay");
-    assert_eq!(replay.errors()[0].code, "transport_unavailable");
+    assert_eq!(
+        replay.errors().next().expect("error should replay").code,
+        "transport_unavailable"
+    );
     assert_eq!(replay.terminal_status(), Some(outcome.status()));
     assert!(matches!(outcome.status(), TerminalRunStatus::Failed { .. }));
 }
@@ -415,7 +542,10 @@ fn tool_error_is_emitted_and_fed_back_to_the_next_model_turn() {
             final_message: "The file could not be read.".to_string(),
         }
     );
-    let second_request = &runtime.model_client().requests()[1];
+    let second_request = runtime
+        .model_client()
+        .last_request()
+        .expect("the second turn request should be recorded");
     let tool_message = second_request
         .messages
         .last()
@@ -431,9 +561,15 @@ fn tool_error_is_emitted_and_fed_back_to_the_next_model_turn() {
     }
 
     let replay = store.replay().expect("tool-error run should replay");
-    assert_eq!(replay.errors()[0].code, "not_found");
+    assert_eq!(
+        replay.errors().next().expect("error should replay").code,
+        "not_found"
+    );
     assert!(matches!(
-        replay.tool_calls()[0]
+        replay
+            .tool_calls()
+            .next()
+            .expect("tool call should replay")
             .result()
             .expect("tool result should exist")
             .output,
@@ -501,7 +637,7 @@ fn interruption_and_cancellation_produce_distinct_terminal_states() {
                 .terminal_status(),
             Some(&expected_status)
         );
-        assert_eq!(runtime.model_client().requests().len(), 1);
+        assert_eq!(runtime.model_client().request_count(), 1);
         assert!(!store
             .read_all()
             .expect("stopped event log should read")
@@ -734,6 +870,34 @@ fn the_first_stop_request_is_shared_across_control_and_stop_token() {
 }
 
 #[test]
+fn completed_terminal_status_wins_over_a_later_cancellation() {
+    let log = TestLog::new("completed-before-late-cancel");
+    let stop = RunStopToken::default();
+    let mut runtime = AgentRuntime::new(
+        FakeModelClient::new([ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "done".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ])]),
+        FakeToolExecutor::default(),
+        JsonlEventStore::new(log.path()),
+    );
+
+    let outcome = runtime
+        .run_with_stop_token(run_request("run-completed-first"), &stop)
+        .expect("run should complete");
+    stop.cancel("late cancellation");
+
+    assert_eq!(stop.terminal_status(), Some(outcome.status().clone()));
+    assert!(!stop.is_requested());
+}
+
+#[test]
 fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_tool() {
     let sink = FailOnceOnToolResultSink::new();
     let observed_events = sink.events.clone();
@@ -956,7 +1120,9 @@ fn approval_decision_is_persisted_before_a_post_approval_cancellation() {
         store
             .replay()
             .expect("approval decision should replay")
-            .tool_calls()[0]
+            .tool_calls()
+            .next()
+            .expect("tool call should replay")
             .approval_decision(),
         Some(&ApprovalDecision::Approve)
     );
@@ -1015,9 +1181,15 @@ fn unhandled_approval_is_denied_without_executing_the_tool() {
     assert!(runtime.tool_executor().calls().is_empty());
     let replay = store.replay().expect("denied run should replay");
     assert_eq!(replay.approvals().len(), 1);
-    assert_eq!(replay.errors()[0].code, "approval_denied");
+    assert_eq!(
+        replay.errors().next().expect("error should replay").code,
+        "approval_denied"
+    );
     assert!(matches!(
-        replay.tool_calls()[0]
+        replay
+            .tool_calls()
+            .next()
+            .expect("tool call should replay")
             .result()
             .expect("denial should be represented as a tool result")
             .output,
