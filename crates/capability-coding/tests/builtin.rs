@@ -34,7 +34,9 @@ fn coding_capability_loads_its_embedded_builtin_manifest() {
         ToolSafetyClass::CallDependent
     );
 
-    let definitions = manifest.tool_definitions();
+    let definitions = manifest
+        .tool_definitions()
+        .expect("embedded manifest produces valid definitions");
     assert_eq!(
         definitions[0].approval_policy,
         ToolApprovalPolicy::AlwaysAllow
@@ -66,7 +68,7 @@ fn coding_capability_registers_initial_tools_with_explicit_stubs() {
         arguments: json!({ "path": "README.md" }),
     };
     let result = runtime.dispatch(
-        &call,
+        call.clone(),
         ToolExecutionAuthorization::NotRequired,
         Arc::new(AtomicBool::new(false)),
     );

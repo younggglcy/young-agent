@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::execution::{
-    ToolCall, ToolError, ToolExecutionAuthorization, ToolExecutor, ToolOutput, ToolResult,
+    PreparedToolCall, ToolCall, ToolDispatcher, ToolError, ToolExecutionAuthorization, ToolHandler,
+    ToolOutput, ToolResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -31,6 +32,68 @@ pub struct ToolDefinition {
     pub mcp: Option<McpCompatibility>,
 }
 
+impl ToolDefinition {
+    pub fn validate(&self) -> Result<(), ToolDefinitionError> {
+        require_non_empty("name", &self.name)?;
+        require_non_empty("description", &self.description)?;
+        require_non_empty("capability.id", &self.capability.id)?;
+        require_non_empty("capability.version", &self.capability.version)?;
+        if !self.input_schema.is_object() {
+            return Err(ToolDefinitionError::new("input_schema must be an object"));
+        }
+        if self
+            .output_schema
+            .as_ref()
+            .is_some_and(|schema| !schema.is_object())
+        {
+            return Err(ToolDefinitionError::new("output_schema must be an object"));
+        }
+        match &self.approval_policy {
+            ToolApprovalPolicy::RequiresApproval { reason }
+            | ToolApprovalPolicy::AlwaysReject { reason } => {
+                require_non_empty("approval policy reason", reason)?;
+            }
+            ToolApprovalPolicy::AlwaysAllow | ToolApprovalPolicy::CallDependent => {}
+        }
+        if let Some(mcp) = &self.mcp {
+            require_non_empty("mcp.server", &mcp.server)?;
+            require_non_empty("mcp.tool_name", &mcp.tool_name)?;
+            require_non_empty("mcp.protocol_version", &mcp.protocol_version)?;
+        }
+        Ok(())
+    }
+}
+
+fn require_non_empty(field: &str, value: &str) -> Result<(), ToolDefinitionError> {
+    if value.trim().is_empty() {
+        return Err(ToolDefinitionError::new(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolDefinitionError {
+    message: String,
+}
+
+impl ToolDefinitionError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ToolDefinitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ToolDefinitionError {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityRef {
@@ -45,8 +108,8 @@ pub enum ToolApprovalPolicy {
     RequiresApproval {
         reason: String,
     },
-    /// The concrete executor classifies each call through
-    /// [`ToolExecutor::approval_reason`].
+    /// The concrete handler classifies each call through
+    /// [`ToolHandler::approval_reason`].
     CallDependent,
     AlwaysReject {
         reason: String,
@@ -68,21 +131,25 @@ pub struct ToolRuntime {
 
 struct RegisteredTool {
     definition: ToolDefinition,
-    executor: Box<dyn ToolExecutor>,
+    handler: Box<dyn ToolHandler>,
 }
 
 impl ToolRuntime {
-    pub fn register<E>(
+    pub fn register<H>(
         &mut self,
         definition: ToolDefinition,
-        executor: E,
+        handler: H,
     ) -> Result<(), ToolRegistrationError>
     where
-        E: ToolExecutor + 'static,
+        H: ToolHandler + 'static,
     {
-        if definition.name.trim().is_empty() {
-            return Err(ToolRegistrationError::EmptyName);
-        }
+        let definition_name = definition.name.clone();
+        definition
+            .validate()
+            .map_err(|source| ToolRegistrationError::InvalidDefinition {
+                name: definition_name,
+                source,
+            })?;
         if self.tools.contains_key(&definition.name) {
             return Err(ToolRegistrationError::DuplicateTool {
                 name: definition.name,
@@ -93,7 +160,7 @@ impl ToolRuntime {
             definition.name.clone(),
             RegisteredTool {
                 definition,
-                executor: Box::new(executor),
+                handler: Box::new(handler),
             },
         );
         Ok(())
@@ -115,104 +182,98 @@ impl ToolRuntime {
         self.tools.is_empty()
     }
 
-    /// Dispatches a call while enforcing its static or call-dependent approval
-    /// policy. Approval prompting stays in the Agent Runtime; this method
-    /// validates the correlated authorization before invoking an executor.
+    /// One-shot convenience for non-interactive callers that already know the
+    /// authorization outcome. Interactive callers should retain the plan from
+    /// [`ToolDispatcher::prepare`] and execute that exact plan after approval.
     pub fn dispatch(
         &mut self,
-        call: &ToolCall,
+        call: ToolCall,
         authorization: ToolExecutionAuthorization,
         cancellation: Arc<AtomicBool>,
     ) -> ToolResult {
-        let output = match self.tools.get_mut(&call.tool_name) {
-            Some(tool) => match &tool.definition.approval_policy {
-                ToolApprovalPolicy::AlwaysReject { reason } => ToolOutput::Failure {
+        let call_id = call.id.clone();
+        let prepared = self.prepare(call);
+        let output = self.execute_prepared(prepared, authorization, cancellation);
+        ToolResult { call_id, output }
+    }
+}
+
+impl crate::execution::sealed::Sealed for ToolRuntime {}
+
+impl ToolDispatcher for ToolRuntime {
+    fn prepare(&self, call: ToolCall) -> PreparedToolCall {
+        let Some(tool) = self.tools.get(&call.tool_name) else {
+            let message = format!("tool '{}' is not registered", call.tool_name);
+            return PreparedToolCall::rejected(
+                call,
+                ToolError {
+                    code: "unknown_tool".to_string(),
+                    message,
+                    retryable: false,
+                },
+            );
+        };
+
+        match &tool.definition.approval_policy {
+            ToolApprovalPolicy::AlwaysAllow => PreparedToolCall::ready(call),
+            ToolApprovalPolicy::RequiresApproval { reason } => {
+                PreparedToolCall::requiring_approval(call, reason.clone())
+            }
+            ToolApprovalPolicy::CallDependent => match tool.handler.approval_reason(&call) {
+                Some(reason) => PreparedToolCall::requiring_approval(call, reason),
+                None => PreparedToolCall::ready(call),
+            },
+            ToolApprovalPolicy::AlwaysReject { reason } => PreparedToolCall::rejected(
+                call,
+                ToolError {
+                    code: "tool_rejected".to_string(),
+                    message: reason.clone(),
+                    retryable: false,
+                },
+            ),
+        }
+    }
+
+    fn execute_prepared(
+        &mut self,
+        prepared: PreparedToolCall,
+        authorization: ToolExecutionAuthorization,
+        cancellation: Arc<AtomicBool>,
+    ) -> ToolOutput {
+        match prepared.into_authorized_call(authorization) {
+            Ok(call) => match self.tools.get_mut(&call.tool_name) {
+                Some(tool) => tool.handler.execute(&call, cancellation),
+                None => ToolOutput::Failure {
                     error: ToolError {
-                        code: "tool_rejected".to_string(),
-                        message: reason.clone(),
+                        code: "unknown_tool".to_string(),
+                        message: format!("tool '{}' is not registered", call.tool_name),
                         retryable: false,
                     },
                     extensions: BTreeMap::new(),
                 },
-                ToolApprovalPolicy::RequiresApproval { reason }
-                    if !authorization.is_granted_for(call) =>
-                {
-                    approval_required(reason.clone())
-                }
-                ToolApprovalPolicy::CallDependent => match tool.executor.approval_reason(call) {
-                    Some(reason) if !authorization.is_granted_for(call) => {
-                        approval_required(reason)
-                    }
-                    _ => tool.executor.execute(call, cancellation),
-                },
-                ToolApprovalPolicy::AlwaysAllow | ToolApprovalPolicy::RequiresApproval { .. } => {
-                    tool.executor.execute(call, cancellation)
-                }
             },
-            None => ToolOutput::Failure {
-                error: ToolError {
-                    code: "unknown_tool".to_string(),
-                    message: format!("tool '{}' is not registered", call.tool_name),
-                    retryable: false,
-                },
-                extensions: BTreeMap::new(),
-            },
-        };
-
-        ToolResult {
-            call_id: call.id.clone(),
-            output,
+            Err(output) => output,
         }
-    }
-}
-
-impl ToolExecutor for ToolRuntime {
-    fn approval_reason(&self, call: &ToolCall) -> Option<String> {
-        let tool = self.tools.get(&call.tool_name)?;
-        match &tool.definition.approval_policy {
-            ToolApprovalPolicy::RequiresApproval { reason } => Some(reason.clone()),
-            ToolApprovalPolicy::CallDependent => tool.executor.approval_reason(call),
-            ToolApprovalPolicy::AlwaysAllow => None,
-            ToolApprovalPolicy::AlwaysReject { .. } => None,
-        }
-    }
-
-    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {
-        self.dispatch(call, ToolExecutionAuthorization::NotRequired, cancellation)
-            .output
-    }
-
-    fn execute_authorized(
-        &mut self,
-        call: &ToolCall,
-        authorization: ToolExecutionAuthorization,
-        cancellation: Arc<AtomicBool>,
-    ) -> ToolOutput {
-        self.dispatch(call, authorization, cancellation).output
-    }
-}
-
-fn approval_required(reason: String) -> ToolOutput {
-    ToolOutput::Failure {
-        error: ToolError {
-            code: "approval_required".to_string(),
-            message: reason,
-            retryable: false,
-        },
-        extensions: BTreeMap::new(),
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolRegistrationError {
-    EmptyName,
-    DuplicateTool { name: String },
+    InvalidDefinition {
+        name: String,
+        source: ToolDefinitionError,
+    },
+    DuplicateTool {
+        name: String,
+    },
 }
 
 impl fmt::Display for ToolRegistrationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EmptyName => write!(formatter, "tool name must not be empty"),
+            Self::InvalidDefinition { name, source } => {
+                write!(formatter, "invalid tool '{name}': {source}")
+            }
             Self::DuplicateTool { name } => {
                 write!(formatter, "tool '{name}' is already registered")
             }
@@ -220,4 +281,11 @@ impl fmt::Display for ToolRegistrationError {
     }
 }
 
-impl Error for ToolRegistrationError {}
+impl Error for ToolRegistrationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidDefinition { source, .. } => Some(source),
+            Self::DuplicateTool { .. } => None,
+        }
+    }
+}

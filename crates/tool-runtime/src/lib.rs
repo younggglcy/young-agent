@@ -6,16 +6,16 @@ pub mod manifest;
 pub mod registry;
 
 pub use execution::{
-    ToolCall, ToolCallId, ToolContent, ToolError, ToolExecutionAuthorization, ToolExecutor,
-    ToolOutput, ToolResult,
+    PreparedToolCall, ToolCall, ToolCallId, ToolContent, ToolDispatcher, ToolError,
+    ToolExecutionAuthorization, ToolHandler, ToolOutput, ToolResult,
 };
-pub use fake::FakeToolExecutor;
+pub use fake::{FakeToolDispatcher, FakeToolHandler};
 pub use manifest::{
     CapabilityManifest, CapabilityManifestError, CapabilityMetadata, ManifestTool, ToolSafetyClass,
 };
 pub use registry::{
-    CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition, ToolRegistrationError,
-    ToolRuntime,
+    CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition, ToolDefinitionError,
+    ToolRegistrationError, ToolRuntime,
 };
 
 #[cfg(test)]

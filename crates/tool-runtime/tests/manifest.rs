@@ -43,7 +43,9 @@ protocol_version = "reserved"
     assert_eq!(manifest.tools[0].safety_class, ToolSafetyClass::AlwaysAllow);
     assert_eq!(manifest.tools[0].input_schema["type"], json!("object"));
 
-    let definitions = manifest.tool_definitions();
+    let definitions = manifest
+        .tool_definitions()
+        .expect("loaded manifest produces valid definitions");
     assert_eq!(definitions.len(), 1);
     assert_eq!(definitions[0].name, "read_file");
     assert_eq!(definitions[0].capability.id, "coding");
@@ -119,7 +121,7 @@ input_schema = { type = "object" }
     assert!(
         error
             .to_string()
-            .contains("tool 'apply_patch' safety_class 'requires_approval' requires safety_reason"),
+            .contains("tool 'apply_patch': approval policy reason must not be empty"),
         "unexpected error: {error}"
     );
 }
@@ -213,7 +215,7 @@ input_schema = "not-an-object"
         (empty_capability_id, "capability.id must not be empty"),
         (
             non_object_schema,
-            "tool 'read_file' input_schema must be a TOML table",
+            "tool 'read_file': input_schema must be an object",
         ),
     ];
 
@@ -224,4 +226,36 @@ input_schema = "not-an-object"
             "expected '{expected}', got '{error}'"
         );
     }
+}
+
+#[test]
+fn direct_deserialization_still_cannot_produce_invalid_tool_definitions() {
+    let source = r#"
+schema_version = 1
+
+[capability]
+id = "coding"
+version = "0.1.0"
+name = "Coding"
+description = "Built-in coding tools."
+
+[[tools]]
+name = "read_file"
+description = "Read one workspace file."
+safety_class = "always_allow"
+input_schema = "not-an-object"
+"#;
+    let manifest: CapabilityManifest =
+        toml::from_str(source).expect("serde shape is syntactically valid");
+
+    let error = manifest
+        .tool_definitions()
+        .expect_err("conversion owns definition validation");
+
+    assert!(
+        error
+            .to_string()
+            .contains("tool 'read_file': input_schema must be an object"),
+        "unexpected error: {error}"
+    );
 }

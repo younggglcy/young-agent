@@ -28,17 +28,18 @@ impl CapabilityManifest {
         manifest.validate_schema_version()?;
         manifest.validate_required_metadata()?;
         manifest.validate_unique_tool_names()?;
-        manifest.validate_safety_reasons()?;
+        manifest.tool_definitions()?;
         Ok(manifest)
     }
 
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+    pub fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, CapabilityManifestError> {
         let capability = CapabilityRef {
             id: self.capability.id.clone(),
             version: self.capability.version.clone(),
         };
 
-        self.tools
+        let definitions = self
+            .tools
             .iter()
             .map(|tool| ToolDefinition {
                 name: tool.name.clone(),
@@ -49,7 +50,15 @@ impl CapabilityManifest {
                 approval_policy: tool.approval_policy(),
                 mcp: tool.mcp.clone(),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        for definition in &definitions {
+            definition
+                .validate()
+                .map_err(|error| CapabilityManifestError::Invalid {
+                    message: format!("tool '{}': {error}", definition.name),
+                })?;
+        }
+        Ok(definitions)
     }
 
     fn validate_schema_version(&self) -> Result<(), CapabilityManifestError> {
@@ -65,8 +74,6 @@ impl CapabilityManifest {
     }
 
     fn validate_required_metadata(&self) -> Result<(), CapabilityManifestError> {
-        require_non_empty("capability.id", &self.capability.id)?;
-        require_non_empty("capability.version", &self.capability.version)?;
         require_non_empty("capability.name", &self.capability.name)?;
         require_non_empty("capability.description", &self.capability.description)?;
         if self.tools.is_empty() {
@@ -75,38 +82,6 @@ impl CapabilityManifest {
             });
         }
 
-        for tool in &self.tools {
-            require_non_empty("tool.name", &tool.name)?;
-            require_non_empty(
-                &format!("tool '{}'.description", tool.name),
-                &tool.description,
-            )?;
-            if !tool.input_schema.is_object() {
-                return Err(CapabilityManifestError::Invalid {
-                    message: format!("tool '{}' input_schema must be a TOML table", tool.name),
-                });
-            }
-            if tool
-                .output_schema
-                .as_ref()
-                .is_some_and(|schema| !schema.is_object())
-            {
-                return Err(CapabilityManifestError::Invalid {
-                    message: format!("tool '{}' output_schema must be a TOML table", tool.name),
-                });
-            }
-            if let Some(mcp) = &tool.mcp {
-                require_non_empty(&format!("tool '{}'.mcp.server", tool.name), &mcp.server)?;
-                require_non_empty(
-                    &format!("tool '{}'.mcp.tool_name", tool.name),
-                    &mcp.tool_name,
-                )?;
-                require_non_empty(
-                    &format!("tool '{}'.mcp.protocol_version", tool.name),
-                    &mcp.protocol_version,
-                )?;
-            }
-        }
         Ok(())
     }
 
@@ -116,35 +91,6 @@ impl CapabilityManifest {
             if !names.insert(tool.name.as_str()) {
                 return Err(CapabilityManifestError::Invalid {
                     message: format!("duplicate tool name '{}'", tool.name),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_safety_reasons(&self) -> Result<(), CapabilityManifestError> {
-        for tool in &self.tools {
-            let needs_reason = matches!(
-                tool.safety_class,
-                ToolSafetyClass::RequiresApproval | ToolSafetyClass::AlwaysReject
-            );
-            let has_reason = tool
-                .safety_reason
-                .as_deref()
-                .is_some_and(|reason| !reason.trim().is_empty());
-            if needs_reason && !has_reason {
-                let safety_class = match tool.safety_class {
-                    ToolSafetyClass::RequiresApproval => "requires_approval",
-                    ToolSafetyClass::AlwaysReject => "always_reject",
-                    ToolSafetyClass::AlwaysAllow | ToolSafetyClass::CallDependent => {
-                        unreachable!("these safety classes need no static reason")
-                    }
-                };
-                return Err(CapabilityManifestError::Invalid {
-                    message: format!(
-                        "tool '{}' safety_class '{safety_class}' requires safety_reason",
-                        tool.name
-                    ),
                 });
             }
         }
@@ -190,16 +136,11 @@ impl ManifestTool {
         match self.safety_class {
             ToolSafetyClass::AlwaysAllow => ToolApprovalPolicy::AlwaysAllow,
             ToolSafetyClass::RequiresApproval => ToolApprovalPolicy::RequiresApproval {
-                reason: self
-                    .safety_reason
-                    .clone()
-                    .unwrap_or_else(|| format!("tool '{}' requires approval", self.name)),
+                reason: self.safety_reason.clone().unwrap_or_default(),
             },
             ToolSafetyClass::CallDependent => ToolApprovalPolicy::CallDependent,
             ToolSafetyClass::AlwaysReject => ToolApprovalPolicy::AlwaysReject {
-                reason: self.safety_reason.clone().unwrap_or_else(|| {
-                    format!("tool '{}' is rejected by its safety policy", self.name)
-                }),
+                reason: self.safety_reason.clone().unwrap_or_default(),
             },
         }
     }

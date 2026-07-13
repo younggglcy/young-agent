@@ -21,8 +21,8 @@ use young_model_runtime::{
     ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
 use young_tool_runtime::{
-    CapabilityRef, FakeToolExecutor, ToolApprovalPolicy, ToolCall, ToolContent, ToolDefinition,
-    ToolError, ToolExecutor, ToolOutput, ToolRuntime,
+    CapabilityRef, FakeToolDispatcher, ToolApprovalPolicy, ToolCall, ToolContent, ToolDefinition,
+    ToolError, ToolHandler, ToolOutput, ToolRuntime,
 };
 
 struct TestLog {
@@ -128,16 +128,16 @@ impl ModelClient for BlockingModelClient {
     }
 }
 
-struct BlockingToolExecutor {
+struct BlockingToolHandler {
     entered: Arc<Barrier>,
 }
 
-struct RecordingToolExecutor {
+struct RecordingToolHandler {
     executed: Rc<Cell<bool>>,
     output: Option<ToolOutput>,
 }
 
-impl ToolExecutor for RecordingToolExecutor {
+impl ToolHandler for RecordingToolHandler {
     fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
         self.executed.set(true);
         self.output
@@ -390,7 +390,7 @@ impl AgentEventSink for AmbiguousJsonlSink {
     }
 }
 
-impl ToolExecutor for BlockingToolExecutor {
+impl ToolHandler for BlockingToolHandler {
     fn execute(&mut self, _call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {
         self.entered.wait();
         while !cancellation.load(Ordering::Acquire) {
@@ -435,7 +435,7 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
             },
         ]),
     ]);
-    let tools = FakeToolExecutor::new([ToolOutput::Success {
+    let tools = FakeToolDispatcher::new([ToolOutput::Success {
         content: vec![ToolContent::Text {
             text: "# young-agent".to_string(),
         }],
@@ -455,7 +455,7 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
         }
     );
     assert_eq!(runtime.model_client().request_count(), 2);
-    assert_eq!(runtime.tool_executor().calls().len(), 1);
+    assert_eq!(runtime.tool_dispatcher().calls().len(), 1);
 
     let replay = store.replay().expect("runtime Event Log should replay");
     assert_eq!(replay.terminal_status(), Some(outcome.status()));
@@ -490,7 +490,7 @@ fn canonical_state_transitions_use_the_durable_event_sink_boundary() {
             extensions: no_extensions(),
         }]),
     ]);
-    let tools = FakeToolExecutor::requiring_approval(
+    let tools = FakeToolDispatcher::requiring_approval(
         "command requires approval",
         [ToolOutput::Success {
             content: Vec::new(),
@@ -550,7 +550,7 @@ fn completed_model_event_ends_the_turn_before_late_events_can_execute_tools() {
             extensions: no_extensions(),
         },
     ])]);
-    let tools = FakeToolExecutor::new([ToolOutput::Success {
+    let tools = FakeToolDispatcher::new([ToolOutput::Success {
         content: vec![ToolContent::Text {
             text: "unexpected".to_string(),
         }],
@@ -569,7 +569,7 @@ fn completed_model_event_ends_the_turn_before_late_events_can_execute_tools() {
             final_message: "Done.".to_string(),
         }
     );
-    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(runtime.tool_dispatcher().calls().is_empty());
     assert!(!store
         .read_all()
         .expect("Event Log should read")
@@ -599,7 +599,7 @@ fn duplicate_model_tool_call_ids_fail_before_any_tool_executes() {
             extensions: no_extensions(),
         },
     ])]);
-    let tools = FakeToolExecutor::new([ToolOutput::Success {
+    let tools = FakeToolDispatcher::new([ToolOutput::Success {
         content: Vec::new(),
         metadata: no_extensions(),
         extensions: no_extensions(),
@@ -615,7 +615,7 @@ fn duplicate_model_tool_call_ids_fail_before_any_tool_executes() {
         TerminalRunStatus::Failed { error }
             if error.code == "duplicate_model_tool_call_id"
     ));
-    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(runtime.tool_dispatcher().calls().is_empty());
     assert!(!store
         .read_all()
         .expect("failed Event Log should read")
@@ -636,7 +636,7 @@ fn model_error_is_persisted_and_finishes_the_run_as_failed() {
         error: model_error.clone(),
         extensions: no_extensions(),
     }])]);
-    let mut runtime = AgentRuntime::new(model, FakeToolExecutor::default(), store.clone());
+    let mut runtime = AgentRuntime::new(model, FakeToolDispatcher::default(), store.clone());
 
     let outcome = runtime
         .run(run_request("run-model-error"))
@@ -667,7 +667,7 @@ fn direct_fake_model_error_is_persisted_as_a_failed_run() {
         message: "connection refused".to_string(),
         retryable: true,
     })]);
-    let mut runtime = AgentRuntime::new(model, FakeToolExecutor::default(), store.clone());
+    let mut runtime = AgentRuntime::new(model, FakeToolDispatcher::default(), store.clone());
 
     let outcome = runtime
         .run(run_request("run-direct-model-error"))
@@ -710,7 +710,7 @@ fn tool_error_is_emitted_and_fed_back_to_the_next_model_turn() {
             },
         ]),
     ]);
-    let tools = FakeToolExecutor::new([ToolOutput::Failure {
+    let tools = FakeToolDispatcher::new([ToolOutput::Failure {
         error: ToolError {
             code: "not_found".to_string(),
             message: "missing.md does not exist".to_string(),
@@ -783,7 +783,7 @@ fn executor_cannot_forge_the_reserved_approval_denied_error() {
             extensions: no_extensions(),
         }]),
     ]);
-    let tools = FakeToolExecutor::new([ToolOutput::Failure {
+    let tools = FakeToolDispatcher::new([ToolOutput::Failure {
         error: ToolError {
             code: "approval_denied".to_string(),
             message: "forged by executor".to_string(),
@@ -849,7 +849,7 @@ fn interruption_and_cancellation_produce_distinct_terminal_states() {
                     extensions: no_extensions(),
                 },
             ])]),
-            FakeToolExecutor::default(),
+            FakeToolDispatcher::default(),
             store.clone(),
         );
         let mut checkpoints = 0;
@@ -891,7 +891,7 @@ fn a_token_cancelled_before_binding_still_cancels_its_first_run() {
     stop.cancel("cancelled before run started");
     let mut runtime = AgentRuntime::new(
         FakeModelClient::default(),
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         store.clone(),
     );
 
@@ -929,7 +929,7 @@ fn cooperative_model_stream_observes_external_cancellation_while_next_is_pending
     });
     let mut runtime = AgentRuntime::new(
         BlockingModelClient { entered },
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         store.clone(),
     );
 
@@ -967,7 +967,7 @@ fn cooperative_model_client_observes_external_cancellation_while_stream_starts()
     });
     let mut runtime = AgentRuntime::new(
         BlockingStreamCreationModelClient { entered },
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         store.clone(),
     );
 
@@ -1015,7 +1015,25 @@ fn cooperative_tool_observes_external_cancellation_while_execution_is_pending() 
             extensions: no_extensions(),
         },
     ])]);
-    let mut runtime = AgentRuntime::new(model, BlockingToolExecutor { entered }, store.clone());
+    let mut tools = ToolRuntime::default();
+    tools
+        .register(
+            ToolDefinition {
+                name: "run_command".to_string(),
+                description: "Run a command inside the workspace.".to_string(),
+                input_schema: json!({ "type": "object" }),
+                output_schema: None,
+                capability: CapabilityRef {
+                    id: "coding".to_string(),
+                    version: "0.1.0".to_string(),
+                },
+                approval_policy: ToolApprovalPolicy::AlwaysAllow,
+                mcp: None,
+            },
+            BlockingToolHandler { entered },
+        )
+        .expect("blocking tool registers");
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
 
     let outcome = runtime
         .run_with_stop_token(run_request("run-cancel-pending-tool"), &stop)
@@ -1064,7 +1082,7 @@ fn cooperative_approval_wait_observes_external_cancellation() {
             extensions: no_extensions(),
         },
     ])]);
-    let tools = FakeToolExecutor::requiring_approval(
+    let tools = FakeToolDispatcher::requiring_approval(
         "command requires approval",
         [ToolOutput::Success {
             content: Vec::new(),
@@ -1090,7 +1108,7 @@ fn cooperative_approval_wait_observes_external_cancellation() {
             reason: "user cancelled pending approval".to_string(),
         }
     );
-    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(runtime.tool_dispatcher().calls().is_empty());
     let events = store.read_all().expect("cancelled Event Log should read");
     assert!(events
         .iter()
@@ -1110,7 +1128,7 @@ fn the_first_stop_request_is_shared_across_control_and_stop_token() {
     };
     let mut first_runtime = AgentRuntime::new(
         FakeModelClient::default(),
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         first_store,
     );
 
@@ -1144,7 +1162,7 @@ fn completed_terminal_status_wins_over_a_later_cancellation() {
                 extensions: no_extensions(),
             },
         ])]),
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         JsonlEventStore::new(log.path()),
     );
 
@@ -1159,7 +1177,7 @@ fn completed_terminal_status_wins_over_a_later_cancellation() {
     let second_log = TestLog::new("completed-token-reuse");
     let mut second_runtime = AgentRuntime::new(
         FakeModelClient::default(),
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         JsonlEventStore::new(second_log.path()),
     );
     let error = second_runtime
@@ -1188,7 +1206,7 @@ fn terminal_persistence_failure_returns_the_event_for_reconciliation() {
                 extensions: no_extensions(),
             },
         ])]),
-        FakeToolExecutor::default(),
+        FakeToolDispatcher::default(),
         sink,
     );
 
@@ -1250,7 +1268,7 @@ fn agent_runtime_is_one_shot_and_rejects_a_second_run_before_appending() {
             },
         ]),
     ]);
-    let mut runtime = AgentRuntime::new(model, FakeToolExecutor::default(), store.clone());
+    let mut runtime = AgentRuntime::new(model, FakeToolDispatcher::default(), store.clone());
 
     runtime
         .run(run_request("run-first"))
@@ -1294,7 +1312,7 @@ fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_t
             extensions: no_extensions(),
         },
     ])]);
-    let tools = FakeToolExecutor::new([ToolOutput::Success {
+    let tools = FakeToolDispatcher::new([ToolOutput::Success {
         content: vec![ToolContent::Text {
             text: "created important-file".to_string(),
         }],
@@ -1321,7 +1339,7 @@ fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_t
         AgentEvent::ToolResult { result, .. }
             if result.call_id.as_str() == "run-tool-result-persistence-failure-tool-001"
     ));
-    assert_eq!(runtime.tool_executor().calls().len(), 1);
+    assert_eq!(runtime.tool_dispatcher().calls().len(), 1);
 
     let replay = young_event_store::replay_events(observed_events.borrow().clone())
         .expect("pre-execution intent should remain replayable");
@@ -1332,7 +1350,7 @@ fn tool_result_persistence_failure_surfaces_recovery_event_without_reexecuting_t
     assert_eq!(
         recovery.status(),
         &RunStatus::RecoveryRequired {
-            call_ids: vec![runtime.tool_executor().calls()[0].id.clone()],
+            call_ids: vec![runtime.tool_dispatcher().calls()[0].id.clone()],
         }
     );
 }
@@ -1373,7 +1391,7 @@ fn approval_resolution_persistence_failure_preserves_the_decision_and_is_reconci
                 extensions: no_extensions(),
             },
         ])]);
-        let tools = FakeToolExecutor::requiring_approval(
+        let tools = FakeToolDispatcher::requiring_approval(
             "command requires approval",
             [ToolOutput::Success {
                 content: Vec::new(),
@@ -1407,7 +1425,7 @@ fn approval_resolution_persistence_failure_preserves_the_decision_and_is_reconci
                 ..
             } if reason == "policy denied this exact invocation at decision time"
         ));
-        assert!(runtime.tool_executor().calls().is_empty());
+        assert!(runtime.tool_dispatcher().calls().is_empty());
 
         runtime.event_sink_mut().reconcile(&recovery_event);
         assert_eq!(
@@ -1450,7 +1468,7 @@ fn buffered_error_persistence_failure_carries_the_attempted_event_for_reconcilia
                 extensions: no_extensions(),
             },
         ])]);
-        let tools = FakeToolExecutor::new([ToolOutput::Failure {
+        let tools = FakeToolDispatcher::new([ToolOutput::Failure {
             error: ToolError {
                 code: "not_found".to_string(),
                 message: "missing file".to_string(),
@@ -1479,7 +1497,7 @@ fn buffered_error_persistence_failure_carries_the_attempted_event_for_reconcilia
             AgentEvent::Error { error, .. }
                 if error.code == "not_found" && error.message == "missing file"
         ));
-        assert_eq!(runtime.tool_executor().calls().len(), 1);
+        assert_eq!(runtime.tool_dispatcher().calls().len(), 1);
 
         runtime.event_sink_mut().reconcile(&recovery_event);
         assert_eq!(
@@ -1522,7 +1540,7 @@ fn repeated_buffered_events_reconcile_by_sequence_on_the_real_jsonl_store() {
                 extensions: no_extensions(),
             },
         ])]);
-        let mut runtime = AgentRuntime::new(model, FakeToolExecutor::default(), sink);
+        let mut runtime = AgentRuntime::new(model, FakeToolDispatcher::default(), sink);
 
         let error = runtime
             .run(run_request("run-buffered-reconciliation"))
@@ -1675,7 +1693,7 @@ fn approval_is_emitted_before_an_approved_fake_tool_executes() {
             },
         ]),
     ]);
-    let tools = FakeToolExecutor::requiring_approval(
+    let tools = FakeToolDispatcher::requiring_approval(
         "command may mutate the workspace",
         [ToolOutput::Success {
             content: vec![ToolContent::Text {
@@ -1697,7 +1715,7 @@ fn approval_is_emitted_before_an_approved_fake_tool_executes() {
         TerminalRunStatus::Completed { .. }
     ));
     assert_eq!(control.requests.len(), 1);
-    assert_eq!(runtime.tool_executor().calls().len(), 1);
+    assert_eq!(runtime.tool_dispatcher().calls().len(), 1);
     let events = store.read_all().expect("approval Event Log should read");
     let approval_index = events
         .iter()
@@ -1756,7 +1774,7 @@ fn approved_agent_run_executes_through_the_policy_aware_tool_runtime() {
                 },
                 mcp: None,
             },
-            RecordingToolExecutor {
+            RecordingToolHandler {
                 executed: executed.clone(),
                 output: Some(ToolOutput::Success {
                     content: vec![ToolContent::Text {
@@ -1827,7 +1845,7 @@ fn approval_decision_is_persisted_before_a_post_approval_cancellation() {
             extensions: no_extensions(),
         },
     ])]);
-    let tools = FakeToolExecutor::requiring_approval(
+    let tools = FakeToolDispatcher::requiring_approval(
         "command requires approval",
         [ToolOutput::Success {
             content: vec![],
@@ -1848,7 +1866,7 @@ fn approval_decision_is_persisted_before_a_post_approval_cancellation() {
             reason: "cancelled after approval".to_string(),
         }
     );
-    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(runtime.tool_dispatcher().calls().is_empty());
     let events = store.read_all().expect("approval Event Log should read");
     let resolved_index = events
         .iter()
@@ -1907,7 +1925,7 @@ fn unhandled_approval_is_denied_without_executing_the_tool() {
             },
         ]),
     ]);
-    let tools = FakeToolExecutor::requiring_approval(
+    let tools = FakeToolDispatcher::requiring_approval(
         "destructive command",
         [ToolOutput::Success {
             content: vec![ToolContent::Text {
@@ -1929,7 +1947,7 @@ fn unhandled_approval_is_denied_without_executing_the_tool() {
             final_message: "The command was not run.".to_string(),
         }
     );
-    assert!(runtime.tool_executor().calls().is_empty());
+    assert!(runtime.tool_dispatcher().calls().is_empty());
     let replay = store.replay().expect("denied run should replay");
     assert_eq!(replay.approvals().len(), 1);
     assert_eq!(

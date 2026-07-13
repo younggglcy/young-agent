@@ -41,7 +41,7 @@ pub enum ToolExecutionAuthorization {
 }
 
 impl ToolExecutionAuthorization {
-    pub(crate) fn is_granted_for(&self, call: &ToolCall) -> bool {
+    fn is_granted_for(&self, call: &ToolCall) -> bool {
         matches!(
             self,
             Self::ApprovalGranted { call_id } if call_id == &call.id
@@ -49,13 +49,88 @@ impl ToolExecutionAuthorization {
     }
 }
 
-/// Execution boundary consumed by the Agent Runtime. Tool lookup, policy, and
-/// concrete implementations remain owned by the Tool Runtime.
-///
-/// This synchronous trait is an intentionally unstable first-phase proof
-/// boundary for deterministic fake tools. Long-lived or remote tool execution
-/// should move this seam to an async future before it becomes a stable API.
-pub trait ToolExecutor {
+/// Immutable result of one Tool Runtime lookup and policy classification.
+/// The plan owns the exact call so approval display and execution cannot drift
+/// to different arguments or invocation ids.
+#[derive(Debug, PartialEq)]
+pub struct PreparedToolCall {
+    call: ToolCall,
+    disposition: ToolExecutionDisposition,
+}
+
+#[derive(Debug, PartialEq)]
+enum ToolExecutionDisposition {
+    Ready,
+    RequiresApproval { reason: String },
+    Reject { error: ToolError },
+}
+
+impl PreparedToolCall {
+    pub(crate) fn ready(call: ToolCall) -> Self {
+        Self {
+            call,
+            disposition: ToolExecutionDisposition::Ready,
+        }
+    }
+
+    pub(crate) fn requiring_approval(call: ToolCall, reason: impl Into<String>) -> Self {
+        Self {
+            call,
+            disposition: ToolExecutionDisposition::RequiresApproval {
+                reason: reason.into(),
+            },
+        }
+    }
+
+    pub(crate) fn rejected(call: ToolCall, error: ToolError) -> Self {
+        Self {
+            call,
+            disposition: ToolExecutionDisposition::Reject { error },
+        }
+    }
+
+    pub fn call(&self) -> &ToolCall {
+        &self.call
+    }
+
+    pub fn approval_reason(&self) -> Option<&str> {
+        match &self.disposition {
+            ToolExecutionDisposition::RequiresApproval { reason } => Some(reason),
+            ToolExecutionDisposition::Ready | ToolExecutionDisposition::Reject { .. } => None,
+        }
+    }
+
+    /// Consumes this exact plan and validates the Agent Runtime's decision.
+    pub(crate) fn into_authorized_call(
+        self,
+        authorization: ToolExecutionAuthorization,
+    ) -> Result<ToolCall, ToolOutput> {
+        match self.disposition {
+            ToolExecutionDisposition::Ready => Ok(self.call),
+            ToolExecutionDisposition::RequiresApproval { .. }
+                if authorization.is_granted_for(&self.call) =>
+            {
+                Ok(self.call)
+            }
+            ToolExecutionDisposition::RequiresApproval { reason } => Err(ToolOutput::Failure {
+                error: ToolError {
+                    code: "approval_required".to_string(),
+                    message: reason,
+                    retryable: false,
+                },
+                extensions: BTreeMap::new(),
+            }),
+            ToolExecutionDisposition::Reject { error } => Err(ToolOutput::Failure {
+                error,
+                extensions: BTreeMap::new(),
+            }),
+        }
+    }
+}
+
+/// Internal seam implemented by one concrete registered tool adapter.
+pub trait ToolHandler {
+    /// Classifies a call only when its definition uses a call-dependent policy.
     fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
         None
     }
@@ -63,22 +138,28 @@ pub trait ToolExecutor {
     /// Executes one invocation. Implementations that can block on external
     /// work must observe `cancellation` and return promptly once it is set;
     /// cancellation is cooperative, not forced.
-    /// Returns only the tool-owned output. The Agent Runtime attaches the
-    /// kernel-owned `ToolCall.id`, so executors cannot forge result correlation.
     fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput;
+}
 
-    /// Executes after the Agent Runtime has resolved any approval request.
-    /// Leaf executors normally inherit this implementation; policy-aware
-    /// dispatchers override it to validate the authorization before invoking
-    /// a registered executor.
-    fn execute_authorized(
+/// External seam consumed by the Agent Runtime. Lookup, policy classification,
+/// authorization enforcement, and handler dispatch stay behind this interface.
+///
+/// This synchronous trait is an intentionally unstable first-phase proof
+/// seam for deterministic fake dispatchers. Long-lived or remote tool execution
+/// should move this seam to an async future before it becomes a stable API.
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
+pub trait ToolDispatcher: sealed::Sealed {
+    fn prepare(&self, call: ToolCall) -> PreparedToolCall;
+
+    fn execute_prepared(
         &mut self,
-        call: &ToolCall,
-        _authorization: ToolExecutionAuthorization,
+        prepared: PreparedToolCall,
+        authorization: ToolExecutionAuthorization,
         cancellation: Arc<AtomicBool>,
-    ) -> ToolOutput {
-        self.execute(call, cancellation)
-    }
+    ) -> ToolOutput;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -121,7 +202,7 @@ pub enum ToolContent {
 #[serde(deny_unknown_fields)]
 pub struct ToolError {
     /// `approval_denied` is reserved for the Agent Runtime's canonical denial
-    /// result and must not be returned by a ToolExecutor.
+    /// result and must not be returned by a ToolHandler.
     pub code: String,
     pub message: String,
     /// Whether retrying the same low-level tool call is expected to help.

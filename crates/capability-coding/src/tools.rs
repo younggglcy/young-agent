@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use young_tool_runtime::{
-    CapabilityManifestError, ToolCall, ToolError, ToolExecutor, ToolOutput, ToolRegistrationError,
+    CapabilityManifestError, ToolCall, ToolError, ToolHandler, ToolOutput, ToolRegistrationError,
     ToolRuntime,
 };
 
@@ -14,9 +14,10 @@ use crate::manifest::coding_manifest;
 pub fn register_builtin_coding_capability(
     runtime: &mut ToolRuntime,
 ) -> Result<(), CodingCapabilityRegistrationError> {
-    let definitions = coding_manifest()
-        .map_err(CodingCapabilityRegistrationError::Manifest)?
-        .tool_definitions();
+    let manifest = coding_manifest().map_err(CodingCapabilityRegistrationError::Manifest)?;
+    let definitions = manifest
+        .tool_definitions()
+        .map_err(CodingCapabilityRegistrationError::Manifest)?;
 
     // Preflight the complete built-in pack so a duplicate cannot leave a
     // partially registered capability behind.
@@ -43,7 +44,7 @@ struct UnimplementedCodingTool {
     tool_name: String,
 }
 
-impl ToolExecutor for UnimplementedCodingTool {
+impl ToolHandler for UnimplementedCodingTool {
     fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
         ToolOutput::Failure {
             error: ToolError {
