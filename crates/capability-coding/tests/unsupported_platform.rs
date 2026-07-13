@@ -67,6 +67,42 @@ fn existing_file_patch_fails_closed_when_metadata_validation_is_unsupported() {
     );
 }
 
+#[test]
+fn new_file_patch_fails_before_creating_staging_on_unsupported_platforms() {
+    let root = TestWorkspace::new();
+    let workspace = CodingWorkspace::resolve(&root.0).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("unsupported-new-file-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\n"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("unsupported new-file patch must fail closed");
+    };
+    assert_eq!(error.code, "unsupported_file_metadata");
+    assert!(!root.0.join("created.txt").exists());
+    assert!(std::fs::read_dir(&root.0).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".young-agent-patch-")
+    }));
+}
+
 #[cfg(not(unix))]
 #[test]
 fn command_fails_closed_without_handle_bound_working_directories() {

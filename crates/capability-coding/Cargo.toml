@@ -6,8 +6,10 @@ repository.workspace = true
 description = "Built-in Coding Capability boundary for the Agent Kernel."
 
 [dependencies]
+blake3.workspace = true
 cap-std.workspace = true
 command-group.workspace = true
+getrandom.workspace = true
 serde_json.workspace = true
 young-tool-runtime = { path = "../tool-runtime" }
 

@@ -246,6 +246,24 @@ fn search_file(
         }
         let remaining_bytes = MAX_SEARCH_BYTES.saturating_sub(results.bytes_searched);
         if remaining_bytes == 0 {
+            let mut probe = [0u8; 1];
+            let bytes_read = file.read(&mut probe).map_err(|source| {
+                failure(
+                    "workspace_io_error",
+                    format!("failed to search '{display_path}': {source}"),
+                    source.kind() == std::io::ErrorKind::Interrupted,
+                )
+            })?;
+            if bytes_read == 0 {
+                return finish_search_file(
+                    display_path,
+                    line_number,
+                    &line,
+                    &utf8,
+                    checkpoint,
+                    results,
+                );
+            }
             results.truncated = true;
             results.limit_reached = true;
             return Ok(());
@@ -259,14 +277,14 @@ fn search_file(
             )
         })?;
         if bytes_read == 0 {
-            if !utf8.finish() {
-                results.discard_binary_file(checkpoint);
-                return Ok(());
-            }
-            if line.bytes_seen > 0 {
-                finish_line(display_path, line_number, &line, results)?;
-            }
-            return Ok(());
+            return finish_search_file(
+                display_path,
+                line_number,
+                &line,
+                &utf8,
+                checkpoint,
+                results,
+            );
         }
         results.bytes_searched = results.bytes_searched.saturating_add(bytes_read as u64);
         if !utf8.feed(&buffer[..bytes_read]) {
@@ -288,6 +306,24 @@ fn search_file(
         }
         line.feed(&buffer[start..bytes_read], pattern);
     }
+}
+
+fn finish_search_file(
+    display_path: &str,
+    line_number: u64,
+    line: &LineState,
+    utf8: &Utf8Validator,
+    checkpoint: SearchCheckpoint,
+    results: &mut SearchResults,
+) -> Result<(), ToolOutput> {
+    if !utf8.finish() {
+        results.discard_binary_file(checkpoint);
+        return Ok(());
+    }
+    if line.bytes_seen > 0 {
+        finish_line(display_path, line_number, line, results)?;
+    }
+    Ok(())
 }
 
 fn finish_line(

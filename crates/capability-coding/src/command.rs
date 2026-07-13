@@ -26,7 +26,7 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[cfg(all(test, unix))]
 thread_local! {
-    static INJECT_NEXT_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_GROUP_KILL_WRAPPER_FAILURE: Cell<bool> = const { Cell::new(false) };
     static INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -160,6 +160,7 @@ fn run_shell_command(
     let mut status = None;
     let mut exited_at = None;
     let mut output_incomplete = false;
+    let mut background_process = false;
     let mut cancelled = false;
     let mut forced_at = None;
 
@@ -190,7 +191,18 @@ fn run_shell_command(
                 }
             }
 
-            if status.is_some() && streams_done == 2 {
+            if status.is_some()
+                && !cancelled
+                && !background_process
+                && forced_at.is_none()
+                && process_group_exists(&child)?
+            {
+                background_process = true;
+                terminate_command_group(&mut child)?;
+                forced_at = Some(Instant::now());
+            }
+
+            if status.is_some() && streams_done == 2 && !background_process {
                 return Ok(());
             }
             if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
@@ -227,6 +239,12 @@ fn run_shell_command(
     if cancelled {
         return Err(CommandError::Cancelled);
     }
+    if background_process {
+        return Err(CommandError::BackgroundProcess);
+    }
+    if output_incomplete {
+        return Err(CommandError::OutputIncomplete);
+    }
     let status = status.expect("loop only exits after the child exits");
     Ok(CommandOutcome {
         status,
@@ -242,20 +260,110 @@ fn run_shell_command(
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
     #[cfg(all(test, unix))]
-    if INJECT_NEXT_KILL_FAILURE.with(|failure| failure.replace(false)) {
-        return Err(CommandError::Kill(std::io::Error::new(
+    let injected_failure = INJECT_GROUP_KILL_WRAPPER_FAILURE.with(Cell::get);
+    #[cfg(not(all(test, unix)))]
+    let injected_failure = false;
+    let wrapper_result = if injected_failure {
+        Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "injected process-control failure",
-        )));
+            "injected persistent command-group wrapper failure",
+        ))
+    } else {
+        loop {
+            match child.kill() {
+                Ok(()) => break Ok(()),
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(source) if group_already_exited(&source) => break Ok(()),
+                Err(source) => break Err(source),
+            }
+        }
+    };
+    if wrapper_result.is_ok() {
+        return Ok(());
     }
+
+    #[cfg(unix)]
+    {
+        let fallback = kill_process_group_by_id(child.id());
+        #[cfg(all(test, unix))]
+        INJECT_GROUP_KILL_WRAPPER_FAILURE.with(|failure| failure.set(false));
+        fallback.map_err(|fallback| {
+            let wrapper = wrapper_result.expect_err("wrapper failure was checked above");
+            CommandError::Kill(std::io::Error::new(
+                fallback.kind(),
+                format!(
+                    "command-group wrapper failed ({wrapper}); direct process-group termination also failed ({fallback})"
+                ),
+            ))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Err(CommandError::Kill(
+            wrapper_result.expect_err("wrapper failure was checked above"),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn process_group_id(child: &GroupChild) -> Result<rustix::process::Pid, CommandError> {
+    let raw = i32::try_from(child.id()).map_err(|_| {
+        CommandError::Kill(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id does not fit in i32",
+        ))
+    })?;
+    rustix::process::Pid::from_raw(raw).ok_or_else(|| {
+        CommandError::Kill(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id was zero",
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn kill_process_group_by_id(id: u32) -> std::io::Result<()> {
+    let raw = i32::try_from(id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id does not fit in i32",
+        )
+    })?;
+    let pid = rustix::process::Pid::from_raw(raw).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id was zero",
+        )
+    })?;
     loop {
-        match child.kill() {
+        match rustix::process::kill_process_group(pid, rustix::process::Signal::KILL) {
             Ok(()) => return Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(source) if group_already_exited(&source) => return Ok(()),
-            Err(source) => return Err(CommandError::Kill(source)),
+            Err(source) if source == rustix::io::Errno::INTR => continue,
+            Err(source) if source == rustix::io::Errno::SRCH => return Ok(()),
+            Err(source) => return Err(std::io::Error::from(source)),
         }
     }
+}
+
+#[cfg(unix)]
+fn process_group_exists(child: &GroupChild) -> Result<bool, CommandError> {
+    let pid = process_group_id(child)?;
+    loop {
+        match rustix::process::test_kill_process_group(pid) {
+            Ok(()) => return Ok(true),
+            Err(source) if source == rustix::io::Errno::INTR => continue,
+            Err(source) if source == rustix::io::Errno::SRCH => return Ok(false),
+            Err(source) if source == rustix::io::Errno::PERM => return Ok(true),
+            Err(source) => {
+                return Err(CommandError::Kill(std::io::Error::from(source)));
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(_child: &GroupChild) -> Result<bool, CommandError> {
+    Ok(false)
 }
 
 fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandError> {
@@ -493,6 +601,8 @@ pub(crate) enum CommandError {
     ReadOutput(std::io::Error),
     ReaderPanicked,
     Cancelled,
+    BackgroundProcess,
+    OutputIncomplete,
 }
 
 impl CommandError {
@@ -506,6 +616,8 @@ impl CommandError {
             | Self::ReadOutput(_)
             | Self::ReaderPanicked => "command_io_error",
             Self::Cancelled => "tool_cancelled",
+            Self::BackgroundProcess => "background_process_not_supported",
+            Self::OutputIncomplete => "command_output_incomplete",
         }
     }
 
@@ -544,6 +656,11 @@ impl fmt::Display for CommandError {
             }
             Self::ReaderPanicked => formatter.write_str("command output reader panicked"),
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
+            Self::BackgroundProcess => {
+                formatter.write_str("run_command does not support background processes")
+            }
+            Self::OutputIncomplete => formatter
+                .write_str("command output remained open after the command process group exited"),
         }
     }
 }
@@ -556,7 +673,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use super::{
-        run_shell_command, CommandError, INJECT_NEXT_KILL_FAILURE,
+        run_shell_command, CommandError, INJECT_GROUP_KILL_WRAPPER_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
     };
     use crate::workspace::CodingWorkspace;
@@ -579,7 +696,7 @@ mod tests {
             thread::sleep(Duration::from_millis(30));
             trigger_flag.store(true, Ordering::Relaxed);
         });
-        INJECT_NEXT_KILL_FAILURE.with(|failure| failure.set(true));
+        INJECT_GROUP_KILL_WRAPPER_FAILURE.with(|failure| failure.set(true));
         let started = Instant::now();
 
         let result = run_shell_command(
@@ -590,7 +707,7 @@ mod tests {
         );
 
         trigger.join().expect("cancellation trigger finishes");
-        assert!(matches!(result, Err(CommandError::Kill(_))));
+        assert!(matches!(result, Err(CommandError::Cancelled)));
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());

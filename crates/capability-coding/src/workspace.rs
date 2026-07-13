@@ -1,10 +1,10 @@
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
@@ -124,18 +124,18 @@ impl CodingWorkspace {
     pub(crate) fn file_snapshot(file: &File) -> io::Result<FileSnapshot> {
         #[cfg(unix)]
         {
-            use cap_std::fs::MetadataExt as _;
-
-            let metadata = file.metadata()?;
+            let before = file_stat_snapshot(&file.metadata()?);
+            let digest = file_digest(file)?;
+            let after = file_stat_snapshot(&file.metadata()?);
+            if before != after {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "file changed while its content snapshot was being captured",
+                ));
+            }
             Ok(FileSnapshot {
-                device: metadata.dev(),
-                inode: metadata.ino(),
-                size: metadata.size(),
-                modified_seconds: metadata.mtime(),
-                modified_nanoseconds: metadata.mtime_nsec(),
-                uid: metadata.uid(),
-                gid: metadata.gid(),
-                mode: metadata.mode(),
+                stat: after,
+                digest,
             })
         }
         #[cfg(not(unix))]
@@ -184,10 +184,11 @@ impl CodingWorkspace {
         if metadata.snapshot != expected_snapshot {
             return Err(patch_target_changed());
         }
-        let staged = self.stage_content(&directory, content, Some(metadata.clone()))?;
-        self.commit_existing_file(&directory, &staged, Path::new(file_name), metadata)
+        let staged = self.stage_content(&directory, content, Some(&metadata))?;
+        self.commit_existing_file(&directory, staged, Path::new(file_name), metadata)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
         let parent = path
             .parent()
@@ -198,7 +199,15 @@ impl CodingWorkspace {
         })?;
         let directory = self.root_dir.open_dir(parent)?;
         let staged = self.stage_content(&directory, content, None)?;
-        self.commit_new_file(&directory, &staged, Path::new(file_name))
+        self.commit_new_file(&directory, staged, Path::new(file_name))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn create_new(&self, _path: &Path, _content: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace patch commits are not supported on this platform",
+        ))
     }
 
     pub(crate) fn metadata(&self) -> Value {
@@ -253,20 +262,14 @@ impl CodingWorkspace {
         &self,
         directory: &Dir,
         content: &[u8],
-        replacement: Option<ReplacementMetadata>,
+        replacement: Option<&ReplacementMetadata>,
     ) -> io::Result<StagedFile> {
         use std::io::Write;
 
-        static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
-
         for _ in 0..100 {
-            let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-            let candidate = PathBuf::from(format!(
-                ".young-agent-patch-{}-{nonce}.tmp",
-                std::process::id()
-            ));
+            let candidate = random_patch_path("stage")?;
             let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
+            options.read(true).write(true).create_new(true);
             #[cfg(unix)]
             {
                 use cap_std::fs::OpenOptionsExt as _;
@@ -279,7 +282,7 @@ impl CodingWorkspace {
                 Err(source) => return Err(source),
             };
             let result = (|| {
-                if let Some(replacement) = replacement.as_ref() {
+                if let Some(replacement) = replacement {
                     #[cfg(unix)]
                     {
                         use cap_std::fs::MetadataExt as _;
@@ -301,7 +304,7 @@ impl CodingWorkspace {
                 }
                 file.write_all(content)?;
                 file.sync_all()?;
-                if let Some(replacement) = replacement.as_ref() {
+                if let Some(replacement) = replacement {
                     file.set_permissions(replacement.permissions.clone())?;
                     #[cfg(unix)]
                     {
@@ -316,6 +319,7 @@ impl CodingWorkspace {
                     }
                     file.sync_all()?;
                 }
+                validate_security_metadata(&file, "patch staging file")?;
                 Ok(())
             })();
             if let Err(source) = result {
@@ -339,16 +343,16 @@ impl CodingWorkspace {
         ))
     }
 
-    fn commit_new_file(&self, directory: &Dir, staged: &StagedFile, path: &Path) -> io::Result<()> {
-        #[cfg(any(
-            target_vendor = "apple",
-            target_os = "linux",
-            target_os = "android",
-            target_os = "redox"
-        ))]
+    fn commit_new_file(
+        &self,
+        directory: &Dir,
+        mut staged: StagedFile,
+        path: &Path,
+    ) -> io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            if let Err(source) = self.validate_staging_slot(directory, staged) {
-                return cleanup_owned_staging_after_error(directory, staged, source);
+            if let Err(source) = self.validate_staging_slot(directory, &staged) {
+                return cleanup_owned_staging_after_error(directory, &staged, source);
             }
             let result = rustix::fs::renameat_with(
                 directory,
@@ -359,16 +363,21 @@ impl CodingWorkspace {
             )
             .map_err(io::Error::from);
             if let Err(source) = result {
-                return cleanup_owned_staging_after_error(directory, staged, source);
+                return cleanup_owned_staging_after_error(directory, &staged, source);
             }
-            self.validate_installed_staging(directory, path, staged)
+            if let Err(source) = refresh_snapshot_after_rename(
+                &staged.file,
+                &mut staged.snapshot,
+                "patch staging file",
+            ) {
+                return rollback_new_file_commit(directory, &staged, path, source);
+            }
+            if let Err(source) = self.validate_installed_staging(directory, path, &staged) {
+                return rollback_new_file_commit(directory, &staged, path, source);
+            }
+            Ok(())
         }
-        #[cfg(not(any(
-            target_vendor = "apple",
-            target_os = "linux",
-            target_os = "android",
-            target_os = "redox"
-        )))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (directory, staged, path);
             Err(io::Error::new(
@@ -381,62 +390,101 @@ impl CodingWorkspace {
     fn commit_existing_file(
         &self,
         directory: &Dir,
-        staged: &StagedFile,
+        mut staged: StagedFile,
         path: &Path,
-        expected: ReplacementMetadata,
+        mut expected: ReplacementMetadata,
     ) -> io::Result<()> {
-        #[cfg(any(
-            target_vendor = "apple",
-            target_os = "linux",
-            target_os = "android",
-            target_os = "redox"
-        ))]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            if let Err(source) = self.validate_staging_slot(directory, staged) {
-                return cleanup_owned_staging_after_error(directory, staged, source);
+            if let Err(source) = self
+                .validate_staging_slot(directory, &staged)
+                .and_then(|()| validate_replacement_slot(directory, path, &expected))
+            {
+                return cleanup_owned_staging_after_error(directory, &staged, source);
             }
             if let Err(source) = exchange_files(directory, &staged.path, path) {
-                return cleanup_owned_staging_after_error(directory, staged, source);
+                return cleanup_owned_staging_after_error(directory, &staged, source);
+            }
+            if let Err(source) = refresh_snapshot_after_rename(
+                &staged.file,
+                &mut staged.snapshot,
+                "patch staging file",
+            )
+            .and_then(|()| refresh_replacement_after_rename(&mut expected))
+            {
+                return rollback_existing_exchange(
+                    directory,
+                    &staged,
+                    path,
+                    &expected,
+                    &staged.path,
+                    source,
+                );
             }
 
             let validation = self
-                .validate_installed_staging(directory, path, staged)
-                .and_then(|()| self.replacement_metadata(directory, &staged.path))
-                .and_then(|metadata| {
-                    if metadata.matches(&expected) {
-                        Ok(())
-                    } else {
-                        Err(patch_target_changed())
-                    }
-                });
+                .validate_installed_staging(directory, path, &staged)
+                .and_then(|()| validate_replacement_slot(directory, &staged.path, &expected));
             if let Err(source) = validation {
-                return rollback_existing_exchange(directory, staged, path, source);
+                return rollback_existing_exchange(
+                    directory,
+                    &staged,
+                    path,
+                    &expected,
+                    &staged.path,
+                    source,
+                );
             }
 
-            let final_validation = self
-                .validate_installed_staging(directory, path, staged)
-                .and_then(|()| self.replacement_metadata(directory, &staged.path))
-                .and_then(|displaced| {
-                    if displaced.matches(&expected) {
-                        Ok(())
-                    } else {
-                        Err(patch_target_changed())
-                    }
-                });
-            if let Err(source) = final_validation {
-                return rollback_existing_exchange(directory, staged, path, source);
+            let recovery_path = match claim_path(directory, &staged.path, "displaced") {
+                Ok(path) => path,
+                Err(source) => {
+                    return rollback_existing_exchange(
+                        directory,
+                        &staged,
+                        path,
+                        &expected,
+                        &staged.path,
+                        source,
+                    )
+                }
+            };
+            if let Err(source) = refresh_replacement_after_rename(&mut expected) {
+                return rollback_existing_exchange(
+                    directory,
+                    &staged,
+                    path,
+                    &expected,
+                    &recovery_path,
+                    source,
+                );
             }
-            if let Err(source) = directory.remove_file(&staged.path) {
-                return rollback_existing_exchange(directory, staged, path, source);
+            let final_validation = self
+                .validate_installed_staging(directory, path, &staged)
+                .and_then(|()| validate_replacement_slot(directory, &recovery_path, &expected));
+            if let Err(source) = final_validation {
+                return rollback_existing_exchange(
+                    directory,
+                    &staged,
+                    path,
+                    &expected,
+                    &recovery_path,
+                    source,
+                );
+            }
+            if let Err(source) = remove_claimed_replacement(directory, &recovery_path, &expected) {
+                return rollback_existing_exchange(
+                    directory,
+                    &staged,
+                    path,
+                    &expected,
+                    &recovery_path,
+                    source,
+                );
             }
             Ok(())
         }
-        #[cfg(not(any(
-            target_vendor = "apple",
-            target_os = "linux",
-            target_os = "android",
-            target_os = "redox"
-        )))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (directory, staged, path, expected);
             Err(io::Error::new(
@@ -447,9 +495,11 @@ impl CodingWorkspace {
     }
 
     fn validate_staging_slot(&self, directory: &Dir, staged: &StagedFile) -> io::Result<()> {
+        validate_security_metadata(&staged.file, "patch staging file")?;
         let handle_snapshot = Self::file_snapshot(&staged.file)?;
         let (slot, _) =
             require_regular_file(directory.open_with(&staged.path, &regular_file_options())?)?;
+        validate_security_metadata(&slot, "patch staging file")?;
         let slot_snapshot = Self::file_snapshot(&slot)?;
         if handle_snapshot == staged.snapshot && slot_snapshot == staged.snapshot {
             Ok(())
@@ -467,9 +517,11 @@ impl CodingWorkspace {
         path: &Path,
         staged: &StagedFile,
     ) -> io::Result<()> {
+        validate_security_metadata(&staged.file, "patch staging file")?;
         let handle_snapshot = Self::file_snapshot(&staged.file)?;
         let (installed, _) =
             require_regular_file(directory.open_with(path, &regular_file_options())?)?;
+        validate_security_metadata(&installed, "installed patch file")?;
         let installed_snapshot = Self::file_snapshot(&installed)?;
         if handle_snapshot == staged.snapshot && installed_snapshot == staged.snapshot {
             Ok(())
@@ -498,30 +550,17 @@ impl CodingWorkspace {
                     "atomic patch refuses files with multiple hard links",
                 ));
             }
-            if file_has_extended_attributes(&file)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "atomic patch refuses files with extended attributes",
-                ));
+            validate_security_metadata(&file, "atomic patch target")?;
+            let snapshot = Self::file_snapshot(&file)?;
+            let metadata = file.metadata()?;
+            if metadata.nlink() != 1 || file_stat_snapshot(&metadata) != snapshot.stat {
+                return Err(patch_target_changed());
             }
-            if has_extended_acl(&file)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "atomic patch refuses files with an extended ACL",
-                ));
-            }
+            validate_security_metadata(&file, "atomic patch target")?;
             Ok(ReplacementMetadata {
                 permissions: metadata.permissions(),
-                snapshot: FileSnapshot {
-                    device: metadata.dev(),
-                    inode: metadata.ino(),
-                    size: metadata.size(),
-                    modified_seconds: metadata.mtime(),
-                    modified_nanoseconds: metadata.mtime_nsec(),
-                    uid: metadata.uid(),
-                    gid: metadata.gid(),
-                    mode: metadata.mode(),
-                },
+                snapshot,
+                file,
                 uid: metadata.uid(),
                 gid: metadata.gid(),
                 mode: metadata.mode(),
@@ -538,26 +577,16 @@ impl CodingWorkspace {
     }
 }
 
-#[derive(Clone)]
 struct ReplacementMetadata {
     permissions: Permissions,
     snapshot: FileSnapshot,
+    file: File,
     #[cfg(unix)]
     uid: u32,
     #[cfg(unix)]
     gid: u32,
     #[cfg(unix)]
     mode: u32,
-}
-
-#[cfg(unix)]
-impl ReplacementMetadata {
-    fn matches(&self, other: &Self) -> bool {
-        self.snapshot == other.snapshot
-            && self.uid == other.uid
-            && self.gid == other.gid
-            && self.mode == other.mode
-    }
 }
 
 struct StagedFile {
@@ -569,6 +598,15 @@ struct StagedFile {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FileSnapshot {
     #[cfg(unix)]
+    stat: FileStatSnapshot,
+    #[cfg(unix)]
+    digest: [u8; 32],
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStatSnapshot {
+    #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
@@ -579,11 +617,227 @@ pub(crate) struct FileSnapshot {
     #[cfg(unix)]
     modified_nanoseconds: i64,
     #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+    #[cfg(unix)]
     uid: u32,
     #[cfg(unix)]
     gid: u32,
     #[cfg(unix)]
     mode: u32,
+}
+
+#[cfg(unix)]
+fn file_stat_snapshot(metadata: &Metadata) -> FileStatSnapshot {
+    use cap_std::fs::MetadataExt as _;
+
+    FileStatSnapshot {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode(),
+    }
+}
+
+#[cfg(unix)]
+fn file_digest(file: &File) -> io::Result<[u8; 32]> {
+    use cap_std::fs::FileExt as _;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let bytes_read = file.read_at(&mut buffer, offset)?;
+        if bytes_read == 0 {
+            return Ok(*hasher.finalize().as_bytes());
+        }
+        hasher.update(&buffer[..bytes_read]);
+        offset = offset.saturating_add(bytes_read as u64);
+    }
+}
+
+#[cfg(unix)]
+impl FileSnapshot {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.stat.device == other.stat.device && self.stat.inode == other.stat.inode
+    }
+
+    fn same_payload_and_metadata(&self, other: &Self) -> bool {
+        self.digest == other.digest
+            && self.stat.device == other.stat.device
+            && self.stat.inode == other.stat.inode
+            && self.stat.size == other.stat.size
+            && self.stat.modified_seconds == other.stat.modified_seconds
+            && self.stat.modified_nanoseconds == other.stat.modified_nanoseconds
+            && self.stat.uid == other.stat.uid
+            && self.stat.gid == other.stat.gid
+            && self.stat.mode == other.stat.mode
+    }
+}
+
+#[cfg(not(unix))]
+impl FileSnapshot {
+    fn same_identity(&self, _other: &Self) -> bool {
+        false
+    }
+
+    fn same_payload_and_metadata(&self, _other: &Self) -> bool {
+        false
+    }
+}
+
+fn validate_security_metadata(file: &File, subject: &str) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if file_has_extended_attributes(file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{subject} has unsupported extended attributes"),
+            ));
+        }
+        if has_extended_acl(file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("{subject} has an unsupported extended ACL"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, subject);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe patch security metadata validation is not supported on this platform",
+        ))
+    }
+}
+
+fn refresh_snapshot_after_rename(
+    file: &File,
+    snapshot: &mut FileSnapshot,
+    subject: &str,
+) -> io::Result<()> {
+    validate_security_metadata(file, subject)?;
+    let refreshed = CodingWorkspace::file_snapshot(file)?;
+    if !refreshed.same_payload_and_metadata(snapshot) {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{subject} changed during an atomic rename"),
+        ));
+    }
+    *snapshot = refreshed;
+    Ok(())
+}
+
+fn refresh_replacement_after_rename(expected: &mut ReplacementMetadata) -> io::Result<()> {
+    refresh_snapshot_after_rename(
+        &expected.file,
+        &mut expected.snapshot,
+        "atomic patch target",
+    )
+}
+
+fn validate_replacement_slot(
+    directory: &Dir,
+    path: &Path,
+    expected: &ReplacementMetadata,
+) -> io::Result<()> {
+    validate_security_metadata(&expected.file, "atomic patch target")?;
+    if CodingWorkspace::file_snapshot(&expected.file)? != expected.snapshot {
+        return Err(patch_target_changed());
+    }
+    let (slot, metadata) =
+        require_regular_file(directory.open_with(path, &regular_file_options())?)?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic patch refuses files with multiple hard links",
+            ));
+        }
+    }
+    validate_security_metadata(&slot, "atomic patch target")?;
+    if CodingWorkspace::file_snapshot(&slot)? == expected.snapshot {
+        Ok(())
+    } else {
+        Err(patch_target_changed())
+    }
+}
+
+#[cfg(unix)]
+fn random_patch_path(kind: &str) -> io::Result<PathBuf> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|source| io::Error::other(format!("failed to generate patch nonce: {source}")))?;
+    let mut name = format!(".young-agent-patch-{kind}-");
+    for byte in random {
+        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    name.push_str(".tmp");
+    Ok(PathBuf::from(name))
+}
+
+#[cfg(not(unix))]
+fn random_patch_path(_kind: &str) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "secure patch staging names are not supported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn claim_path(directory: &Dir, path: &Path, kind: &str) -> io::Result<PathBuf> {
+    for _ in 0..100 {
+        let claim = random_patch_path(kind)?;
+        match rustix::fs::renameat_with(
+            directory,
+            path,
+            directory,
+            &claim,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => return Ok(claim),
+            Err(source) if io::Error::from(source).kind() == io::ErrorKind::AlreadyExists => {
+                continue
+            }
+            Err(source) => return Err(io::Error::from(source)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique patch recovery path",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn claim_path(_directory: &Dir, _path: &Path, _kind: &str) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic patch recovery is not supported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rename_no_replace(directory: &Dir, from: &Path, to: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        directory,
+        from,
+        directory,
+        to,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(io::Error::from)
 }
 
 fn patch_target_changed() -> io::Error {
@@ -595,20 +849,44 @@ fn patch_target_changed() -> io::Error {
 
 fn cleanup_staging_after_error<T>(
     directory: &Dir,
-    staging_path: &Path,
+    claimed_path: &Path,
+    staging_file: &File,
+    expected: FileSnapshot,
     source: io::Error,
 ) -> io::Result<T> {
-    match directory.remove_file(staging_path) {
+    if !claimed_staging_matches(directory, claimed_path, staging_file, expected)? {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "patch operation failed ({source}); claimed recovery path '{}' did not contain the owned staging file and was preserved",
+                claimed_path.display()
+            ),
+        ));
+    }
+    match directory.remove_file(claimed_path) {
         Ok(()) => Err(source),
         Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(source),
         Err(cleanup) => Err(io::Error::new(
             cleanup.kind(),
             format!(
-                "patch operation failed ({source}); staging file '{}' could not be removed ({cleanup})",
-                staging_path.display()
+                "patch operation failed ({source}); claimed staging file '{}' could not be removed ({cleanup})",
+                claimed_path.display()
             ),
         )),
     }
+}
+
+fn claimed_staging_matches(
+    directory: &Dir,
+    claimed_path: &Path,
+    staging_file: &File,
+    expected: FileSnapshot,
+) -> io::Result<bool> {
+    let (claimed, _) =
+        require_regular_file(directory.open_with(claimed_path, &regular_file_options())?)?;
+    let retained = CodingWorkspace::file_snapshot(staging_file)?;
+    let claimed_snapshot = CodingWorkspace::file_snapshot(&claimed)?;
+    Ok(retained.same_identity(&expected) && claimed_snapshot.same_identity(&expected))
 }
 
 fn cleanup_open_staging_after_error<T>(
@@ -618,18 +896,36 @@ fn cleanup_open_staging_after_error<T>(
     source: io::Error,
 ) -> io::Result<T> {
     let expected = CodingWorkspace::file_snapshot(staging_file)?;
-    let (slot, _) =
-        require_regular_file(directory.open_with(staging_path, &regular_file_options())?)?;
-    if CodingWorkspace::file_snapshot(&slot)? != expected {
+    let claimed = match claim_path(directory, staging_path, "cleanup") {
+        Ok(path) => path,
+        Err(claim) if claim.kind() == io::ErrorKind::NotFound => return Err(source),
+        Err(claim) => {
+            return Err(io::Error::new(
+                claim.kind(),
+                format!(
+                    "patch operation failed ({source}); staging path '{}' could not be claimed for cleanup ({claim})",
+                    staging_path.display()
+                ),
+            ))
+        }
+    };
+    if !claimed_staging_matches(directory, &claimed, staging_file, expected)? {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        restore_claimed_path(
+            directory,
+            &claimed,
+            staging_path,
+            &format!("patch operation failed ({source}); staging identity changed"),
+        )?;
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
-                "patch operation failed ({source}); staging path changed and was preserved as '{}'",
+                "patch operation failed ({source}); concurrent staging entry was restored as '{}'",
                 staging_path.display()
             ),
         ));
     }
-    cleanup_staging_after_error(directory, staging_path, source)
+    cleanup_staging_after_error(directory, &claimed, staging_file, expected, source)
 }
 
 fn cleanup_owned_staging_after_error<T>(
@@ -665,12 +961,7 @@ fn require_regular_file(file: File) -> io::Result<(File, Metadata)> {
     }
 }
 
-#[cfg(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "redox"
-))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn exchange_files(directory: &Dir, left: &Path, right: &Path) -> io::Result<()> {
     rustix::fs::renameat_with(
         directory,
@@ -682,53 +973,154 @@ fn exchange_files(directory: &Dir, left: &Path, right: &Path) -> io::Result<()> 
     .map_err(io::Error::from)
 }
 
-#[cfg(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "redox"
-))]
-fn rollback_existing_exchange(
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn remove_claimed_replacement(
+    directory: &Dir,
+    recovery_path: &Path,
+    expected: &ReplacementMetadata,
+) -> io::Result<()> {
+    validate_replacement_slot(directory, recovery_path, expected)?;
+    directory.remove_file(recovery_path)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn restore_claimed_path(
+    directory: &Dir,
+    claimed_path: &Path,
+    path: &Path,
+    context: &str,
+) -> io::Result<()> {
+    rename_no_replace(directory, claimed_path, path).map_err(|restore| {
+        io::Error::new(
+            restore.kind(),
+            format!(
+                "{context}; '{}' could not be restored to '{}' and was preserved ({restore})",
+                claimed_path.display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rollback_new_file_commit(
     directory: &Dir,
     staged: &StagedFile,
     path: &Path,
     source: io::Error,
 ) -> io::Result<()> {
-    let (installed, _) = require_regular_file(directory.open_with(path, &regular_file_options())?)?;
-    if CodingWorkspace::file_snapshot(&staged.file)? != staged.snapshot
-        || CodingWorkspace::file_snapshot(&installed)? != staged.snapshot
+    let claimed = claim_path(directory, path, "new-rollback").map_err(|claim| {
+        io::Error::new(
+            claim.kind(),
+            format!(
+                "new-file patch commit failed ({source}); target '{}' could not be claimed for rollback ({claim})",
+                path.display()
+            ),
+        )
+    })?;
+    let (claimed_file, _) =
+        require_regular_file(directory.open_with(&claimed, &regular_file_options())?)?;
+    let retained = CodingWorkspace::file_snapshot(&staged.file)?;
+    let claimed_snapshot = CodingWorkspace::file_snapshot(&claimed_file)?;
+    if retained.same_identity(&staged.snapshot) && claimed_snapshot.same_identity(&staged.snapshot)
     {
+        return cleanup_staging_after_error(
+            directory,
+            &claimed,
+            &staged.file,
+            staged.snapshot,
+            source,
+        );
+    }
+    restore_claimed_path(
+        directory,
+        &claimed,
+        path,
+        &format!("new-file patch commit failed ({source}); target identity changed"),
+    )?;
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("new-file patch commit failed ({source}); concurrent target was restored"),
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rollback_existing_exchange(
+    directory: &Dir,
+    staged: &StagedFile,
+    path: &Path,
+    expected: &ReplacementMetadata,
+    recovery_path: &Path,
+    source: io::Error,
+) -> io::Result<()> {
+    let published_claim = claim_path(directory, path, "published-rollback").map_err(|claim| {
+        io::Error::new(
+            claim.kind(),
+            format!(
+                "patch commit failed ({source}); published target could not be claimed for rollback ({claim}); displaced file remains at '{}'",
+                recovery_path.display()
+            ),
+        )
+    })?;
+    let (published, _) =
+        require_regular_file(directory.open_with(&published_claim, &regular_file_options())?)?;
+    let retained = CodingWorkspace::file_snapshot(&staged.file)?;
+    let published_snapshot = CodingWorkspace::file_snapshot(&published)?;
+    if !retained.same_identity(&staged.snapshot)
+        || !published_snapshot.same_identity(&staged.snapshot)
+    {
+        restore_claimed_path(
+            directory,
+            &published_claim,
+            path,
+            &format!("patch commit failed ({source}); published target identity changed"),
+        )?;
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
-                "patch commit failed ({source}); target changed again, so displaced file was preserved as '{}'",
-                staged.path.display()
+                "patch commit failed ({source}); concurrent target was restored and displaced file remains at '{}'",
+                recovery_path.display()
             ),
         ));
     }
-    if let Err(rollback) = exchange_files(directory, &staged.path, path) {
-        return Err(io::Error::other(format!(
-            "patch commit failed ({source}) and restoring the original target also failed ({rollback})"
-        )));
-    }
-    let (rolled_back_staging, _) =
-        require_regular_file(directory.open_with(&staged.path, &regular_file_options())?)?;
-    if CodingWorkspace::file_snapshot(&rolled_back_staging)? != staged.snapshot {
+    if let Err(recovery) = validate_replacement_slot(directory, recovery_path, expected) {
+        restore_claimed_path(
+            directory,
+            &published_claim,
+            path,
+            &format!(
+                "patch commit failed ({source}); displaced target validation failed ({recovery})"
+            ),
+        )?;
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             format!(
-                "patch target was restored after failure ({source}), but staging changed again and was preserved as '{}'",
-                staged.path.display()
+                "patch commit failed ({source}); published target was restored because recovery '{}' changed ({recovery})",
+                recovery_path.display()
             ),
         ));
     }
-    if let Err(cleanup) = directory.remove_file(&staged.path) {
+    if let Err(restore) = rename_no_replace(directory, recovery_path, path) {
+        restore_claimed_path(
+            directory,
+            &published_claim,
+            path,
+            &format!(
+                "patch commit failed ({source}); original target could not be restored ({restore})"
+            ),
+        )?;
         return Err(io::Error::new(
-            cleanup.kind(),
-            format!("patch commit failed ({source}); target was restored but staging cleanup failed ({cleanup})"),
+            restore.kind(),
+            format!("patch commit failed ({source}); original target rollback failed ({restore})"),
         ));
     }
-    Err(source)
+    cleanup_staging_after_error(
+        directory,
+        &published_claim,
+        &staged.file,
+        staged.snapshot,
+        source,
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
@@ -767,9 +1159,21 @@ fn has_extended_acl(file: &File) -> io::Result<bool> {
     target_os = "hurd"
 ))]
 fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
-    let mut names: Vec<u8> = Vec::with_capacity(64 * 1024);
-    rustix::fs::flistxattr(file, &mut names).map_err(io::Error::from)?;
-    Ok(!names.is_empty())
+    let mut names = vec![0u8; 64 * 1024];
+    let written = rustix::fs::flistxattr(file, &mut names).map_err(io::Error::from)?;
+    for name in names[..written]
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        #[cfg(target_os = "macos")]
+        if name == b"com.apple.provenance" {
+            // APFS attaches this OS-managed attribute to ordinary new files, including
+            // our staging file. It is not user-authored security metadata to preserve.
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(not(any(
@@ -1220,12 +1624,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(
-        target_vendor = "apple",
-        target_os = "linux",
-        target_os = "android",
-        target_os = "redox"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn create_new_never_removes_an_existing_file() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1264,6 +1663,126 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_snapshot_digest_detects_equal_length_rewrites() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-digest-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "first\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (file, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let before = CodingWorkspace::file_snapshot(&file).expect("first snapshot succeeds");
+
+        std::fs::write(root.join("target.txt"), "other\n").expect("equal-length rewrite succeeds");
+        let after = CodingWorkspace::file_snapshot(&file).expect("second snapshot succeeds");
+
+        assert_eq!(before.stat.size, after.stat.size);
+        assert_ne!(before.digest, after.digest);
+        drop((file, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn new_file_validation_failure_removes_the_published_staging_identity() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-new-rollback-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let mut staged = workspace
+            .stage_content(&directory, b"owned\n", None)
+            .expect("content is staged");
+        super::rename_no_replace(
+            &directory,
+            &staged.path,
+            std::path::Path::new("created.txt"),
+        )
+        .expect("staging is published");
+        super::refresh_snapshot_after_rename(
+            &staged.file,
+            &mut staged.snapshot,
+            "patch staging file",
+        )
+        .expect("controlled rename refreshes ctime");
+        std::fs::write(root.join("created.txt"), "changed\n")
+            .expect("installed staging is concurrently changed");
+
+        let error = super::rollback_new_file_commit(
+            &directory,
+            &staged,
+            std::path::Path::new("created.txt"),
+            super::patch_target_changed(),
+        )
+        .expect_err("failed validation must roll back the new target");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!root.join("created.txt").exists());
+        drop((staged, directory, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn new_file_commit_rechecks_staging_extended_attributes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-staging-xattr-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let staged = workspace
+            .stage_content(&directory, b"owned\n", None)
+            .expect("content is staged");
+        #[cfg(target_os = "macos")]
+        let attribute = "com.young-agent.concurrent";
+        #[cfg(target_os = "linux")]
+        let attribute = "user.young-agent.concurrent";
+        rustix::fs::fsetxattr(
+            &staged.file,
+            attribute,
+            b"injected",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("concurrent xattr is injected");
+
+        let error = workspace
+            .commit_new_file(&directory, staged, std::path::Path::new("created.txt"))
+            .expect_err("staging xattrs must be rejected at commit");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(!root.join("created.txt").exists());
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".young-agent-patch-")
+        }));
+        drop((directory, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn existing_commit_rolls_back_when_the_target_identity_changes() {
@@ -1283,7 +1802,7 @@ mod tests {
             .replacement_metadata(&directory, std::path::Path::new("target.txt"))
             .expect("metadata validates");
         let staging = workspace
-            .stage_content(&directory, b"patched\n", Some(metadata.clone()))
+            .stage_content(&directory, b"patched\n", Some(&metadata))
             .expect("content is staged");
 
         directory
@@ -1295,7 +1814,7 @@ mod tests {
         let error = workspace
             .commit_existing_file(
                 &directory,
-                &staging,
+                staging,
                 std::path::Path::new("target.txt"),
                 metadata,
             )
@@ -1371,6 +1890,7 @@ mod tests {
         let staged = workspace
             .stage_content(&directory, b"owned\n", None)
             .expect("content is staged");
+        let staged_path = staged.path.clone();
         directory
             .rename(&staged.path, &directory, "owned-staging.tmp")
             .expect("owned staging file is moved");
@@ -1378,13 +1898,13 @@ mod tests {
             .expect("replacement staging path is written");
 
         let error = workspace
-            .commit_new_file(&directory, &staged, std::path::Path::new("created.txt"))
+            .commit_new_file(&directory, staged, std::path::Path::new("created.txt"))
             .expect_err("replaced staging slot must fail");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(!root.join("created.txt").exists());
         assert_eq!(
-            std::fs::read_to_string(root.join(&staged.path)).unwrap(),
+            std::fs::read_to_string(root.join(&staged_path)).unwrap(),
             "concurrent\n"
         );
         assert_eq!(
@@ -1392,7 +1912,7 @@ mod tests {
             "owned\n"
         );
 
-        drop((staged, directory, workspace));
+        drop((directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
@@ -1415,7 +1935,7 @@ mod tests {
             .replacement_metadata(&directory, std::path::Path::new("target.txt"))
             .expect("metadata validates");
         let staged = workspace
-            .stage_content(&directory, b"patched\n", Some(expected))
+            .stage_content(&directory, b"patched\n", Some(&expected))
             .expect("content is staged");
         super::exchange_files(&directory, &staged.path, std::path::Path::new("target.txt"))
             .expect("initial exchange succeeds");
@@ -1429,6 +1949,8 @@ mod tests {
             &directory,
             &staged,
             std::path::Path::new("target.txt"),
+            &expected,
+            &staged.path,
             super::patch_target_changed(),
         )
         .expect_err("rollback must not overwrite a second replacement");
@@ -1475,7 +1997,7 @@ mod tests {
             .replacement_metadata(&directory, std::path::Path::new("target.txt"))
             .expect("metadata validates");
         let staged = workspace
-            .stage_content(&directory, b"patched\n", Some(expected.clone()))
+            .stage_content(&directory, b"patched\n", Some(&expected))
             .expect("content is staged");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
             .expect("concurrent mode is set");
@@ -1483,7 +2005,7 @@ mod tests {
         let error = workspace
             .commit_existing_file(
                 &directory,
-                &staged,
+                staged,
                 std::path::Path::new("target.txt"),
                 expected,
             )
@@ -1493,7 +2015,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
         assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o640);
 
-        drop((staged, directory, workspace));
+        drop((directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 }

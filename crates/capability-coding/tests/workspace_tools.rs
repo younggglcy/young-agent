@@ -1550,14 +1550,14 @@ fn run_command_bounds_background_process_pipe_lifetime() {
     );
 
     assert!(started.elapsed() < Duration::from_secs(2));
-    let ToolOutput::Success { metadata, .. } = result.output else {
-        panic!("completed shell command should return");
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("background command must be rejected");
     };
-    assert_eq!(metadata["output_incomplete"], json!(true));
+    assert_eq!(error.code, "background_process_not_supported");
 }
 
 #[test]
-fn run_command_leaves_an_approved_detached_background_task_running() {
+fn run_command_terminates_an_approved_detached_background_task() {
     let test_workspace = TestWorkspace::new("command-detached-background");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1578,16 +1578,19 @@ fn run_command_leaves_an_approved_detached_background_task_running() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("detached background command must be rejected");
+    };
+    assert_eq!(error.code, "background_process_not_supported");
     thread::sleep(Duration::from_millis(250));
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("background.txt")).unwrap(),
-        "survived"
+    assert!(
+        !test_workspace.path().join("background.txt").exists(),
+        "rejected background commands must not mutate the workspace later"
     );
 }
 
 #[test]
-fn run_command_cancellation_still_terminates_after_the_shell_leader_exits() {
+fn run_command_rejects_background_work_after_the_shell_leader_exits() {
     let test_workspace = TestWorkspace::new("command-cancel-after-leader");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1597,12 +1600,6 @@ fn run_command_cancellation_still_terminates_after_the_shell_leader_exits() {
         tool_name: "run_command".to_string(),
         arguments: json!({ "command": "tail -f /dev/null &" }),
     };
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let cancellation_trigger = cancellation.clone();
-    let trigger = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(100));
-        cancellation_trigger.store(true, Ordering::Relaxed);
-    });
     let started = std::time::Instant::now();
 
     let result = runtime.dispatch(
@@ -1610,15 +1607,14 @@ fn run_command_cancellation_still_terminates_after_the_shell_leader_exits() {
         ToolExecutionAuthorization::ApprovalGranted {
             call_id: call.id.clone(),
         },
-        cancellation,
+        Arc::new(AtomicBool::new(false)),
     );
-    trigger.join().expect("cancellation trigger finishes");
 
     assert!(started.elapsed() < Duration::from_secs(2));
     let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("cancelled command must fail");
+        panic!("background command must fail");
     };
-    assert_eq!(error.code, "tool_cancelled");
+    assert_eq!(error.code, "background_process_not_supported");
 }
 
 #[test]
@@ -1631,7 +1627,7 @@ fn run_command_does_not_wait_for_a_pipe_holder_that_escapes_the_process_group() 
         id: ToolCallId::new("call-escaped-pipe-command"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import os,time; os.setsid(); time.sleep(2)' &"
+            "command": "python3 -c 'import os,time; os.setsid(); open(\"escaped-ready\", \"w\").close(); time.sleep(2)' & while [ ! -f escaped-ready ]; do :; done"
         }),
     };
     let started = std::time::Instant::now();
@@ -1646,8 +1642,8 @@ fn run_command_does_not_wait_for_a_pipe_holder_that_escapes_the_process_group() 
 
     assert!(started.elapsed() < Duration::from_millis(1500));
     let output = result.output;
-    let ToolOutput::Success { metadata, .. } = &output else {
-        panic!("escaped pipe holder must not block command completion: {output:?}");
+    let ToolOutput::Failure { error, .. } = &output else {
+        panic!("escaped pipe holder must fail explicitly: {output:?}");
     };
-    assert_eq!(metadata["output_incomplete"], json!(true));
+    assert_eq!(error.code, "command_output_incomplete");
 }
