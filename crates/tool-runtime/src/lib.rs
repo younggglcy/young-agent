@@ -2,13 +2,20 @@
 
 pub mod execution;
 pub mod fake;
+pub mod manifest;
 pub mod registry;
 
 pub use execution::{
     ToolCall, ToolCallId, ToolContent, ToolError, ToolExecutor, ToolOutput, ToolResult,
 };
 pub use fake::FakeToolExecutor;
-pub use registry::{CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition};
+pub use manifest::{
+    CapabilityManifest, CapabilityManifestError, CapabilityMetadata, ManifestTool, ToolSafetyClass,
+};
+pub use registry::{
+    CapabilityRef, McpCompatibility, ToolApprovalPolicy, ToolDefinition, ToolRegistrationError,
+    ToolRuntime,
+};
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,84 @@
+schema_version = 1
+
+[capability]
+id = "coding"
+version = "0.1.0"
+name = "Coding Capability"
+description = "Built-in tools for reading, searching, patching, and validating a local workspace."
+
+[[tools]]
+name = "read_file"
+description = "Read a UTF-8 file inside the workspace boundary."
+safety_class = "always_allow"
+
+[tools.input_schema]
+type = "object"
+additionalProperties = false
+required = ["path"]
+
+[tools.input_schema.properties.path]
+type = "string"
+
+[tools.mcp]
+server = "builtin-coding"
+tool_name = "read_file"
+protocol_version = "reserved"
+
+[[tools]]
+name = "search_files"
+description = "Search file contents inside the workspace boundary."
+safety_class = "always_allow"
+
+[tools.input_schema]
+type = "object"
+additionalProperties = false
+required = ["query"]
+
+[tools.input_schema.properties.query]
+type = "string"
+
+[tools.input_schema.properties.path]
+type = "string"
+
+[tools.mcp]
+server = "builtin-coding"
+tool_name = "search_files"
+protocol_version = "reserved"
+
+[[tools]]
+name = "apply_patch"
+description = "Apply a patch to files inside the workspace boundary."
+safety_class = "requires_approval"
+safety_reason = "patching mutates workspace files"
+
+[tools.input_schema]
+type = "object"
+additionalProperties = false
+required = ["patch"]
+
+[tools.input_schema.properties.patch]
+type = "string"
+
+[tools.mcp]
+server = "builtin-coding"
+tool_name = "apply_patch"
+protocol_version = "reserved"
+
+[[tools]]
+name = "run_command"
+description = "Run a command inside the workspace boundary."
+safety_class = "requires_approval"
+safety_reason = "commands may mutate the workspace or start processes"
+
+[tools.input_schema]
+type = "object"
+additionalProperties = false
+required = ["command"]
+
+[tools.input_schema.properties.command]
+type = "string"
+
+[tools.mcp]
+server = "builtin-coding"
+tool_name = "run_command"
+protocol_version = "reserved"

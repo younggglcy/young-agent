@@ -36,3 +36,4 @@ agent 或人下次应该怎么做。
 
 - [Contract Review 先收紧 Wire Shape](contract-review-wire-shape.md)
 - [Event Log 是 Replay 的唯一真相](event-log-replay-source-of-truth.md)
+- [Capability Manifest 只声明，不执行](capability-manifest-declares-not-executes.md)

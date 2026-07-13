@@ -3,6 +3,9 @@
 pub mod manifest;
 pub mod tools;
 
+pub use manifest::{coding_manifest, CODING_CAPABILITY_MANIFEST_TOML};
+pub use tools::{register_builtin_coding_capability, CodingCapabilityRegistrationError};
+
 #[cfg(test)]
 mod tests {
     #[test]
