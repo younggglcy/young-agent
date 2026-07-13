@@ -1,3 +1,5 @@
+#![cfg(any(target_os = "macos", target_os = "linux"))]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1552,6 +1554,36 @@ fn run_command_bounds_background_process_pipe_lifetime() {
         panic!("completed shell command should return");
     };
     assert_eq!(metadata["output_incomplete"], json!(true));
+}
+
+#[test]
+fn run_command_leaves_an_approved_detached_background_task_running() {
+    let test_workspace = TestWorkspace::new("command-detached-background");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-detached-background-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "(sleep 0.1; printf survived > background.txt) >/dev/null 2>&1 &"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("background.txt")).unwrap(),
+        "survived"
+    );
 }
 
 #[test]

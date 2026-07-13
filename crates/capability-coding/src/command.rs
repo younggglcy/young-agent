@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::cell::Cell;
 
 use command_group::{CommandGroup, GroupChild};
@@ -24,9 +24,10 @@ use crate::workspace::CodingWorkspace;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static INJECT_NEXT_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) const APPROVAL_REASON: &str =
@@ -129,10 +130,23 @@ fn run_shell_command(
         .stderr
         .take()
         .expect("stderr was configured as piped");
-    if let Err(source) = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr)) {
-        terminate_command_group(&mut child)?;
-        wait_for_command_group(&mut child)?;
-        return Err(CommandError::ConfigureOutput(source));
+    #[cfg(all(test, unix))]
+    let configure_result =
+        if INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE.with(|failure| failure.replace(false)) {
+            Err(std::io::Error::other(
+                "injected output configuration failure",
+            ))
+        } else {
+            make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr))
+        };
+    #[cfg(not(all(test, unix)))]
+    let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
+    if let Err(source) = configure_result {
+        let cleanup = cleanup_process_group(&mut child, false, true);
+        return match cleanup {
+            Ok(()) => Err(CommandError::ConfigureOutput(source)),
+            Err(cleanup) => Err(cleanup),
+        };
     }
     let (sender, receiver) = mpsc::sync_channel(16);
     let reader_stop = Arc::new(AtomicBool::new(false));
@@ -195,6 +209,7 @@ fn run_shell_command(
     let cleanup_result = cleanup_command_resources(
         &mut child,
         status.is_some(),
+        control_result.is_err() || forced_at.is_some(),
         reader_stop,
         receiver,
         stdout_reader,
@@ -226,7 +241,7 @@ fn run_shell_command(
 }
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if INJECT_NEXT_KILL_FAILURE.with(|failure| failure.replace(false)) {
         return Err(CommandError::Kill(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -266,17 +281,13 @@ fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatu
 fn cleanup_command_resources(
     child: &mut GroupChild,
     process_exited: bool,
+    terminate_group: bool,
     reader_stop: Arc<AtomicBool>,
     receiver: Receiver<StreamMessage>,
     stdout_reader: thread::JoinHandle<()>,
     stderr_reader: thread::JoinHandle<()>,
 ) -> Result<(), CommandError> {
-    let mut first_error = terminate_command_group(child).err();
-    if !process_exited && first_error.is_none() {
-        if let Err(source) = wait_for_command_group(child) {
-            first_error = Some(source);
-        }
-    }
+    let mut first_error = cleanup_process_group(child, process_exited, terminate_group).err();
 
     reader_stop.store(true, Ordering::Relaxed);
     drop(receiver);
@@ -287,6 +298,35 @@ fn cleanup_command_resources(
         first_error = Some(CommandError::ReaderPanicked);
     }
 
+    match first_error {
+        Some(source) => Err(source),
+        None => Ok(()),
+    }
+}
+
+fn cleanup_process_group(
+    child: &mut GroupChild,
+    process_exited: bool,
+    terminate_group: bool,
+) -> Result<(), CommandError> {
+    let mut first_error = None;
+    if terminate_group {
+        if let Err(source) = terminate_command_group(child) {
+            first_error = Some(source);
+        }
+    }
+    if !process_exited {
+        let wait_result = if terminate_group && first_error.is_some() {
+            try_wait_for_command_group(child).map(|_| ())
+        } else {
+            wait_for_command_group(child).map(|_| ())
+        };
+        if let Err(source) = wait_result {
+            if first_error.is_none() {
+                first_error = Some(source);
+            }
+        }
+    }
     match first_error {
         Some(source) => Err(source),
         None => Ok(()),
@@ -508,14 +548,17 @@ impl fmt::Display for CommandError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use super::{run_shell_command, CommandError, INJECT_NEXT_KILL_FAILURE};
+    use super::{
+        run_shell_command, CommandError, INJECT_NEXT_KILL_FAILURE,
+        INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
+    };
     use crate::workspace::CodingWorkspace;
 
     #[test]
@@ -548,6 +591,37 @@ mod tests {
 
         trigger.join().expect("cancellation trigger finishes");
         assert!(matches!(result, Err(CommandError::Kill(_))));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(250));
+        assert!(!root.join("delayed.txt").exists());
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
+    fn output_configuration_failure_still_reaps_the_spawned_group() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-command-config-cleanup-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE.with(|failure| failure.set(true));
+        let started = Instant::now();
+
+        let result = run_shell_command(
+            &workspace,
+            "(sleep 0.2; printf leaked > delayed.txt) & wait",
+            &AtomicBool::new(false),
+            1024,
+        );
+
+        assert!(matches!(result, Err(CommandError::ConfigureOutput(_))));
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());

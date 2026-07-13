@@ -20,27 +20,34 @@ pub struct CodingWorkspace {
 impl CodingWorkspace {
     pub fn resolve(selected_root: impl AsRef<Path>) -> Result<Self, CodingWorkspaceError> {
         let selected_root = selected_root.as_ref();
+        let root_dir =
+            Dir::open_ambient_dir(selected_root, ambient_authority()).map_err(|source| {
+                CodingWorkspaceError::OpenRoot {
+                    path: selected_root.to_path_buf(),
+                    source,
+                }
+            })?;
+        let opened_metadata =
+            root_dir
+                .metadata(".")
+                .map_err(|source| CodingWorkspaceError::InspectOpenedRoot {
+                    path: selected_root.to_path_buf(),
+                    source,
+                })?;
+        if !opened_metadata.is_dir() {
+            return Err(CodingWorkspaceError::RootIsNotDirectory {
+                path: selected_root.to_path_buf(),
+            });
+        }
         let root = fs::canonicalize(selected_root).map_err(|source| {
             CodingWorkspaceError::ResolveRoot {
                 path: selected_root.to_path_buf(),
                 source,
             }
         })?;
-        let metadata = fs::metadata(&root).map_err(|source| CodingWorkspaceError::ResolveRoot {
-            path: root.clone(),
-            source,
-        })?;
-        if !metadata.is_dir() {
-            return Err(CodingWorkspaceError::RootIsNotDirectory { path: root });
-        }
-        let root_dir = Dir::open_ambient_dir(&root, ambient_authority()).map_err(|source| {
-            CodingWorkspaceError::OpenRoot {
-                path: root.clone(),
-                source,
-            }
-        })?;
+        ensure_opened_root_matches_path(&root_dir, &root)?;
 
-        let git_worktree = detect_git_worktree(&root)?;
+        let git_worktree = detect_git_worktree(&root_dir, &root)?;
         Ok(Self {
             context: Arc::new(WorkspaceContext { root, git_worktree }),
             root_dir: Arc::new(root_dir),
@@ -126,6 +133,9 @@ impl CodingWorkspace {
                 size: metadata.size(),
                 modified_seconds: metadata.mtime(),
                 modified_nanoseconds: metadata.mtime_nsec(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                mode: metadata.mode(),
             })
         }
         #[cfg(not(unix))]
@@ -145,15 +155,7 @@ impl CodingWorkspace {
     #[cfg(unix)]
     #[allow(unsafe_code)]
     pub(crate) fn bind_command_working_directory(&self, command: &mut Command) -> io::Result<()> {
-        use std::os::unix::process::CommandExt;
-
-        let directory = self.root_dir.try_clone()?;
-        // SAFETY: the closure performs only the async-signal-safe fchdir syscall on an
-        // already-open directory handle. It allocates nothing and touches no shared state.
-        unsafe {
-            command.pre_exec(move || rustix::process::fchdir(&directory).map_err(io::Error::from));
-        }
-        Ok(())
+        bind_process_working_directory(command, &self.root_dir)
     }
 
     #[cfg(not(unix))]
@@ -182,13 +184,8 @@ impl CodingWorkspace {
         if metadata.snapshot != expected_snapshot {
             return Err(patch_target_changed());
         }
-        let temp_path = self.stage_content(&directory, content, Some(metadata))?;
-        self.commit_existing_file(
-            &directory,
-            &temp_path,
-            Path::new(file_name),
-            expected_snapshot,
-        )
+        let staged = self.stage_content(&directory, content, Some(metadata.clone()))?;
+        self.commit_existing_file(&directory, &staged, Path::new(file_name), metadata)
     }
 
     pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
@@ -200,12 +197,8 @@ impl CodingWorkspace {
             io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
         })?;
         let directory = self.root_dir.open_dir(parent)?;
-        let temp_path = self.stage_content(&directory, content, None)?;
-        let result = self.commit_new_file(&directory, &temp_path, Path::new(file_name));
-        match result {
-            Ok(()) => Ok(()),
-            Err(source) => cleanup_staging_after_error(&directory, &temp_path, source),
-        }
+        let staged = self.stage_content(&directory, content, None)?;
+        self.commit_new_file(&directory, &staged, Path::new(file_name))
     }
 
     pub(crate) fn metadata(&self) -> Value {
@@ -261,7 +254,7 @@ impl CodingWorkspace {
         directory: &Dir,
         content: &[u8],
         replacement: Option<ReplacementMetadata>,
-    ) -> io::Result<PathBuf> {
+    ) -> io::Result<StagedFile> {
         use std::io::Write;
 
         static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
@@ -325,11 +318,20 @@ impl CodingWorkspace {
                 }
                 Ok(())
             })();
-            drop(file);
             if let Err(source) = result {
-                return cleanup_staging_after_error(directory, &candidate, source);
+                return cleanup_open_staging_after_error(directory, &candidate, &file, source);
             }
-            return Ok(candidate);
+            let snapshot = match Self::file_snapshot(&file) {
+                Ok(snapshot) => snapshot,
+                Err(source) => {
+                    return cleanup_open_staging_after_error(directory, &candidate, &file, source)
+                }
+            };
+            return Ok(StagedFile {
+                path: candidate,
+                file,
+                snapshot,
+            });
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -337,7 +339,7 @@ impl CodingWorkspace {
         ))
     }
 
-    fn commit_new_file(&self, directory: &Dir, temp_path: &Path, path: &Path) -> io::Result<()> {
+    fn commit_new_file(&self, directory: &Dir, staged: &StagedFile, path: &Path) -> io::Result<()> {
         #[cfg(any(
             target_vendor = "apple",
             target_os = "linux",
@@ -345,14 +347,19 @@ impl CodingWorkspace {
             target_os = "redox"
         ))]
         {
-            rustix::fs::renameat_with(
+            self.validate_staging_slot(directory, staged)?;
+            let result = rustix::fs::renameat_with(
                 directory,
-                temp_path,
+                &staged.path,
                 directory,
                 path,
                 rustix::fs::RenameFlags::NOREPLACE,
             )
-            .map_err(io::Error::from)
+            .map_err(io::Error::from);
+            if let Err(source) = result {
+                return cleanup_owned_staging_after_error(directory, staged, source);
+            }
+            self.validate_installed_staging(directory, path, staged)
         }
         #[cfg(not(any(
             target_vendor = "apple",
@@ -361,7 +368,7 @@ impl CodingWorkspace {
             target_os = "redox"
         )))]
         {
-            let _ = (directory, temp_path, path);
+            let _ = (directory, staged, path);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic no-replace patch commits are not supported on this platform",
@@ -372,9 +379,9 @@ impl CodingWorkspace {
     fn commit_existing_file(
         &self,
         directory: &Dir,
-        temp_path: &Path,
+        staged: &StagedFile,
         path: &Path,
-        expected_snapshot: FileSnapshot,
+        expected: ReplacementMetadata,
     ) -> io::Result<()> {
         #[cfg(any(
             target_vendor = "apple",
@@ -383,25 +390,40 @@ impl CodingWorkspace {
             target_os = "redox"
         ))]
         {
-            if let Err(source) = exchange_files(directory, temp_path, path) {
-                return cleanup_staging_after_error(directory, temp_path, source);
+            self.validate_staging_slot(directory, staged)?;
+            if let Err(source) = exchange_files(directory, &staged.path, path) {
+                return cleanup_owned_staging_after_error(directory, staged, source);
             }
 
             let validation = self
-                .replacement_metadata(directory, temp_path)
+                .validate_installed_staging(directory, path, staged)
+                .and_then(|()| self.replacement_metadata(directory, &staged.path))
                 .and_then(|metadata| {
-                    if metadata.snapshot == expected_snapshot {
+                    if metadata.matches(&expected) {
                         Ok(())
                     } else {
                         Err(patch_target_changed())
                     }
                 });
             if let Err(source) = validation {
-                return rollback_existing_exchange(directory, temp_path, path, source);
+                return rollback_existing_exchange(directory, staged, path, source);
             }
 
-            if let Err(source) = directory.remove_file(temp_path) {
-                return rollback_existing_exchange(directory, temp_path, path, source);
+            let final_validation = self
+                .validate_installed_staging(directory, path, staged)
+                .and_then(|()| self.replacement_metadata(directory, &staged.path))
+                .and_then(|displaced| {
+                    if displaced.matches(&expected) {
+                        Ok(())
+                    } else {
+                        Err(patch_target_changed())
+                    }
+                });
+            if let Err(source) = final_validation {
+                return rollback_existing_exchange(directory, staged, path, source);
+            }
+            if let Err(source) = directory.remove_file(&staged.path) {
+                return rollback_existing_exchange(directory, staged, path, source);
             }
             Ok(())
         }
@@ -412,10 +434,48 @@ impl CodingWorkspace {
             target_os = "redox"
         )))]
         {
-            let _ = (directory, temp_path, path, expected_snapshot);
+            let _ = (directory, staged, path, expected);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic identity-bound patch commits are not supported on this platform",
+            ))
+        }
+    }
+
+    fn validate_staging_slot(&self, directory: &Dir, staged: &StagedFile) -> io::Result<()> {
+        let handle_snapshot = Self::file_snapshot(&staged.file)?;
+        let (slot, _) =
+            require_regular_file(directory.open_with(&staged.path, &regular_file_options())?)?;
+        let slot_snapshot = Self::file_snapshot(&slot)?;
+        if handle_snapshot == staged.snapshot && slot_snapshot == staged.snapshot {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "patch staging file changed before commit",
+            ))
+        }
+    }
+
+    fn validate_installed_staging(
+        &self,
+        directory: &Dir,
+        path: &Path,
+        staged: &StagedFile,
+    ) -> io::Result<()> {
+        let handle_snapshot = Self::file_snapshot(&staged.file)?;
+        let (installed, _) =
+            require_regular_file(directory.open_with(path, &regular_file_options())?)?;
+        let installed_snapshot = Self::file_snapshot(&installed)?;
+        if handle_snapshot == staged.snapshot && installed_snapshot == staged.snapshot {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "patch target changed during commit; displaced file was preserved as '{}'",
+                    staged.path.display()
+                ),
             ))
         }
     }
@@ -457,6 +517,9 @@ impl CodingWorkspace {
                     size: metadata.size(),
                     modified_seconds: metadata.mtime(),
                     modified_nanoseconds: metadata.mtime_nsec(),
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                    mode: metadata.mode(),
                 },
                 uid: metadata.uid(),
                 gid: metadata.gid(),
@@ -486,6 +549,22 @@ struct ReplacementMetadata {
     mode: u32,
 }
 
+#[cfg(unix)]
+impl ReplacementMetadata {
+    fn matches(&self, other: &Self) -> bool {
+        self.snapshot == other.snapshot
+            && self.uid == other.uid
+            && self.gid == other.gid
+            && self.mode == other.mode
+    }
+}
+
+struct StagedFile {
+    path: PathBuf,
+    file: File,
+    snapshot: FileSnapshot,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FileSnapshot {
     #[cfg(unix)]
@@ -498,6 +577,12 @@ pub(crate) struct FileSnapshot {
     modified_seconds: i64,
     #[cfg(unix)]
     modified_nanoseconds: i64,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    mode: u32,
 }
 
 fn patch_target_changed() -> io::Error {
@@ -523,6 +608,35 @@ fn cleanup_staging_after_error<T>(
             ),
         )),
     }
+}
+
+fn cleanup_open_staging_after_error<T>(
+    directory: &Dir,
+    staging_path: &Path,
+    staging_file: &File,
+    source: io::Error,
+) -> io::Result<T> {
+    let expected = CodingWorkspace::file_snapshot(staging_file)?;
+    let (slot, _) =
+        require_regular_file(directory.open_with(staging_path, &regular_file_options())?)?;
+    if CodingWorkspace::file_snapshot(&slot)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "patch operation failed ({source}); staging path changed and was preserved as '{}'",
+                staging_path.display()
+            ),
+        ));
+    }
+    cleanup_staging_after_error(directory, staging_path, source)
+}
+
+fn cleanup_owned_staging_after_error<T>(
+    directory: &Dir,
+    staged: &StagedFile,
+    source: io::Error,
+) -> io::Result<T> {
+    cleanup_open_staging_after_error(directory, &staged.path, &staged.file, source)
 }
 
 fn regular_file_options() -> OpenOptions {
@@ -575,16 +689,39 @@ fn exchange_files(directory: &Dir, left: &Path, right: &Path) -> io::Result<()> 
 ))]
 fn rollback_existing_exchange(
     directory: &Dir,
-    temp_path: &Path,
+    staged: &StagedFile,
     path: &Path,
     source: io::Error,
 ) -> io::Result<()> {
-    if let Err(rollback) = exchange_files(directory, temp_path, path) {
-        return Err(io::Error::other(format!(
-                "patch commit failed ({source}) and restoring the original target also failed ({rollback})"
-            )));
+    let (installed, _) = require_regular_file(directory.open_with(path, &regular_file_options())?)?;
+    if CodingWorkspace::file_snapshot(&staged.file)? != staged.snapshot
+        || CodingWorkspace::file_snapshot(&installed)? != staged.snapshot
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "patch commit failed ({source}); target changed again, so displaced file was preserved as '{}'",
+                staged.path.display()
+            ),
+        ));
     }
-    if let Err(cleanup) = directory.remove_file(temp_path) {
+    if let Err(rollback) = exchange_files(directory, &staged.path, path) {
+        return Err(io::Error::other(format!(
+            "patch commit failed ({source}) and restoring the original target also failed ({rollback})"
+        )));
+    }
+    let (rolled_back_staging, _) =
+        require_regular_file(directory.open_with(&staged.path, &regular_file_options())?)?;
+    if CodingWorkspace::file_snapshot(&rolled_back_staging)? != staged.snapshot {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "patch target was restored after failure ({source}), but staging changed again and was preserved as '{}'",
+                staged.path.display()
+            ),
+        ));
+    }
+    if let Err(cleanup) = directory.remove_file(&staged.path) {
         return Err(io::Error::new(
             cleanup.kind(),
             format!("patch commit failed ({source}); target was restored but staging cleanup failed ({cleanup})"),
@@ -808,10 +945,20 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn detect_git_worktree(root: &Path) -> Result<Option<GitWorktreeContext>, CodingWorkspaceError> {
-    let output = git_probe_command(root)
+fn detect_git_worktree(
+    root_dir: &Dir,
+    root_path: &Path,
+) -> Result<Option<GitWorktreeContext>, CodingWorkspaceError> {
+    let mut command = git_probe_command();
+    #[cfg(unix)]
+    bind_process_working_directory(&mut command, root_dir)
+        .map_err(CodingWorkspaceError::BindGitProbe)?;
+    #[cfg(not(unix))]
+    command.current_dir(root_path);
+    let output = command
         .output()
         .map_err(CodingWorkspaceError::StartGitProbe)?;
+    ensure_opened_root_matches_path(root_dir, root_path)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -844,7 +991,7 @@ fn detect_git_worktree(root: &Path) -> Result<Option<GitWorktreeContext>, Coding
     }))
 }
 
-fn git_probe_command(root: &Path) -> Command {
+fn git_probe_command() -> Command {
     const REPOSITORY_ENVIRONMENT: &[&str] = &[
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -869,8 +1016,6 @@ fn git_probe_command(root: &Path) -> Command {
 
     let mut command = Command::new("git");
     command
-        .arg("-C")
-        .arg(root)
         .args([
             "rev-parse",
             "--path-format=absolute",
@@ -883,6 +1028,65 @@ fn git_probe_command(root: &Path) -> Command {
         command.env_remove(name);
     }
     command
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn bind_process_working_directory(command: &mut Command, directory: &Dir) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let directory = directory.try_clone()?;
+    // SAFETY: the closure performs only the async-signal-safe fchdir syscall on an
+    // already-open directory handle. It allocates nothing and touches no shared state.
+    unsafe {
+        command.pre_exec(move || rustix::process::fchdir(&directory).map_err(io::Error::from));
+    }
+    Ok(())
+}
+
+fn ensure_opened_root_matches_path(
+    root_dir: &Dir,
+    root_path: &Path,
+) -> Result<(), CodingWorkspaceError> {
+    let opened =
+        root_dir
+            .metadata(".")
+            .map_err(|source| CodingWorkspaceError::InspectOpenedRoot {
+                path: root_path.to_path_buf(),
+                source,
+            })?;
+    let ambient = fs::metadata(root_path).map_err(|source| CodingWorkspaceError::ResolveRoot {
+        path: root_path.to_path_buf(),
+        source,
+    })?;
+
+    #[cfg(unix)]
+    let matches = {
+        use cap_std::fs::MetadataExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        opened.dev() == ambient.dev() && opened.ino() == ambient.ino()
+    };
+    #[cfg(windows)]
+    let matches = {
+        use cap_std::fs::MetadataExt as _;
+        use std::os::windows::fs::MetadataExt as _;
+
+        opened.volume_serial_number() == ambient.volume_serial_number()
+            && opened.file_index() == ambient.file_index()
+            && opened.volume_serial_number().is_some()
+            && opened.file_index().is_some()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let matches = false;
+
+    if matches {
+        Ok(())
+    } else {
+        Err(CodingWorkspaceError::RootChanged {
+            path: root_path.to_path_buf(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -898,6 +1102,14 @@ pub enum CodingWorkspaceError {
         path: PathBuf,
         source: io::Error,
     },
+    InspectOpenedRoot {
+        path: PathBuf,
+        source: io::Error,
+    },
+    RootChanged {
+        path: PathBuf,
+    },
+    BindGitProbe(io::Error),
     StartGitProbe(io::Error),
     GitProbeFailed {
         exit_code: Option<i32>,
@@ -927,6 +1139,22 @@ impl fmt::Display for CodingWorkspaceError {
                 "failed to open workspace root '{}': {source}",
                 path.display()
             ),
+            Self::InspectOpenedRoot { path, source } => write!(
+                formatter,
+                "failed to inspect opened workspace '{}': {source}",
+                path.display()
+            ),
+            Self::RootChanged { path } => write!(
+                formatter,
+                "workspace path '{}' changed while it was being opened",
+                path.display()
+            ),
+            Self::BindGitProbe(source) => {
+                write!(
+                    formatter,
+                    "failed to bind git probe to workspace handle: {source}"
+                )
+            }
             Self::StartGitProbe(source) => {
                 write!(formatter, "failed to start git worktree probe: {source}")
             }
@@ -952,9 +1180,12 @@ impl Error for CodingWorkspaceError {
         match self {
             Self::ResolveRoot { source, .. }
             | Self::OpenRoot { source, .. }
+            | Self::InspectOpenedRoot { source, .. }
+            | Self::BindGitProbe(source)
             | Self::StartGitProbe(source) => Some(source),
             Self::GitOutputUtf8(source) => Some(source),
             Self::RootIsNotDirectory { .. }
+            | Self::RootChanged { .. }
             | Self::GitProbeFailed { .. }
             | Self::UnexpectedGitOutput { .. } => None,
         }
@@ -969,7 +1200,7 @@ mod tests {
 
     #[test]
     fn git_probe_clears_repository_environment_overrides() {
-        let command = git_probe_command(std::path::Path::new("."));
+        let command = git_probe_command();
         let environment = command.get_envs().collect::<Vec<_>>();
 
         for name in [
@@ -988,6 +1219,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     fn create_new_never_removes_an_existing_file() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1026,7 +1263,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn existing_commit_rolls_back_when_the_target_identity_changes() {
         let nonce = SystemTime::now()
@@ -1041,13 +1278,11 @@ mod tests {
         std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
-        let original = directory.open("target.txt").expect("target opens");
-        let expected = CodingWorkspace::file_snapshot(&original).expect("snapshot is available");
         let metadata = workspace
             .replacement_metadata(&directory, std::path::Path::new("target.txt"))
             .expect("metadata validates");
         let staging = workspace
-            .stage_content(&directory, b"patched\n", Some(metadata))
+            .stage_content(&directory, b"patched\n", Some(metadata.clone()))
             .expect("content is staged");
 
         directory
@@ -1061,7 +1296,7 @@ mod tests {
                 &directory,
                 &staging,
                 std::path::Path::new("target.txt"),
-                expected,
+                metadata,
             )
             .expect_err("identity mismatch must fail the commit");
 
@@ -1083,6 +1318,181 @@ mod tests {
         }));
 
         drop((directory, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_root_identity_detects_an_ambient_path_replacement() {
+        use cap_std::ambient_authority;
+        use cap_std::fs::Dir;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "young-workspace-root-swap-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = parent.join("selected");
+        let moved = parent.join("moved");
+        std::fs::create_dir_all(&root).expect("test workspace is created");
+        let opened = Dir::open_ambient_dir(&root, ambient_authority()).expect("root handle opens");
+        std::fs::rename(&root, &moved).expect("opened root is moved");
+        std::fs::create_dir(&root).expect("replacement root is created");
+
+        let error = super::ensure_opened_root_matches_path(&opened, &root)
+            .expect_err("replacement path must not match the opened handle");
+
+        assert!(matches!(
+            error,
+            super::CodingWorkspaceError::RootChanged { .. }
+        ));
+        drop(opened);
+        std::fs::remove_dir_all(parent).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn new_file_commit_rejects_a_replaced_staging_slot() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-staging-swap-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let staged = workspace
+            .stage_content(&directory, b"owned\n", None)
+            .expect("content is staged");
+        directory
+            .rename(&staged.path, &directory, "owned-staging.tmp")
+            .expect("owned staging file is moved");
+        std::fs::write(root.join(&staged.path), "concurrent\n")
+            .expect("replacement staging path is written");
+
+        let error = workspace
+            .commit_new_file(&directory, &staged, std::path::Path::new("created.txt"))
+            .expect_err("replaced staging slot must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!root.join("created.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join(&staged.path)).unwrap(),
+            "concurrent\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("owned-staging.tmp")).unwrap(),
+            "owned\n"
+        );
+
+        drop((staged, directory, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn rollback_preserves_a_second_concurrent_target_replacement() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-rollback-race-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let expected = workspace
+            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
+            .expect("metadata validates");
+        let staged = workspace
+            .stage_content(&directory, b"patched\n", Some(expected))
+            .expect("content is staged");
+        super::exchange_files(&directory, &staged.path, std::path::Path::new("target.txt"))
+            .expect("initial exchange succeeds");
+        directory
+            .rename("target.txt", &directory, "published-staging.tmp")
+            .expect("installed staging file is moved");
+        std::fs::write(root.join("target.txt"), "second concurrent\n")
+            .expect("second concurrent target is written");
+
+        let error = super::rollback_existing_exchange(
+            &directory,
+            &staged,
+            std::path::Path::new("target.txt"),
+            super::patch_target_changed(),
+        )
+        .expect_err("rollback must not overwrite a second replacement");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "second concurrent\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(&staged.path)).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("published-staging.tmp")).unwrap(),
+            "patched\n"
+        );
+
+        drop((staged, directory, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn existing_commit_preserves_a_concurrent_mode_change() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-mode-race-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let target = root.join("target.txt");
+        std::fs::write(&target, "original\n").expect("target is written");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("initial mode is set");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let expected = workspace
+            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
+            .expect("metadata validates");
+        let staged = workspace
+            .stage_content(&directory, b"patched\n", Some(expected.clone()))
+            .expect("content is staged");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
+            .expect("concurrent mode is set");
+
+        let error = workspace
+            .commit_existing_file(
+                &directory,
+                &staged,
+                std::path::Path::new("target.txt"),
+                expected,
+            )
+            .expect_err("concurrent mode change must conflict");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o640);
+
+        drop((staged, directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 }

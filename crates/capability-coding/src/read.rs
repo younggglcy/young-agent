@@ -71,7 +71,7 @@ pub(crate) fn execute(
         return failure("tool_cancelled", "read_file was cancelled", false);
     }
 
-    let truncated = metadata.len() > MAX_OUTPUT_BYTES as u64;
+    let truncated = metadata.len() > MAX_OUTPUT_BYTES as u64 || bytes.len() > MAX_OUTPUT_BYTES;
     let visible_bytes = if truncated {
         &bytes[..bytes.len().min(MAX_OUTPUT_BYTES)]
     } else {
