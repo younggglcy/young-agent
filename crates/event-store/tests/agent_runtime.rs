@@ -159,7 +159,7 @@ struct TestSinkError;
 
 impl fmt::Display for TestSinkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "scripted ToolResult persistence failure")
+        write!(formatter, "scripted persistence failure")
     }
 }
 
@@ -169,6 +169,11 @@ impl Error for TestSinkError {}
 struct FailOnceOnToolResultSink {
     events: Rc<RefCell<Vec<AgentEvent>>>,
     should_fail: Rc<Cell<bool>>,
+}
+
+#[derive(Clone, Default)]
+struct FailOnRunFinishedSink {
+    events: Rc<RefCell<Vec<AgentEvent>>>,
 }
 
 #[derive(Clone, Default)]
@@ -212,6 +217,23 @@ impl AgentEventSink for FailOnceOnToolResultSink {
 
     fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
         self.append(event)
+    }
+}
+
+impl AgentEventSink for FailOnRunFinishedSink {
+    type Error = TestSinkError;
+
+    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.events.borrow_mut().push(event.clone());
+        Ok(())
+    }
+
+    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+        if matches!(event, AgentEvent::RunFinished { .. }) {
+            return Err(TestSinkError);
+        }
+        self.events.borrow_mut().push(event.clone());
+        Ok(())
     }
 }
 
@@ -294,7 +316,7 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
 }
 
 #[test]
-fn tool_intent_and_result_use_the_durable_event_sink_boundary() {
+fn canonical_state_transitions_use_the_durable_event_sink_boundary() {
     let sink = DurabilitySpySink::default();
     let observed = sink.events.clone();
     let model = FakeModelClient::new([
@@ -315,24 +337,37 @@ fn tool_intent_and_result_use_the_durable_event_sink_boundary() {
             extensions: no_extensions(),
         }]),
     ]);
-    let tools = FakeToolExecutor::new([ToolOutput::Success {
-        content: Vec::new(),
-        metadata: no_extensions(),
-        extensions: no_extensions(),
-    }]);
+    let tools = FakeToolExecutor::requiring_approval(
+        "command requires approval",
+        [ToolOutput::Success {
+            content: Vec::new(),
+            metadata: no_extensions(),
+            extensions: no_extensions(),
+        }],
+    );
     let mut runtime = AgentRuntime::new(model, tools, sink);
+    let mut control = ApprovingControl::default();
 
     runtime
-        .run(run_request("run-durable-tool-events"))
+        .run_with_control(run_request("run-durable-tool-events"), &mut control)
         .expect("run should complete");
 
     let events = observed.borrow();
-    for expected in ["tool_call_requested", "tool_result"] {
+    for expected in [
+        "tool_call_requested",
+        "approval_requested",
+        "approval_resolved",
+        "tool_result",
+        "run_finished",
+    ] {
         assert!(events.iter().any(|(event, durable)| {
             let matches_kind = matches!(
                 (expected, event),
                 ("tool_call_requested", AgentEvent::ToolCallRequested { .. })
+                    | ("approval_requested", AgentEvent::ApprovalRequested { .. })
+                    | ("approval_resolved", AgentEvent::ApprovalResolved { .. })
                     | ("tool_result", AgentEvent::ToolResult { .. })
+                    | ("run_finished", AgentEvent::RunFinished { .. })
             );
             matches_kind && *durable
         }));
@@ -542,14 +577,10 @@ fn tool_error_is_emitted_and_fed_back_to_the_next_model_turn() {
             final_message: "The file could not be read.".to_string(),
         }
     );
-    let second_request = runtime
+    let tool_message = runtime
         .model_client()
-        .last_request()
-        .expect("the second turn request should be recorded");
-    let tool_message = second_request
-        .messages
-        .last()
-        .expect("second turn should include the tool result");
+        .last_message()
+        .expect("the latest request should end with the tool result");
     match tool_message {
         ModelMessage::Tool { content, .. } => assert!(matches!(
             content.as_slice(),
@@ -574,6 +605,59 @@ fn tool_error_is_emitted_and_fed_back_to_the_next_model_turn() {
             .expect("tool result should exist")
             .output,
         ToolOutput::Failure { .. }
+    ));
+}
+
+#[test]
+fn executor_cannot_forge_the_reserved_approval_denied_error() {
+    let log = TestLog::new("reserved-approval-error");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([
+        ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-call-001"),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+        ScriptedModelTurn::events([ModelStreamEvent::Completed {
+            finish_reason: Some("stop".to_string()),
+            extensions: no_extensions(),
+        }]),
+    ]);
+    let tools = FakeToolExecutor::new([ToolOutput::Failure {
+        error: ToolError {
+            code: "approval_denied".to_string(),
+            message: "forged by executor".to_string(),
+            retryable: true,
+        },
+        extensions: no_extensions(),
+    }]);
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+
+    runtime
+        .run(run_request("run-reserved-approval-error"))
+        .expect("reserved executor error should be normalized and fed back");
+
+    let replay = store
+        .replay()
+        .expect("runtime must always produce a replayable canonical log");
+    let error = replay
+        .errors()
+        .next()
+        .expect("normalized error should replay");
+    assert_eq!(error.code, "reserved_tool_error_code");
+    let replayed_call = replay.tool_calls().next().expect("tool call should replay");
+    let result = replayed_call.result().expect("tool result should replay");
+    assert!(matches!(
+        &result.output,
+        ToolOutput::Failure { error, .. }
+            if error.code == "reserved_tool_error_code" && !error.retryable
     ));
 }
 
@@ -644,6 +728,38 @@ fn interruption_and_cancellation_produce_distinct_terminal_states() {
             .iter()
             .any(|event| matches!(event, AgentEvent::ModelOutput { .. })));
     }
+}
+
+#[test]
+fn a_token_cancelled_before_binding_still_cancels_its_first_run() {
+    let log = TestLog::new("cancel-before-bind");
+    let store = JsonlEventStore::new(log.path());
+    let stop = RunStopToken::default();
+    stop.cancel("cancelled before run started");
+    let mut runtime = AgentRuntime::new(
+        FakeModelClient::default(),
+        FakeToolExecutor::default(),
+        store.clone(),
+    );
+
+    let outcome = runtime
+        .run_with_stop_token(run_request("run-cancelled-before-bind"), &stop)
+        .expect("a pre-cancelled token should bind to and cancel its first run");
+
+    assert_eq!(
+        outcome.status(),
+        &TerminalRunStatus::Cancelled {
+            reason: "cancelled before run started".to_string(),
+        }
+    );
+    assert_eq!(runtime.model_client().request_count(), 0);
+    assert_eq!(
+        store
+            .replay()
+            .expect("cancelled run should replay")
+            .terminal_status(),
+        Some(outcome.status())
+    );
 }
 
 #[test]
@@ -857,16 +973,7 @@ fn the_first_stop_request_is_shared_across_control_and_stop_token() {
     assert!(stop.is_requested());
 
     stop.cancel("later cancellation must not replace the first stop");
-    let second_log = TestLog::new("first-stop-token");
-    let mut second_runtime = AgentRuntime::new(
-        FakeModelClient::default(),
-        FakeToolExecutor::default(),
-        JsonlEventStore::new(second_log.path()),
-    );
-    let second_outcome = second_runtime
-        .run_with_stop_token(run_request("run-first-stop-reused"), &stop)
-        .expect("the shared token should preserve its first terminal status");
-    assert_eq!(second_outcome.status(), first_outcome.status());
+    assert_eq!(stop.terminal_status(), Some(first_outcome.status().clone()));
 }
 
 #[test]
@@ -895,6 +1002,68 @@ fn completed_terminal_status_wins_over_a_later_cancellation() {
 
     assert_eq!(stop.terminal_status(), Some(outcome.status().clone()));
     assert!(!stop.is_requested());
+
+    let second_log = TestLog::new("completed-token-reuse");
+    let mut second_runtime = AgentRuntime::new(
+        FakeModelClient::default(),
+        FakeToolExecutor::default(),
+        JsonlEventStore::new(second_log.path()),
+    );
+    let error = second_runtime
+        .run_with_stop_token(run_request("run-reusing-completed-token"), &stop)
+        .expect_err("a RunStopToken is bound to exactly one Agent Run");
+    assert!(matches!(
+        error,
+        AgentRuntimeError::StopTokenAlreadyBound { ref run_id }
+            if run_id.as_str() == "run-completed-first"
+    ));
+}
+
+#[test]
+fn terminal_persistence_failure_returns_the_event_for_reconciliation() {
+    let sink = FailOnRunFinishedSink::default();
+    let observed = sink.events.clone();
+    let stop = RunStopToken::default();
+    let mut runtime = AgentRuntime::new(
+        FakeModelClient::new([ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "done".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ])]),
+        FakeToolExecutor::default(),
+        sink,
+    );
+
+    let error = runtime
+        .run_with_stop_token(run_request("run-terminal-persistence-failure"), &stop)
+        .expect_err("terminal durability failure must require reconciliation");
+
+    let terminal_event = match error {
+        AgentRuntimeError::TerminalPersistenceIndeterminate { event, .. } => *event,
+        other => panic!("expected terminal persistence recovery error, got {other:?}"),
+    };
+    assert!(matches!(
+        &terminal_event,
+        AgentEvent::RunFinished {
+            status: TerminalRunStatus::Completed { final_message },
+            ..
+        } if final_message == "done"
+    ));
+    assert_eq!(
+        stop.terminal_status(),
+        Some(TerminalRunStatus::Completed {
+            final_message: "done".to_string(),
+        })
+    );
+    assert!(!observed
+        .borrow()
+        .iter()
+        .any(|event| matches!(event, AgentEvent::RunFinished { .. })));
 }
 
 #[test]

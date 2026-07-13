@@ -423,6 +423,128 @@ fn strict_replay_requires_approval_resolution_before_a_tool_result() {
 }
 
 #[test]
+fn legacy_replay_rejects_mixed_approval_event_formats() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": { "id": "tool-call-001", "tool_name": "one", "arguments": {} }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": { "id": "tool-call-001", "tool_name": "one", "arguments": {} },
+                "reason": "approval one"
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": { "status": "success", "content": [] }
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-002",
+            "call": { "id": "tool-call-002", "tool_name": "two", "arguments": {} }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-002",
+                "call": { "id": "tool-call-002", "tool_name": "two", "arguments": {} },
+                "reason": "approval two"
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_resolved",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "approval_id": "approval-002",
+            "decision": { "decision": "approve" }
+        })),
+    ];
+
+    let error = young_event_store::replay_events_with_compatibility(
+        events,
+        ReplayCompatibility::LegacyApprovalWithoutResolution,
+    )
+    .expect_err("one Agent Run cannot mix legacy and resolved approval formats");
+
+    assert!(matches!(
+        error,
+        ReplayError::MixedApprovalLogFormats { event_number: 7 }
+    ));
+}
+
+#[test]
+fn legacy_replay_still_validates_the_reserved_denial_shape() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": { "id": "tool-call-001", "tool_name": "one", "arguments": {} }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": { "id": "tool-call-001", "tool_name": "one", "arguments": {} },
+                "reason": "approval one"
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": {
+                    "status": "failure",
+                    "error": {
+                        "code": "approval_denied",
+                        "message": "legacy denial",
+                        "retryable": true
+                    }
+                }
+            }
+        })),
+    ];
+
+    let error = young_event_store::replay_events_with_compatibility(
+        events,
+        ReplayCompatibility::LegacyApprovalWithoutResolution,
+    )
+    .expect_err("legacy compatibility must not accept a retryable denial");
+
+    assert!(matches!(
+        error,
+        ReplayError::InvalidApprovalDenialResult {
+            event_number: 4,
+            ref call_id,
+        } if call_id.as_str() == "tool-call-001"
+    ));
+}
+
+#[test]
 fn replay_rejects_successful_completion_with_an_unresolved_tool_call() {
     let events = vec![
         agent_event(json!({ "type": "run_started", "run_id": "run-001" })),

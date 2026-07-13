@@ -86,6 +86,8 @@ pub enum ToolContent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolError {
+    /// `approval_denied` is reserved for the Agent Runtime's canonical denial
+    /// result and must not be returned by a ToolExecutor.
     pub code: String,
     pub message: String,
     /// Whether retrying the same low-level tool call is expected to help.

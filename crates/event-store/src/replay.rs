@@ -158,6 +158,14 @@ pub enum ReplayCompatibility {
     LegacyApprovalWithoutResolution,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ApprovalLogFormat {
+    #[default]
+    Undetermined,
+    Legacy,
+    Resolved,
+}
+
 fn replay_events_with_mode(
     events: Vec<AgentEvent>,
     detect_recovery: bool,
@@ -177,6 +185,7 @@ fn replay_events_with_mode(
     let mut approvals = Vec::new();
     let mut errors = Vec::new();
     let mut run_finished = false;
+    let mut approval_log_format = ApprovalLogFormat::Undetermined;
 
     for (index, event) in events.iter().enumerate().skip(1) {
         let event_number = index + 1;
@@ -281,6 +290,12 @@ fn replay_events_with_mode(
                         approval_id: approval_id.clone(),
                     });
                 }
+                if compatibility == ReplayCompatibility::LegacyApprovalWithoutResolution
+                    && approval_log_format == ApprovalLogFormat::Legacy
+                {
+                    return Err(ReplayError::MixedApprovalLogFormats { event_number });
+                }
+                approval_log_format = ApprovalLogFormat::Resolved;
 
                 tool_calls[tool_call_index].approval_resolution_event = Some(index);
                 pending_approvals.remove(&tool_call_index);
@@ -316,8 +331,24 @@ fn replay_events_with_mode(
                         });
                     }
                     None if replayed_call.approval().is_some() => {
-                        // Explicit compatibility for logs written before
-                        // ApprovalResolved existed.
+                        if approval_log_format == ApprovalLogFormat::Resolved {
+                            return Err(ReplayError::ToolResultBeforeApprovalResolution {
+                                event_number,
+                                call_id: result.call_id.clone(),
+                            });
+                        }
+                        if matches!(
+                            &result.output,
+                            ToolOutput::Failure { error, extensions }
+                                if error.code == "approval_denied"
+                                    && (error.retryable || !extensions.is_empty())
+                        ) {
+                            return Err(ReplayError::InvalidApprovalDenialResult {
+                                event_number,
+                                call_id: result.call_id.clone(),
+                            });
+                        }
+                        approval_log_format = ApprovalLogFormat::Legacy;
                     }
                     Some(ApprovalDecision::Deny { reason }) => {
                         let is_canonical = matches!(
@@ -486,6 +517,9 @@ pub enum ReplayError {
         event_number: usize,
         call_id: ToolCallId,
     },
+    MixedApprovalLogFormats {
+        event_number: usize,
+    },
     TerminalWithUnresolvedToolCalls {
         event_number: usize,
         call_ids: Vec<ToolCallId>,
@@ -612,6 +646,10 @@ impl fmt::Display for ReplayError {
                 formatter,
                 "Event Log event {event_number} records an invalid approval-denial result for tool call '{}'",
                 call_id.as_str()
+            ),
+            Self::MixedApprovalLogFormats { event_number } => write!(
+                formatter,
+                "Event Log event {event_number} mixes legacy approvals without resolutions and modern ApprovalResolved events"
             ),
             Self::TerminalWithUnresolvedToolCalls {
                 event_number,

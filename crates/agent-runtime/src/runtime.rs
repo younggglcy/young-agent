@@ -73,7 +73,13 @@ where
 #[derive(Clone, Debug, Default)]
 pub struct RunStopToken {
     cancellation: Arc<AtomicBool>,
-    terminal_status: Arc<Mutex<Option<TerminalRunStatus>>>,
+    state: Arc<Mutex<RunStopState>>,
+}
+
+#[derive(Debug, Default)]
+struct RunStopState {
+    bound_run_id: Option<RunId>,
+    terminal_status: Option<TerminalRunStatus>,
 }
 
 impl RunStopToken {
@@ -96,10 +102,23 @@ impl RunStopToken {
     /// Returns the first terminal status chosen for this run, including normal
     /// completion and failure as well as interruption and cancellation.
     pub fn terminal_status(&self) -> Option<TerminalRunStatus> {
-        self.terminal_status
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_status
             .clone()
+    }
+
+    fn bind(&self, run_id: &RunId) -> Result<(), RunId> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(bound_run_id) = &state.bound_run_id {
+            return Err(bound_run_id.clone());
+        }
+        state.bound_run_id = Some(run_id.clone());
+        Ok(())
     }
 
     fn request_stop(&self, status: TerminalRunStatus) {
@@ -107,21 +126,22 @@ impl RunStopToken {
     }
 
     fn resolve_terminal(&self, proposed: TerminalRunStatus) -> TerminalRunStatus {
-        let mut terminal_status = self
-            .terminal_status
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if terminal_status.is_none() {
+        if state.terminal_status.is_none() {
             let is_stop = matches!(
                 proposed,
                 TerminalRunStatus::Interrupted { .. } | TerminalRunStatus::Cancelled { .. }
             );
-            *terminal_status = Some(proposed);
+            state.terminal_status = Some(proposed);
             if is_stop {
                 self.cancellation.store(true, Ordering::Release);
             }
         }
-        terminal_status
+        state
+            .terminal_status
             .clone()
             .expect("terminal status was initialized")
     }
@@ -252,6 +272,9 @@ where
             tools,
             metadata,
         } = request;
+
+        stop.bind(&run_id)
+            .map_err(|run_id| AgentRuntimeError::StopTokenAlreadyBound { run_id })?;
 
         let mut model_request = ModelRequest {
             model,
@@ -496,7 +519,7 @@ where
                 request: approval,
                 extensions: BTreeMap::new(),
             };
-            self.emit(&approval_event)?;
+            self.emit_durable(&approval_event)?;
             let AgentEvent::ApprovalRequested {
                 request: approval, ..
             } = approval_event
@@ -510,7 +533,7 @@ where
                     .finish(run_id, status, stop)
                     .map(ToolCallProgress::Finished);
             }
-            self.emit(&AgentEvent::ApprovalResolved {
+            self.emit_durable(&AgentEvent::ApprovalResolved {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 approval_id: approval.id,
@@ -525,7 +548,9 @@ where
                             .finish(run_id, status, stop)
                             .map(ToolCallProgress::Finished);
                     }
-                    self.tool_executor.execute(&call, stop.cancellation_flag())
+                    normalize_tool_output(
+                        self.tool_executor.execute(&call, stop.cancellation_flag()),
+                    )
                 }
                 ApprovalDecision::Deny { reason } => ToolOutput::Failure {
                     error: young_tool_runtime::ToolError {
@@ -542,7 +567,7 @@ where
                     .finish(run_id, status, stop)
                     .map(ToolCallProgress::Finished);
             }
-            self.tool_executor.execute(&call, stop.cancellation_flag())
+            normalize_tool_output(self.tool_executor.execute(&call, stop.cancellation_flag()))
         };
 
         let result = ToolResult {
@@ -648,10 +673,16 @@ where
         stop: &RunStopToken,
     ) -> Result<RunOutcome, AgentRuntimeError<S::Error>> {
         let status = stop.resolve_terminal(proposed_status);
-        self.emit(&AgentEvent::RunFinished {
+        let event = AgentEvent::RunFinished {
             run_id: run_id.clone(),
             status: status.clone(),
             extensions: BTreeMap::new(),
+        };
+        self.event_sink.append_durable(&event).map_err(|source| {
+            AgentRuntimeError::TerminalPersistenceIndeterminate {
+                event: Box::new(event),
+                source,
+            }
         })?;
         Ok(RunOutcome { status })
     }
@@ -681,8 +712,29 @@ fn tool_result_content(output: ToolOutput) -> Vec<ModelMessageContent> {
     }
 }
 
+fn normalize_tool_output(output: ToolOutput) -> ToolOutput {
+    match output {
+        ToolOutput::Failure { error, .. } if error.code == "approval_denied" => {
+            ToolOutput::Failure {
+                error: young_tool_runtime::ToolError {
+                    code: "reserved_tool_error_code".to_string(),
+                    message: "tool executor returned reserved error code 'approval_denied'"
+                        .to_string(),
+                    retryable: false,
+                },
+                extensions: BTreeMap::new(),
+            }
+        }
+        output => output,
+    }
+}
+
 #[derive(Debug)]
 pub enum AgentRuntimeError<E> {
+    /// A stop token is a one-run terminal latch and cannot be reused.
+    StopTokenAlreadyBound {
+        run_id: RunId,
+    },
     EventSink(E),
     /// The tool returned, but its result could not be recorded. The caller
     /// must reconcile or retry persistence of `event`; it must not execute the
@@ -691,15 +743,30 @@ pub enum AgentRuntimeError<E> {
         event: Box<AgentEvent>,
         source: E,
     },
+    /// The terminal winner was chosen, but its canonical commit may or may not
+    /// have reached stable storage. Reconcile `event` without rerunning.
+    TerminalPersistenceIndeterminate {
+        event: Box<AgentEvent>,
+        source: E,
+    },
 }
 
 impl<E: fmt::Display> fmt::Display for AgentRuntimeError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StopTokenAlreadyBound { run_id } => write!(
+                formatter,
+                "RunStopToken is already bound to Agent Run '{}'",
+                run_id.as_str()
+            ),
             Self::EventSink(source) => write!(formatter, "failed to append Agent Event: {source}"),
             Self::ToolResultPersistenceIndeterminate { event, source } => write!(
                 formatter,
                 "tool execution completed but persistence of its result Agent Event is indeterminate; inspect and reconcile the Event Log without re-executing the tool: {event:?}: {source}"
+            ),
+            Self::TerminalPersistenceIndeterminate { event, source } => write!(
+                formatter,
+                "terminal status was chosen but persistence of its RunFinished event is indeterminate; inspect and reconcile the Event Log without rerunning the Agent Run: {event:?}: {source}"
             ),
         }
     }
@@ -708,9 +775,10 @@ impl<E: fmt::Display> fmt::Display for AgentRuntimeError<E> {
 impl<E: Error + 'static> Error for AgentRuntimeError<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::EventSink(source) | Self::ToolResultPersistenceIndeterminate { source, .. } => {
-                Some(source)
-            }
+            Self::StopTokenAlreadyBound { .. } => None,
+            Self::EventSink(source)
+            | Self::ToolResultPersistenceIndeterminate { source, .. }
+            | Self::TerminalPersistenceIndeterminate { source, .. } => Some(source),
         }
     }
 }

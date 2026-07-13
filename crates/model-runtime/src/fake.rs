@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::client::{ModelClient, ModelRequest};
+use crate::client::{ModelClient, ModelMessage, ModelRequest};
 use crate::stream::{ModelError, ModelStreamEvent};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,7 +25,7 @@ impl ScriptedModelTurn {
 pub struct FakeModelClient {
     turns: VecDeque<ScriptedModelTurn>,
     request_count: usize,
-    last_request: Option<ModelRequest>,
+    last_message: Option<ModelMessage>,
 }
 
 impl FakeModelClient {
@@ -33,7 +33,7 @@ impl FakeModelClient {
         Self {
             turns: turns.into_iter().collect(),
             request_count: 0,
-            last_request: None,
+            last_message: None,
         }
     }
 
@@ -41,10 +41,11 @@ impl FakeModelClient {
         self.request_count
     }
 
-    /// Returns only the latest request snapshot so scripted runs use memory
-    /// proportional to current history rather than all cumulative histories.
-    pub fn last_request(&self) -> Option<&ModelRequest> {
-        self.last_request.as_ref()
+    /// Returns only the final message projected from the latest request. This
+    /// keeps per-turn observation proportional to the new message rather than
+    /// repeatedly cloning cumulative history.
+    pub fn last_message(&self) -> Option<&ModelMessage> {
+        self.last_message.as_ref()
     }
 
     pub fn remaining_turns(&self) -> usize {
@@ -61,7 +62,7 @@ impl ModelClient for FakeModelClient {
         _cancellation: Arc<AtomicBool>,
     ) -> Result<Self::Stream, ModelError> {
         self.request_count += 1;
-        self.last_request = Some(request.clone());
+        self.last_message = request.messages.last().cloned();
         match self.turns.pop_front() {
             Some(ScriptedModelTurn::Events(events)) => Ok(events.into_iter()),
             Some(ScriptedModelTurn::Error(error)) => Err(error),
