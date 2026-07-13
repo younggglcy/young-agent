@@ -1627,7 +1627,7 @@ fn run_command_waits_for_a_setsid_background_task_with_closed_pipes() {
         id: ToolCallId::new("call-escaped-pipe-command"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import os,time; os.setsid(); time.sleep(0.15); open(\"escaped-finished\", \"w\").write(\"done\")' >/dev/null 2>&1 & exit 0"
+            "command": "trap 'printf user-trap > user-trap.txt' EXIT; python3 -c 'import os,time; os.setsid(); time.sleep(0.15); open(\"escaped-finished\", \"w\").write(\"done\")' >/dev/null 2>&1 & exit 0"
         }),
     };
     let started = std::time::Instant::now();
@@ -1647,4 +1647,45 @@ fn run_command_waits_for_a_setsid_background_task_with_closed_pipes() {
         std::fs::read_to_string(test_workspace.path().join("escaped-finished")).unwrap(),
         "done"
     );
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("user-trap.txt")).unwrap(),
+        "user-trap"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_command_does_not_report_cancelled_while_a_setsid_descendant_survives() {
+    let test_workspace = TestWorkspace::new("command-escaped-cancellation");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-escaped-command-cancellation"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "python3 -c 'import os,time; os.setsid(); time.sleep(0.6)' >/dev/null 2>&1 & wait"
+        }),
+    };
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation_trigger = cancellation.clone();
+    let trigger = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        cancellation_trigger.store(true, Ordering::Relaxed);
+    });
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        cancellation,
+    );
+    trigger.join().expect("cancellation trigger finishes");
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("incompletely terminated command must fail");
+    };
+    assert_eq!(error.code, "command_termination_incomplete");
+    thread::sleep(Duration::from_millis(400));
 }

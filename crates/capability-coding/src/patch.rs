@@ -108,6 +108,13 @@ fn apply_unified_patch(
     if cancellation.load(Ordering::Relaxed) {
         return Err(PatchError::Cancelled);
     }
+    let FileChange::Write(content) = &change;
+    if content.len() as u64 > MAX_PATCH_FILE_BYTES {
+        return Err(PatchError::Limit(format!(
+            "patch result '{}' exceeds {MAX_PATCH_FILE_BYTES} bytes",
+            resolved.relative_path.display()
+        )));
+    }
     match change {
         FileChange::Write(content) if resolved.existed => workspace
             .replace_existing_atomically(

@@ -18,6 +18,9 @@ const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_METADATA_SERIALIZED_BYTES: usize = 4 * 1024;
 const MAX_SEARCH_DIRECTORY_ENTRIES: usize = 100_000;
+const MAX_SEARCH_DIRECTORIES: u64 = 10_000;
+const MAX_SEARCH_ENTRIES: u64 = 100_000;
+const MAX_SEARCH_DEPTH: usize = 256;
 const MAX_SEARCH_FILES: u64 = 100_000;
 const MAX_SEARCH_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -110,7 +113,11 @@ fn search_directory(
     cancellation: &AtomicBool,
     results: &mut SearchResults,
 ) -> Result<(), ToolOutput> {
-    let entries = sorted_entries(&root, &relative_path, cancellation)?;
+    let _ = results.record_directory();
+    let entries = sorted_entries(&root, &relative_path, cancellation, results)?;
+    if results.limit_reached {
+        return Ok(());
+    }
     let mut stack = vec![DirectoryFrame {
         relative_path,
         entries,
@@ -144,6 +151,9 @@ fn search_directory(
             if file_name == ".git" {
                 continue;
             }
+            if stack.len() == MAX_SEARCH_DEPTH || !results.record_directory() {
+                return Ok(());
+            }
             let directory = entry.open_dir().map_err(|source| {
                 failure(
                     "workspace_io_error",
@@ -151,7 +161,10 @@ fn search_directory(
                     source.kind() == std::io::ErrorKind::Interrupted,
                 )
             })?;
-            let entries = sorted_entries(&directory, &entry_path, cancellation)?;
+            let entries = sorted_entries(&directory, &entry_path, cancellation, results)?;
+            if results.limit_reached {
+                return Ok(());
+            }
             stack.push(DirectoryFrame {
                 relative_path: entry_path,
                 entries,
@@ -178,6 +191,7 @@ fn sorted_entries(
     directory: &Dir,
     relative_path: &Path,
     cancellation: &AtomicBool,
+    results: &mut SearchResults,
 ) -> Result<std::vec::IntoIter<DirEntry>, ToolOutput> {
     let entries = directory.entries().map_err(|source| {
         failure(
@@ -195,14 +209,7 @@ fn sorted_entries(
                 false,
             ));
         }
-        sorted.push(entry.map_err(|source| {
-            failure(
-                "workspace_io_error",
-                format!("failed to read a directory entry: {source}"),
-                source.kind() == std::io::ErrorKind::Interrupted,
-            )
-        })?);
-        if sorted.len() > MAX_SEARCH_DIRECTORY_ENTRIES {
+        if sorted.len() == MAX_SEARCH_DIRECTORY_ENTRIES {
             return Err(failure(
                 "search_limit_exceeded",
                 format!(
@@ -212,6 +219,17 @@ fn sorted_entries(
                 false,
             ));
         }
+        let entry = entry.map_err(|source| {
+            failure(
+                "workspace_io_error",
+                format!("failed to read a directory entry: {source}"),
+                source.kind() == std::io::ErrorKind::Interrupted,
+            )
+        })?;
+        if !results.record_entry() {
+            break;
+        }
+        sorted.push(entry);
     }
     sorted.sort_by_key(DirEntry::file_name);
     Ok(sorted.into_iter())
@@ -376,6 +394,8 @@ struct SearchResults {
     serialized_bytes: usize,
     bytes_searched: u64,
     files_searched: u64,
+    directories_visited: u64,
+    entries_visited: u64,
     binary_files_skipped: u64,
     lines_truncated: u64,
     truncated: bool,
@@ -392,6 +412,26 @@ struct SearchCheckpoint {
 }
 
 impl SearchResults {
+    fn record_directory(&mut self) -> bool {
+        if self.directories_visited == MAX_SEARCH_DIRECTORIES {
+            self.truncated = true;
+            self.limit_reached = true;
+            return false;
+        }
+        self.directories_visited = self.directories_visited.saturating_add(1);
+        true
+    }
+
+    fn record_entry(&mut self) -> bool {
+        if self.entries_visited == MAX_SEARCH_ENTRIES {
+            self.truncated = true;
+            self.limit_reached = true;
+            return false;
+        }
+        self.entries_visited = self.entries_visited.saturating_add(1);
+        true
+    }
+
     fn checkpoint(&self) -> SearchCheckpoint {
         SearchCheckpoint {
             matches_len: self.matches.len(),
@@ -527,6 +567,14 @@ fn bounded_search_output(
                 ("bytes_searched".to_string(), json!(results.bytes_searched)),
                 ("files_searched".to_string(), json!(results.files_searched)),
                 (
+                    "directories_visited".to_string(),
+                    json!(results.directories_visited),
+                ),
+                (
+                    "entries_visited".to_string(),
+                    json!(results.entries_visited),
+                ),
+                (
                     "binary_files_skipped".to_string(),
                     json!(results.binary_files_skipped),
                 ),
@@ -564,5 +612,34 @@ fn visible_utf8_prefix(bytes: &[u8]) -> Result<&str, ()> {
             std::str::from_utf8(&bytes[..error.valid_up_to()]).map_err(|_| ())
         }
         Err(_) => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SearchResults, MAX_SEARCH_DIRECTORIES, MAX_SEARCH_ENTRIES};
+
+    #[test]
+    fn global_directory_budget_stops_before_opening_another_directory() {
+        let mut results = SearchResults {
+            directories_visited: MAX_SEARCH_DIRECTORIES,
+            ..SearchResults::default()
+        };
+
+        assert!(!results.record_directory());
+        assert!(results.truncated);
+        assert!(results.limit_reached);
+    }
+
+    #[test]
+    fn global_entry_budget_stops_before_retaining_another_entry() {
+        let mut results = SearchResults {
+            entries_visited: MAX_SEARCH_ENTRIES,
+            ..SearchResults::default()
+        };
+
+        assert!(!results.record_entry());
+        assert!(results.truncated);
+        assert!(results.limit_reached);
     }
 }

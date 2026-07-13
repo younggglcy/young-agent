@@ -274,6 +274,7 @@ impl CodingWorkspace {
     ) -> io::Result<StagedFile> {
         use std::io::Write;
 
+        validate_staging_content_size(content.len())?;
         for _ in 0..100 {
             let candidate = random_patch_path("stage")?;
             let mut options = OpenOptions::new();
@@ -378,10 +379,10 @@ impl CodingWorkspace {
                 &mut staged.snapshot,
                 "patch staging file",
             ) {
-                return rollback_new_file_commit(directory, &staged, path, source);
+                return Err(published_target_changed(path, None, source));
             }
-            if let Err(source) = self.validate_installed_staging(directory, path, &staged) {
-                return rollback_new_file_commit(directory, &staged, path, source);
+            if let Err(source) = validate_installed_staging_slot(directory, path, &staged) {
+                return Err(published_target_changed(path, None, source));
             }
             Ok(())
         }
@@ -406,7 +407,7 @@ impl CodingWorkspace {
         {
             if let Err(source) = self
                 .validate_staging_slot(directory, &staged)
-                .and_then(|()| validate_replacement_slot(directory, path, &expected))
+                .and_then(|()| validate_replacement_slot_identity(directory, path, &expected))
             {
                 return cleanup_owned_staging_after_error(directory, &staged, source);
             }
@@ -420,75 +421,28 @@ impl CodingWorkspace {
             )
             .and_then(|()| refresh_replacement_after_rename(&mut expected))
             {
-                return rollback_existing_exchange(
-                    directory,
-                    &staged,
-                    path,
-                    &expected,
-                    &staged.path,
-                    source,
-                );
+                return Err(published_target_changed(path, Some(&staged.path), source));
             }
 
-            let validation = self
-                .validate_installed_staging(directory, path, &staged)
-                .and_then(|()| validate_replacement_slot(directory, &staged.path, &expected));
+            let validation =
+                validate_installed_staging_slot(directory, path, &staged).and_then(|()| {
+                    validate_replacement_slot_identity(directory, &staged.path, &expected)
+                });
             if let Err(source) = validation {
-                return rollback_existing_exchange(
-                    directory,
-                    &staged,
-                    path,
-                    &expected,
-                    &staged.path,
-                    source,
-                );
+                return Err(published_target_changed(path, Some(&staged.path), source));
             }
 
             let recovery_path = match claim_path(directory, &staged.path, "displaced") {
                 Ok(path) => path,
                 Err(source) => {
-                    return rollback_existing_exchange(
-                        directory,
-                        &staged,
-                        path,
-                        &expected,
-                        &staged.path,
-                        source,
-                    )
+                    return Err(published_target_changed(path, Some(&staged.path), source));
                 }
             };
             if let Err(source) = refresh_replacement_after_rename(&mut expected) {
-                return rollback_existing_exchange(
-                    directory,
-                    &staged,
-                    path,
-                    &expected,
-                    &recovery_path,
-                    source,
-                );
-            }
-            let final_validation = self
-                .validate_installed_staging(directory, path, &staged)
-                .and_then(|()| validate_replacement_slot(directory, &recovery_path, &expected));
-            if let Err(source) = final_validation {
-                return rollback_existing_exchange(
-                    directory,
-                    &staged,
-                    path,
-                    &expected,
-                    &recovery_path,
-                    source,
-                );
+                return Err(published_target_changed(path, Some(&recovery_path), source));
             }
             if let Err(source) = remove_claimed_replacement(directory, &recovery_path, &expected) {
-                return rollback_existing_exchange(
-                    directory,
-                    &staged,
-                    path,
-                    &expected,
-                    &recovery_path,
-                    source,
-                );
+                return Err(published_target_changed(path, Some(&recovery_path), source));
             }
             Ok(())
         }
@@ -503,42 +457,13 @@ impl CodingWorkspace {
     }
 
     fn validate_staging_slot(&self, directory: &Dir, staged: &StagedFile) -> io::Result<()> {
-        validate_security_metadata(&staged.file, "patch staging file")?;
-        let handle_snapshot = Self::file_snapshot(&staged.file)?;
-        let (slot, _) =
-            require_regular_file(directory.open_with(&staged.path, &regular_file_options())?)?;
-        validate_security_metadata(&slot, "patch staging file")?;
-        let slot_snapshot = Self::file_snapshot(&slot)?;
-        if handle_snapshot == staged.snapshot && slot_snapshot == staged.snapshot {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "patch staging file changed before commit",
-            ))
-        }
-    }
-
-    fn validate_installed_staging(
-        &self,
-        directory: &Dir,
-        path: &Path,
-        staged: &StagedFile,
-    ) -> io::Result<()> {
-        validate_security_metadata(&staged.file, "patch staging file")?;
-        let handle_snapshot = Self::file_snapshot(&staged.file)?;
-        let (installed, _) =
-            require_regular_file(directory.open_with(path, &regular_file_options())?)?;
-        validate_security_metadata(&installed, "installed patch file")?;
-        let installed_snapshot = Self::file_snapshot(&installed)?;
-        if handle_snapshot == staged.snapshot && installed_snapshot == staged.snapshot {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "patch target changed during commit; automatic cleanup was skipped",
-            ))
-        }
+        validate_snapshot_slot(
+            directory,
+            &staged.path,
+            &staged.snapshot,
+            "patch staging file",
+            "patch staging file changed before commit",
+        )
     }
 
     fn replacement_metadata(
@@ -660,7 +585,7 @@ fn file_digest(file: &File, size: u64) -> io::Result<[u8; 32]> {
 
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
+    let mut buffer = [0u8; 64 * 1024];
     while offset < size {
         let remaining = usize::try_from((size - offset).min(buffer.len() as u64))
             .expect("bounded digest chunk fits usize");
@@ -697,11 +622,19 @@ impl FileSnapshot {
             && self.stat.gid == other.stat.gid
             && self.stat.mode == other.stat.mode
     }
+
+    fn matches_metadata(&self, metadata: &Metadata) -> bool {
+        self.stat == file_stat_snapshot(metadata)
+    }
 }
 
 #[cfg(not(unix))]
 impl FileSnapshot {
     fn same_payload_and_metadata(&self, _other: &Self) -> bool {
+        false
+    }
+
+    fn matches_metadata(&self, _metadata: &Metadata) -> bool {
         false
     }
 }
@@ -733,6 +666,17 @@ fn validate_security_metadata(file: &File, subject: &str) -> io::Result<()> {
     }
 }
 
+fn validate_staging_content_size(size: usize) -> io::Result<()> {
+    if size as u64 > MAX_FILE_SNAPSHOT_BYTES {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("patch result exceeds {MAX_FILE_SNAPSHOT_BYTES} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn refresh_snapshot_after_rename(
     file: &File,
     snapshot: &mut FileSnapshot,
@@ -758,15 +702,41 @@ fn refresh_replacement_after_rename(expected: &mut ReplacementMetadata) -> io::R
     )
 }
 
-fn validate_replacement_slot(
+fn validate_replacement_slot_identity(
     directory: &Dir,
     path: &Path,
     expected: &ReplacementMetadata,
 ) -> io::Result<()> {
-    validate_security_metadata(&expected.file, "atomic patch target")?;
-    if CodingWorkspace::file_snapshot(&expected.file)? != expected.snapshot {
-        return Err(patch_target_changed());
-    }
+    validate_snapshot_slot(
+        directory,
+        path,
+        &expected.snapshot,
+        "atomic patch target",
+        "patch target changed during commit",
+    )
+}
+
+fn validate_installed_staging_slot(
+    directory: &Dir,
+    path: &Path,
+    staged: &StagedFile,
+) -> io::Result<()> {
+    validate_snapshot_slot(
+        directory,
+        path,
+        &staged.snapshot,
+        "installed patch file",
+        "patch target changed during commit; automatic cleanup was skipped",
+    )
+}
+
+fn validate_snapshot_slot(
+    directory: &Dir,
+    path: &Path,
+    expected: &FileSnapshot,
+    subject: &str,
+    changed_message: &str,
+) -> io::Result<()> {
     let (slot, metadata) =
         require_regular_file(directory.open_with(path, &regular_file_options())?)?;
     #[cfg(unix)]
@@ -780,11 +750,23 @@ fn validate_replacement_slot(
             ));
         }
     }
-    validate_security_metadata(&slot, "atomic patch target")?;
-    if CodingWorkspace::file_snapshot(&slot)? == expected.snapshot {
+    validate_security_metadata(&slot, subject)?;
+    let after = slot.metadata()?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::MetadataExt as _;
+
+        if after.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic patch refuses files with multiple hard links",
+            ));
+        }
+    }
+    if expected.matches_metadata(&after) {
         Ok(())
     } else {
-        Err(patch_target_changed())
+        Err(io::Error::new(io::ErrorKind::WouldBlock, changed_message))
     }
 }
 
@@ -860,6 +842,23 @@ fn patch_target_changed() -> io::Error {
     )
 }
 
+fn published_target_changed(
+    target: &Path,
+    recovery: Option<&Path>,
+    source: io::Error,
+) -> io::Error {
+    let recovery = recovery.map_or_else(String::new, |path| {
+        format!("; displaced data was preserved as '{}'", path.display())
+    });
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "patch was atomically published at '{}', but post-commit validation failed ({source}); the published target was preserved{recovery}",
+            target.display()
+        ),
+    )
+}
+
 fn cleanup_staging_after_error<T>(
     directory: &Dir,
     claimed_path: &Path,
@@ -867,14 +866,26 @@ fn cleanup_staging_after_error<T>(
     expected: FileSnapshot,
     source: io::Error,
 ) -> io::Result<T> {
-    if !claimed_staging_matches(directory, claimed_path, staging_file, expected)? {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "patch operation failed ({source}); claimed recovery path '{}' did not contain the owned staging file and was preserved",
-                claimed_path.display()
-            ),
-        ));
+    match claimed_staging_matches(directory, claimed_path, staging_file, expected) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "patch operation failed ({source}); claimed recovery path '{}' changed and was preserved",
+                    claimed_path.display()
+                ),
+            ));
+        }
+        Err(validation) => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "patch operation failed ({source}); claimed recovery path '{}' could not be validated and was preserved ({validation})",
+                    claimed_path.display()
+                ),
+            ));
+        }
     }
     match directory.remove_file(claimed_path) {
         Ok(()) => Err(source),
@@ -914,7 +925,15 @@ fn cleanup_open_staging_after_error<T>(
     staging_file: &File,
     source: io::Error,
 ) -> io::Result<T> {
-    let expected = CodingWorkspace::file_snapshot(staging_file)?;
+    let expected = CodingWorkspace::file_snapshot(staging_file).map_err(|validation| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "patch operation failed ({source}); staging file '{}' could not be validated and was preserved ({validation})",
+                staging_path.display()
+            ),
+        )
+    })?;
     cleanup_expected_staging_after_error(directory, staging_path, staging_file, expected, source)
 }
 
@@ -938,21 +957,42 @@ fn cleanup_expected_staging_after_error<T>(
             ))
         }
     };
-    if !claimed_staging_matches(directory, &claimed, staging_file, expected)? {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        restore_claimed_path(
-            directory,
-            &claimed,
-            staging_path,
-            &format!("patch operation failed ({source}); staging identity changed"),
-        )?;
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "patch operation failed ({source}); concurrent staging entry was restored as '{}'",
-                staging_path.display()
-            ),
-        ));
+    match claimed_staging_matches(directory, &claimed, staging_file, expected) {
+        Ok(true) => {}
+        Ok(false) => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            restore_claimed_path(
+                directory,
+                &claimed,
+                staging_path,
+                &format!("patch operation failed ({source}); staging identity changed"),
+            )?;
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "patch operation failed ({source}); concurrent staging entry was restored as '{}'",
+                    staging_path.display()
+                ),
+            ));
+        }
+        Err(validation) => {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            restore_claimed_path(
+                directory,
+                &claimed,
+                staging_path,
+                &format!(
+                    "patch operation failed ({source}); staging ownership was indeterminate ({validation})"
+                ),
+            )?;
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "patch operation failed ({source}); indeterminate staging entry was restored as '{}' ({validation})",
+                    staging_path.display()
+                ),
+            ));
+        }
     }
     cleanup_staging_after_error(directory, &claimed, staging_file, expected, source)
 }
@@ -1014,7 +1054,7 @@ fn remove_claimed_replacement(
     recovery_path: &Path,
     expected: &ReplacementMetadata,
 ) -> io::Result<()> {
-    validate_replacement_slot(directory, recovery_path, expected)?;
+    validate_replacement_slot_identity(directory, recovery_path, expected)?;
     directory.remove_file(recovery_path)
 }
 
@@ -1035,116 +1075,6 @@ fn restore_claimed_path(
             ),
         )
     })
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rollback_new_file_commit(
-    directory: &Dir,
-    staged: &StagedFile,
-    path: &Path,
-    source: io::Error,
-) -> io::Result<()> {
-    let claimed = claim_path(directory, path, "new-rollback").map_err(|claim| {
-        io::Error::new(
-            claim.kind(),
-            format!(
-                "new-file patch commit failed ({source}); target '{}' could not be claimed for rollback ({claim})",
-                path.display()
-            ),
-        )
-    })?;
-    if claimed_staging_matches(directory, &claimed, &staged.file, staged.snapshot)? {
-        return cleanup_staging_after_error(
-            directory,
-            &claimed,
-            &staged.file,
-            staged.snapshot,
-            source,
-        );
-    }
-    restore_claimed_path(
-        directory,
-        &claimed,
-        path,
-        &format!("new-file patch commit failed ({source}); target identity changed"),
-    )?;
-    Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        format!("new-file patch commit failed ({source}); concurrent target was restored"),
-    ))
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rollback_existing_exchange(
-    directory: &Dir,
-    staged: &StagedFile,
-    path: &Path,
-    expected: &ReplacementMetadata,
-    recovery_path: &Path,
-    source: io::Error,
-) -> io::Result<()> {
-    let published_claim = claim_path(directory, path, "published-rollback").map_err(|claim| {
-        io::Error::new(
-            claim.kind(),
-            format!(
-                "patch commit failed ({source}); published target could not be claimed for rollback ({claim}); displaced file remains at '{}'",
-                recovery_path.display()
-            ),
-        )
-    })?;
-    if !claimed_staging_matches(directory, &published_claim, &staged.file, staged.snapshot)? {
-        restore_claimed_path(
-            directory,
-            &published_claim,
-            path,
-            &format!("patch commit failed ({source}); published target identity changed"),
-        )?;
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "patch commit failed ({source}); concurrent target was restored and displaced file remains at '{}'",
-                recovery_path.display()
-            ),
-        ));
-    }
-    if let Err(recovery) = validate_replacement_slot(directory, recovery_path, expected) {
-        restore_claimed_path(
-            directory,
-            &published_claim,
-            path,
-            &format!(
-                "patch commit failed ({source}); displaced target validation failed ({recovery})"
-            ),
-        )?;
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "patch commit failed ({source}); published target was restored because recovery '{}' changed ({recovery})",
-                recovery_path.display()
-            ),
-        ));
-    }
-    if let Err(restore) = rename_no_replace(directory, recovery_path, path) {
-        restore_claimed_path(
-            directory,
-            &published_claim,
-            path,
-            &format!(
-                "patch commit failed ({source}); original target could not be restored ({restore})"
-            ),
-        )?;
-        return Err(io::Error::new(
-            restore.kind(),
-            format!("patch commit failed ({source}); original target rollback failed ({restore})"),
-        ));
-    }
-    cleanup_staging_after_error(
-        directory,
-        &published_claim,
-        &staged.file,
-        staged.snapshot,
-        source,
-    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
@@ -1778,6 +1708,17 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
+    #[test]
+    fn staging_rejects_an_oversized_result_before_creating_a_file() {
+        let oversized =
+            usize::try_from(super::MAX_FILE_SNAPSHOT_BYTES + 1).expect("snapshot limit fits usize");
+
+        let error = super::validate_staging_content_size(oversized)
+            .expect_err("oversized staging content must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn new_file_validation_failure_preserves_a_concurrently_modified_target() {
@@ -1810,13 +1751,12 @@ mod tests {
         std::fs::write(root.join("created.txt"), "changed\n")
             .expect("installed staging is concurrently changed");
 
-        let error = super::rollback_new_file_commit(
+        let error = super::validate_installed_staging_slot(
             &directory,
-            &staged,
             std::path::Path::new("created.txt"),
-            super::patch_target_changed(),
+            &staged,
         )
-        .expect_err("failed validation must roll back the new target");
+        .expect_err("concurrent target mutation must fail validation");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(
@@ -2010,7 +1950,7 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn rollback_preserves_a_second_concurrent_target_replacement() {
+    fn post_commit_validation_preserves_a_second_concurrent_target_replacement() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after the Unix epoch")
@@ -2037,15 +1977,12 @@ mod tests {
         std::fs::write(root.join("target.txt"), "second concurrent\n")
             .expect("second concurrent target is written");
 
-        let error = super::rollback_existing_exchange(
+        let error = super::validate_installed_staging_slot(
             &directory,
-            &staged,
             std::path::Path::new("target.txt"),
-            &expected,
-            &staged.path,
-            super::patch_target_changed(),
+            &staged,
         )
-        .expect_err("rollback must not overwrite a second replacement");
+        .expect_err("post-commit validation must detect a second replacement");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(
