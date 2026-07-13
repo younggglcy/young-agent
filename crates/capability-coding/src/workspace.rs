@@ -22,6 +22,7 @@ thread_local! {
     static INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
     static INJECT_RECOVERY_CONTENT_REPLACEMENT_BEFORE_EXCHANGE_FAILURE: Cell<bool> = const { Cell::new(false) };
     static INJECT_RECOVERY_SECURITY_METADATA_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_RECOVERY_SYMLINK_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
@@ -642,6 +643,16 @@ impl CodingWorkspace {
                     ));
                 }
             }
+            #[cfg(test)]
+            if INJECT_RECOVERY_SYMLINK_AFTER_EXCHANGE.with(|injected| injected.replace(false)) {
+                if let Err(source) =
+                    inject_symlink_recovery_content(&recovery.directory, &staged.path)
+                {
+                    return Err(published_commit_failure(
+                        directory, recovery, &staged, &expected, source,
+                    ));
+                }
+            }
             if let Err(source) = refresh_snapshot_after_rename(
                 &staged.file,
                 &mut staged.snapshot,
@@ -1149,12 +1160,27 @@ fn validate_snapshot_slot(
     subject: &str,
     changed_message: &str,
 ) -> io::Result<()> {
+    let entry_before = directory.symlink_metadata(path)?;
+    if !entry_before.is_file() || entry_before.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, changed_message));
+    }
     let (slot, metadata) =
         require_regular_file(directory.open_with(path, &regular_file_options())?)?;
+    let entry_after = directory.symlink_metadata(path)?;
+    if !entry_after.is_file() || entry_after.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, changed_message));
+    }
     #[cfg(unix)]
     {
         use cap_std::fs::MetadataExt as _;
 
+        if entry_before.dev() != metadata.dev()
+            || entry_before.ino() != metadata.ino()
+            || entry_after.dev() != metadata.dev()
+            || entry_after.ino() != metadata.ino()
+        {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, changed_message));
+        }
         if metadata.nlink() != 1 {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1432,6 +1458,9 @@ fn inspect_preserved_recovery_content(
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn recovery_content_failure_kind(source: &io::Error) -> RecoveryContentEvidence {
+    if source.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        return RecoveryContentEvidence::Mismatch;
+    }
     match source.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => {
             RecoveryContentEvidence::Mismatch
@@ -1609,6 +1638,13 @@ fn inject_recovery_extended_attribute(file: &File) -> io::Result<()> {
         rustix::fs::XattrFlags::empty(),
     )
     .map_err(io::Error::from)
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+fn inject_symlink_recovery_content(recovery: &Dir, path: &Path) -> io::Result<()> {
+    const MOVED_ORIGINAL: &str = "moved-original-before-recovery-symlink";
+    recovery.rename(path, recovery, MOVED_ORIGINAL)?;
+    rustix::fs::symlinkat(MOVED_ORIGINAL, recovery, path).map_err(io::Error::from)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -2734,6 +2770,66 @@ mod tests {
         assert!(super::file_has_extended_attributes(&candidate_file).unwrap());
 
         drop((candidate_file, target, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn post_publication_recovery_symlink_is_reported_as_unlocated() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (target, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let snapshot = CodingWorkspace::file_snapshot(&target).expect("snapshot reads");
+        super::INJECT_RECOVERY_SYMLINK_AFTER_EXCHANGE.with(|injected| injected.set(true));
+
+        let error = workspace
+            .replace_existing_atomically(std::path::Path::new("target.txt"), b"patched\n", snapshot)
+            .expect_err("recovery symlink replacement must fail post-publication validation");
+
+        let super::AtomicReplaceError::Published {
+            recovery: super::PublishedRecovery::Unlocated,
+            ..
+        } = error
+        else {
+            panic!("a structural recovery entry mismatch must be unlocated");
+        };
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "patched\n"
+        );
+        let recovery = root.join(super::RECOVERY_DIRECTORY);
+        let symlink = std::fs::read_dir(&recovery)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".young-agent-patch-displaced-")
+            })
+            .expect("replacement symlink remains present");
+        assert!(std::fs::symlink_metadata(symlink.path())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("moved-original-before-recovery-symlink"))
+                .unwrap(),
+            "original\n"
+        );
+
+        drop((target, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
