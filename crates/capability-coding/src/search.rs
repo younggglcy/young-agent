@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,7 +104,12 @@ pub(crate) fn execute(
 
 struct DirectoryFrame {
     relative_path: PathBuf,
-    entries: std::vec::IntoIter<DirEntry>,
+    entries: std::vec::IntoIter<NamedEntry>,
+}
+
+struct NamedEntry {
+    file_name: OsString,
+    entry: DirEntry,
 }
 
 fn search_directory(
@@ -131,7 +137,7 @@ fn search_directory(
                 false,
             ));
         }
-        let Some(entry) = frame.entries.next() else {
+        let Some(NamedEntry { file_name, entry }) = frame.entries.next() else {
             stack.pop();
             continue;
         };
@@ -145,7 +151,6 @@ fn search_directory(
         if file_type.is_symlink() {
             continue;
         }
-        let file_name = entry.file_name();
         let entry_path = frame.relative_path.join(&file_name);
         if file_type.is_dir() {
             if file_name == ".git" || file_name == RECOVERY_DIRECTORY {
@@ -196,7 +201,7 @@ fn sorted_entries(
     relative_path: &Path,
     cancellation: &AtomicBool,
     results: &mut SearchResults,
-) -> Result<std::vec::IntoIter<DirEntry>, ToolOutput> {
+) -> Result<std::vec::IntoIter<NamedEntry>, ToolOutput> {
     let entries = directory.entries().map_err(|source| {
         failure(
             "workspace_io_error",
@@ -233,9 +238,12 @@ fn sorted_entries(
         if !results.record_entry() {
             break;
         }
-        sorted.push(entry);
+        sorted.push(NamedEntry {
+            file_name: entry.file_name(),
+            entry,
+        });
     }
-    sorted.sort_by_key(DirEntry::file_name);
+    sorted.sort_unstable_by(|left, right| left.file_name.cmp(&right.file_name));
     Ok(sorted.into_iter())
 }
 

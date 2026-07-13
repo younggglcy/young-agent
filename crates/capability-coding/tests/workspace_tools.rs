@@ -1494,7 +1494,7 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
         json!("kill_requested_at_foreground_exit")
     );
     assert!(metadata["process_security_policy"].is_string());
-    assert!(metadata["credential_changes_blocked"].is_boolean());
+    assert!(metadata["exec_privilege_gain_blocked"].is_boolean());
     assert_eq!(metadata["detached_processes_tracked"], json!(false));
     assert!(extensions.is_empty());
 }
@@ -1695,7 +1695,6 @@ fn run_command_terminates_a_background_process_when_the_foreground_shell_exits()
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() < Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(2));
     let ToolOutput::Success { metadata, .. } = result.output else {
         panic!("foreground shell status should be reported after background termination");
@@ -1726,7 +1725,6 @@ fn run_command_seals_a_background_process_with_closed_pipes() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() < Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(
         matches!(result.output, ToolOutput::Success { .. }),

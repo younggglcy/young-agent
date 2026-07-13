@@ -19,6 +19,9 @@ API 完成 `open`、遍历、创建、删除与 `rename`。这样边界会在每
 内的 `rename` 原子替换，避免失败时留下半写状态。原子替换会改变 inode，因此遇到
 hard link、extended ACL、xattr 或无法保留的 owner/group 时应明确拒绝，而不是静默
 丢失安全 metadata；新文件则用平台的 no-replace rename 提交，避免并发创建竞态。
+失败输出还要把 publication state 与 recovery evidence 分开：只有 recovery namespace
+identity/policy、entry identity 和 payload snapshot 在 move 后复核通过，才能标记为
+`LocatedVerified`；任一证据缺失都应降级为 content/policy unverified 或 unlocated。
 
 用户选定的 workspace root 是权限边界；所属 git worktree 是上下文，不应反过来
 扩大权限。worktree root、per-worktree git dir 和 common git dir 可以记录到工具
@@ -30,9 +33,9 @@ async-signal-safe 的 `fchdir`，直接绑定已打开的 workspace handle；无
 平台应安全拒绝。Issue #7 还限制完整序列化输出、把取消传播到整个进程组，并让 pipe
 reader 可停止回收。进程组 leader 退出后不能先 reap 再继续用它的 PID 作为 PGID：
 该数值可能被复用，后续探测或取消会等待、甚至终止无关进程。macOS/Linux 实现应先用
-`waitid(..., WNOWAIT)` 观察终态，并为该组保留一个由父进程直接持有的 sentinel。
-用户 shell 源码保持原样；leader 终态后仍保留其身份，先终止 background 与同组残余成员，
-再完成 leader/sentinel reap。成功提交不应依赖
+`waitid(..., WNOWAIT)` 观察终态。用户 shell 源码保持原样；leader 终态后仍保留其
+unreaped identity 作为 PGID reservation，给已经开始的 fork 让出有限调度机会后，先终止
+background 与同组残余成员，再完成 leader reap。成功提交不应依赖
 `/proc` 或 `libproc` 的非原子成员快照；无法提供非回收终态观察的平台应在 spawn 前拒绝。
 Linux 额外用 `no_new_privs` 阻止后代通过 exec 获得新的 signal 权限；macOS 没有等价的
 portable primitive，因此 manifest 与 output 只能承诺向仍可 signal 的同组成员请求终止，

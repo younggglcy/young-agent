@@ -688,6 +688,12 @@ impl PatchError {
                         "located_policy_unverified",
                         "unverified",
                     ),
+                    PublishedRecovery::LocatedContentAndPolicyUnverified(path) => (
+                        "patch_not_published_with_recovery",
+                        vec![display_relative_path(&path)],
+                        "located_content_and_policy_unverified",
+                        "unverified",
+                    ),
                     PublishedRecovery::Unlocated => (
                         "patch_not_published_recovery_unlocated",
                         Vec::new(),
@@ -747,6 +753,13 @@ impl PatchError {
                             "published_with_recovery",
                             vec![display_relative_path(&path)],
                             "located_policy_unverified",
+                            "unverified",
+                        ),
+                        PublishedRecovery::LocatedContentAndPolicyUnverified(path) => (
+                            "patch_published_with_recovery",
+                            "published_with_recovery",
+                            vec![display_relative_path(&path)],
+                            "located_content_and_policy_unverified",
                             "unverified",
                         ),
                         PublishedRecovery::NotApplicableNewFile => (

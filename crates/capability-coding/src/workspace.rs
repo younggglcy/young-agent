@@ -18,6 +18,8 @@ use std::cell::Cell;
 thread_local! {
     static INJECT_RECOVERY_POLICY_FAILURE_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
     static INJECT_NEW_FILE_VALIDATION_FAILURE_AFTER_RENAME: Cell<bool> = const { Cell::new(false) };
+    static INJECT_RECOVERY_NAMESPACE_SWAP_AFTER_CLEANUP_MOVE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
@@ -199,22 +201,25 @@ impl CodingWorkspace {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
             })
-            .map_err(AtomicReplaceError::before)?;
+            .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         let directory = self
             .root_dir
             .open_dir(parent)
-            .map_err(AtomicReplaceError::before)?;
+            .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         let metadata = self
             .replacement_metadata(&directory, Path::new(file_name))
-            .map_err(AtomicReplaceError::before)?;
+            .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         if metadata.snapshot != expected_snapshot {
-            return Err(AtomicReplaceError::before(patch_target_changed()));
+            return Err(AtomicReplaceError::before_within(
+                patch_target_changed(),
+                parent,
+            ));
         }
-        let recovery_directory =
-            open_recovery_namespace(&directory).map_err(AtomicReplaceError::before)?;
+        let recovery_directory = open_recovery_namespace(&directory)
+            .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         let staged = self
             .stage_content(&directory, content, Some(&metadata))
-            .map_err(AtomicReplaceError::before)?;
+            .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         let recovery = self
             .commit_existing_file(
                 &directory,
@@ -250,17 +255,19 @@ impl CodingWorkspace {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
             })
-            .map_err(AtomicCreateError::before)?;
+            .map_err(|source| AtomicCreateError::before_within(source, parent))?;
         let directory = self
             .root_dir
             .open_dir(parent)
-            .map_err(AtomicCreateError::before)?;
+            .map_err(|source| AtomicCreateError::before_within(source, parent))?;
         let staged = self
             .stage_content(&directory, content, None)
-            .map_err(AtomicCreateError::before)?;
+            .map_err(|source| AtomicCreateError::before_within(source, parent))?;
         self.commit_new_file(&directory, staged, Path::new(file_name))
             .map_err(|error| match error {
-                CommitNewError::BeforePublication(source) => AtomicCreateError::before(source),
+                CommitNewError::BeforePublication(source) => {
+                    AtomicCreateError::before_within(source, parent)
+                }
                 CommitNewError::Published(source) => AtomicCreateError::Published {
                     source,
                     target: path.to_path_buf(),
@@ -274,10 +281,13 @@ impl CodingWorkspace {
         _path: &Path,
         _content: &[u8],
     ) -> Result<(), AtomicCreateError> {
-        Err(AtomicCreateError::before(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic no-replace patch commits are not supported on this platform",
-        )))
+        Err(AtomicCreateError::before_within(
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic no-replace patch commits are not supported on this platform",
+            ),
+            Path::new("."),
+        ))
     }
 
     pub(crate) fn metadata(&self) -> Value {
@@ -534,6 +544,18 @@ impl CodingWorkspace {
                     ));
                 }
             }
+            #[cfg(test)]
+            if INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE
+                .with(|injected| injected.replace(false))
+            {
+                if let Err(source) =
+                    inject_replaced_recovery_content(&recovery.directory, &staged.path)
+                {
+                    return Err(published_commit_failure(
+                        directory, recovery, &staged, source,
+                    ));
+                }
+            }
             if let Err(source) = refresh_snapshot_after_rename(
                 &staged.file,
                 &mut staged.snapshot,
@@ -670,9 +692,9 @@ pub(crate) enum AtomicReplaceError {
 }
 
 impl AtomicReplaceError {
-    fn before(source: io::Error) -> Self {
-        let recovery =
-            preserved_recovery_from_io_error(&source).map(PublishedRecovery::LocatedVerified);
+    fn before_within(source: io::Error, parent: &Path) -> Self {
+        let recovery = preserved_recovery_from_io_error(&source)
+            .map(|recovery| recovery.within_parent(parent));
         Self::BeforePublication { source, recovery }
     }
 }
@@ -689,9 +711,9 @@ pub(crate) enum AtomicCreateError {
 }
 
 impl AtomicCreateError {
-    fn before(source: io::Error) -> Self {
-        let recovery =
-            preserved_recovery_from_io_error(&source).map(PublishedRecovery::LocatedVerified);
+    fn before_within(source: io::Error, parent: &Path) -> Self {
+        let recovery = preserved_recovery_from_io_error(&source)
+            .map(|recovery| recovery.within_parent(parent));
         Self::BeforePublication { source, recovery }
     }
 }
@@ -707,11 +729,12 @@ impl AtomicCreateError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum PublishedRecovery {
     LocatedVerified(PathBuf),
     LocatedContentUnverified(PathBuf),
     LocatedPolicyUnverified(PathBuf),
+    LocatedContentAndPolicyUnverified(PathBuf),
     NotApplicableNewFile,
     Unlocated,
 }
@@ -724,6 +747,9 @@ impl PublishedRecovery {
                 Self::LocatedContentUnverified(parent.join(path))
             }
             Self::LocatedPolicyUnverified(path) => Self::LocatedPolicyUnverified(parent.join(path)),
+            Self::LocatedContentAndPolicyUnverified(path) => {
+                Self::LocatedContentAndPolicyUnverified(parent.join(path))
+            }
             Self::NotApplicableNewFile => Self::NotApplicableNewFile,
             Self::Unlocated => Self::Unlocated,
         }
@@ -757,8 +783,7 @@ enum CommitError {
 
 impl CommitError {
     fn before(source: io::Error) -> Self {
-        let recovery =
-            preserved_recovery_from_io_error(&source).map(PublishedRecovery::LocatedVerified);
+        let recovery = preserved_recovery_from_io_error(&source);
         Self::BeforePublication { source, recovery }
     }
 }
@@ -1083,11 +1108,11 @@ fn move_claimed_to_recovery_namespace(
     directory: &Dir,
     claimed_path: &Path,
     kind: &str,
-) -> io::Result<PathBuf> {
+) -> io::Result<(RecoveryNamespace, PathBuf)> {
     let recovery = open_recovery_namespace(directory)?;
     let destination =
         move_to_recovery_namespace(directory, claimed_path, &recovery.directory, kind)?;
-    Ok(PathBuf::from(RECOVERY_DIRECTORY).join(destination))
+    Ok((recovery, destination))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1124,7 +1149,7 @@ fn move_claimed_to_recovery_namespace(
     _directory: &Dir,
     _claimed_path: &Path,
     _kind: &str,
-) -> io::Result<PathBuf> {
+) -> io::Result<(RecoveryNamespace, PathBuf)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "namespaced patch recovery is not supported on this platform",
@@ -1197,6 +1222,60 @@ fn validate_recovery_namespace_slot(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preserved_recovery_evidence(
+    parent: &Dir,
+    recovery: &RecoveryNamespace,
+    path: &Path,
+    file: &File,
+    expected: FileSnapshot,
+    refreshed: bool,
+) -> PublishedRecovery {
+    let policy_before = match validate_recovery_namespace_slot(parent, recovery) {
+        Ok(()) => true,
+        Err(RecoveryNamespaceError::Policy(_)) => false,
+        Err(RecoveryNamespaceError::Identity(_)) => return PublishedRecovery::Unlocated,
+    };
+    let content_verified =
+        refreshed && validate_preserved_recovery_content(recovery, path, file, expected).is_ok();
+    let policy_after = match validate_recovery_namespace_slot(parent, recovery) {
+        Ok(()) => true,
+        Err(RecoveryNamespaceError::Policy(_)) => false,
+        Err(RecoveryNamespaceError::Identity(_)) => return PublishedRecovery::Unlocated,
+    };
+    let policy_verified = policy_before && policy_after;
+    let located = PathBuf::from(RECOVERY_DIRECTORY).join(path);
+    match (content_verified, policy_verified) {
+        (true, true) => PublishedRecovery::LocatedVerified(located),
+        (false, true) => PublishedRecovery::LocatedContentUnverified(located),
+        (true, false) => PublishedRecovery::LocatedPolicyUnverified(located),
+        (false, false) => PublishedRecovery::LocatedContentAndPolicyUnverified(located),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn validate_preserved_recovery_content(
+    recovery: &RecoveryNamespace,
+    path: &Path,
+    file: &File,
+    expected: FileSnapshot,
+) -> io::Result<()> {
+    validate_security_metadata(file, "preserved patch staging file")?;
+    if CodingWorkspace::file_snapshot(file)? != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "preserved patch staging content changed during recovery",
+        ));
+    }
+    validate_snapshot_slot(
+        &recovery.directory,
+        path,
+        &expected,
+        "preserved patch staging file",
+        "preserved patch staging entry changed during recovery",
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn preserved_content_failure(
     parent: &Dir,
     recovery: &RecoveryNamespace,
@@ -1209,7 +1288,20 @@ fn preserved_content_failure(
             source,
             recovery: Some(PublishedRecovery::LocatedContentUnverified(path)),
         },
-        Err(error) => preserved_namespace_failure_with_source(staged, error, source),
+        Err(RecoveryNamespaceError::Policy(policy)) => CommitError::BeforePublication {
+            source: io::Error::new(
+                source.kind(),
+                format!("{source}; recovery policy validation failed ({policy})"),
+            ),
+            recovery: Some(PublishedRecovery::LocatedContentAndPolicyUnverified(path)),
+        },
+        Err(RecoveryNamespaceError::Identity(identity)) => CommitError::BeforePublication {
+            source: io::Error::new(
+                source.kind(),
+                format!("{source}; recovery namespace identity was lost ({identity})"),
+            ),
+            recovery: Some(PublishedRecovery::Unlocated),
+        },
     }
 }
 
@@ -1276,7 +1368,7 @@ fn published_commit_failure(
     match validate_recovery_namespace_slot(parent, recovery) {
         Ok(()) => CommitError::Published {
             source,
-            recovery: PublishedRecovery::LocatedVerified(
+            recovery: PublishedRecovery::LocatedContentUnverified(
                 PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
             ),
         },
@@ -1285,7 +1377,7 @@ fn published_commit_failure(
                 source.kind(),
                 format!("{source}; recovery policy validation failed ({policy})"),
             ),
-            recovery: PublishedRecovery::LocatedPolicyUnverified(
+            recovery: PublishedRecovery::LocatedContentAndPolicyUnverified(
                 PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
             ),
         },
@@ -1382,6 +1474,24 @@ fn inject_invalid_recovery_policy(recovery: &Dir) -> io::Result<()> {
     let mut file = recovery.open_with(".gitignore", &options)?;
     file.write_all(b"unexpected\n")?;
     file.sync_all()
+}
+
+#[cfg(test)]
+fn inject_replaced_recovery_content(recovery: &Dir, path: &Path) -> io::Result<()> {
+    use std::io::Write as _;
+
+    recovery.rename(path, recovery, "moved-original-after-exchange")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        options.mode(0o600);
+    }
+    let mut replacement = recovery.open_with(path, &options)?;
+    replacement.write_all(b"concurrent replacement\n")?;
+    replacement.sync_all()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1522,7 +1632,8 @@ fn cleanup_expected_staging_after_error<T>(
             ));
         }
     }
-    let recovery = move_claimed_to_recovery_namespace(directory, &claimed, "failed")
+    let (recovery_namespace, recovery_path) =
+        move_claimed_to_recovery_namespace(directory, &claimed, "failed")
         .map_err(|recovery| {
             io::Error::new(
                 recovery.kind(),
@@ -1532,6 +1643,29 @@ fn cleanup_expected_staging_after_error<T>(
                 ),
             )
         })?;
+    #[cfg(test)]
+    if INJECT_RECOVERY_NAMESPACE_SWAP_AFTER_CLEANUP_MOVE.with(|injected| injected.replace(false)) {
+        directory.rename(
+            RECOVERY_DIRECTORY,
+            directory,
+            "moved-recovery-after-cleanup",
+        )?;
+        drop(open_recovery_namespace(directory)?);
+    }
+    let mut recovery_snapshot = expected;
+    let recovery_refresh = refresh_snapshot_after_rename(
+        staging_file,
+        &mut recovery_snapshot,
+        "preserved patch staging file",
+    );
+    let recovery = preserved_recovery_evidence(
+        directory,
+        &recovery_namespace,
+        &recovery_path,
+        staging_file,
+        recovery_snapshot,
+        recovery_refresh.is_ok(),
+    );
     Err(io::Error::new(
         source.kind(),
         PreservedStagingError { source, recovery },
@@ -1541,17 +1675,28 @@ fn cleanup_expected_staging_after_error<T>(
 #[derive(Debug)]
 struct PreservedStagingError {
     source: io::Error,
-    recovery: PathBuf,
+    recovery: PublishedRecovery,
 }
 
 impl fmt::Display for PreservedStagingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "patch operation failed ({}); owned staging data was preserved as recovery file '{}'",
-            self.source,
-            self.recovery.display()
-        )
+        write!(formatter, "patch operation failed ({})", self.source)?;
+        match &self.recovery {
+            PublishedRecovery::LocatedVerified(path)
+            | PublishedRecovery::LocatedContentUnverified(path)
+            | PublishedRecovery::LocatedPolicyUnverified(path)
+            | PublishedRecovery::LocatedContentAndPolicyUnverified(path) => write!(
+                formatter,
+                "; owned staging data was preserved as recovery file '{}'",
+                path.display()
+            ),
+            PublishedRecovery::Unlocated => formatter.write_str(
+                "; owned staging data was preserved, but its recovery location could not be verified",
+            ),
+            PublishedRecovery::NotApplicableNewFile => formatter.write_str(
+                "; owned staging data has no applicable recovery location",
+            ),
+        }
     }
 }
 
@@ -1561,7 +1706,7 @@ impl Error for PreservedStagingError {
     }
 }
 
-fn preserved_recovery_from_io_error(source: &io::Error) -> Option<PathBuf> {
+fn preserved_recovery_from_io_error(source: &io::Error) -> Option<PublishedRecovery> {
     source
         .get_ref()
         .and_then(|source| source.downcast_ref::<PreservedStagingError>())
@@ -2347,6 +2492,59 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn post_publication_recovery_replacement_is_not_reported_as_verified() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-content-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (target, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let snapshot = CodingWorkspace::file_snapshot(&target).expect("snapshot reads");
+        super::INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE
+            .with(|injected| injected.set(true));
+
+        let error = workspace
+            .replace_existing_atomically(std::path::Path::new("target.txt"), b"patched\n", snapshot)
+            .expect_err("replaced recovery entry must fail post-publication validation");
+
+        let super::AtomicReplaceError::Published {
+            recovery: super::PublishedRecovery::LocatedContentUnverified(recovery),
+            ..
+        } = error
+        else {
+            panic!("replaced recovery content must be located but content-unverified");
+        };
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "patched\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(&recovery)).unwrap(),
+            "concurrent replacement\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                root.join(super::RECOVERY_DIRECTORY)
+                    .join("moved-original-after-exchange")
+            )
+            .unwrap(),
+            "original\n"
+        );
+
+        drop((target, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn create_new_never_removes_an_existing_file() {
@@ -2358,13 +2556,13 @@ mod tests {
             "young-workspace-create-new-{}-{nonce}",
             std::process::id()
         ));
-        std::fs::create_dir(&root).expect("test workspace is created");
-        std::fs::write(root.join("owned.txt"), "concurrent owner\n")
+        std::fs::create_dir_all(root.join("src")).expect("nested test workspace is created");
+        std::fs::write(root.join("src/owned.txt"), "concurrent owner\n")
             .expect("existing file is written");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
 
         let error = workspace
-            .create_new(std::path::Path::new("owned.txt"), b"patch content\n")
+            .create_new(std::path::Path::new("src/owned.txt"), b"patch content\n")
             .expect_err("create-new commit must not replace an existing file");
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
@@ -2376,10 +2574,10 @@ mod tests {
             panic!("preserved create-new staging data must have a structured recovery path");
         };
         assert_eq!(
-            std::fs::read_to_string(root.join("owned.txt")).unwrap(),
+            std::fs::read_to_string(root.join("src/owned.txt")).unwrap(),
             "concurrent owner\n"
         );
-        let recoveries = std::fs::read_dir(root.join(super::RECOVERY_DIRECTORY))
+        let recoveries = std::fs::read_dir(root.join("src").join(super::RECOVERY_DIRECTORY))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
@@ -2395,6 +2593,51 @@ mod tests {
             std::fs::read_to_string(recoveries[0].path()).unwrap(),
             "patch content\n"
         );
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn cleanup_namespace_swap_downgrades_recovery_to_unlocated() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-cleanup-namespace-swap-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("owned.txt"), "concurrent owner\n")
+            .expect("existing file is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        super::INJECT_RECOVERY_NAMESPACE_SWAP_AFTER_CLEANUP_MOVE
+            .with(|injected| injected.set(true));
+
+        let error = workspace
+            .create_new(std::path::Path::new("owned.txt"), b"patch content\n")
+            .expect_err("namespace swap must keep publication failure structured");
+
+        let super::AtomicCreateError::BeforePublication {
+            recovery: Some(super::PublishedRecovery::Unlocated),
+            ..
+        } = error
+        else {
+            panic!("renamed recovery namespace must not retain a verified ambient path");
+        };
+        assert_eq!(
+            std::fs::read_to_string(root.join("owned.txt")).unwrap(),
+            "concurrent owner\n"
+        );
+        assert!(std::fs::read_dir(root.join("moved-recovery-after-cleanup"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(
+                |entry| std::fs::read_to_string(entry.path()).ok().as_deref()
+                    == Some("patch content\n")
+            ));
 
         drop(workspace);
         std::fs::remove_dir_all(root).expect("test workspace is removed");

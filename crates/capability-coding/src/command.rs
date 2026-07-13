@@ -3,10 +3,8 @@ use std::fmt;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +22,8 @@ use crate::tool_support::{
 use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-const FOREGROUND_EXIT_SETTLE: Duration = Duration::from_millis(10);
+const FOREGROUND_EXIT_SETTLE_YIELDS: usize = 8;
+const MAX_STREAM_READS_PER_TICK: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[cfg(all(test, unix))]
@@ -101,8 +100,8 @@ pub(crate) fn execute(
                 json!(process_security_policy()),
             ),
             (
-                "credential_changes_blocked".to_string(),
-                json!(credential_changes_blocked()),
+                "exec_privilege_gain_blocked".to_string(),
+                json!(exec_privilege_gain_blocked()),
             ),
             ("detached_processes_tracked".to_string(), json!(false)),
             ("workspace".to_string(), workspace.metadata()),
@@ -144,22 +143,12 @@ fn run_shell_command(
         .stderr(Stdio::piped())
         .group_spawn();
     let mut child = child.map_err(CommandError::Spawn)?;
-    let mut sentinel = match spawn_process_group_sentinel(child.id()) {
-        Ok(sentinel) => sentinel,
-        Err(source) => {
-            let cleanup = cleanup_process_group(&mut child, false, true);
-            return match cleanup {
-                Ok(()) => Err(CommandError::SpawnSentinel(source)),
-                Err(cleanup) => Err(cleanup),
-            };
-        }
-    };
-    let stdout = child
+    let mut stdout = child
         .inner()
         .stdout
         .take()
         .expect("stdout was configured as piped");
-    let stderr = child
+    let mut stderr = child
         .inner()
         .stderr
         .take()
@@ -177,20 +166,15 @@ fn run_shell_command(
     let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
     if let Err(source) = configure_result {
         let cleanup = cleanup_process_group(&mut child, false, true);
-        let sentinel_cleanup = wait_for_sentinel(&mut sentinel);
-        return match (cleanup, sentinel_cleanup) {
-            (Err(cleanup), _) | (Ok(()), Err(cleanup)) => Err(cleanup),
-            (Ok(()), Ok(())) => Err(CommandError::ConfigureOutput(source)),
+        return match cleanup {
+            Err(cleanup) => Err(cleanup),
+            Ok(()) => Err(CommandError::ConfigureOutput(source)),
         };
     }
-    let (sender, receiver) = mpsc::sync_channel(16);
-    let reader_stop = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_reader(Stream::Stdout, stdout, sender.clone(), reader_stop.clone());
-    let stderr_reader = spawn_reader(Stream::Stderr, stderr, sender, reader_stop.clone());
-
     let mut stdout_capture = CapturedStream::new(max_output_bytes);
     let mut stderr_capture = CapturedStream::new(max_output_bytes);
-    let mut streams_done = 0usize;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
     let mut stream_error = None;
     let mut status = None;
     let mut leader_terminal = false;
@@ -212,11 +196,16 @@ fn run_shell_command(
                 forced_at = Some(Instant::now());
             }
 
-            receive_stream_message(
-                &receiver,
+            let stdout_progress = read_available_stream(
+                &mut stdout,
                 &mut stdout_capture,
+                &mut stdout_done,
+                &mut stream_error,
+            );
+            let stderr_progress = read_available_stream(
+                &mut stderr,
                 &mut stderr_capture,
-                &mut streams_done,
+                &mut stderr_done,
                 &mut stream_error,
             );
 
@@ -226,13 +215,15 @@ fn run_shell_command(
             if status.is_none() && leader_terminal {
                 // Keep the terminal leader unreaped while already-started descendant
                 // forks settle, then terminate the still-reserved process group once.
-                thread::sleep(FOREGROUND_EXIT_SETTLE);
-                terminate_command_group(&mut child)?;
+                for _ in 0..FOREGROUND_EXIT_SETTLE_YIELDS {
+                    thread::yield_now();
+                }
+                terminate_signal_compatible_group_after_leader_exit(&mut child)?;
                 termination_sent = true;
                 status = Some(wait_for_command_group(&mut child)?);
             }
 
-            if status.is_some() && streams_done == 2 {
+            if status.is_some() && stdout_done && stderr_done {
                 return Ok(());
             }
             if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
@@ -247,20 +238,16 @@ fn run_shell_command(
             } else {
                 drain_started_at = None;
             }
+            if !stdout_progress && !stderr_progress {
+                wait_for_stream_activity(&stdout, &stderr, stdout_done, stderr_done)?;
+            }
         }
     })();
 
-    let cleanup_result = cleanup_command_resources(
+    let cleanup_result = cleanup_process_group(
         &mut child,
-        &mut sentinel,
         status.is_some(),
         control_result.is_err() && status.is_none() && !termination_sent,
-        OutputReaderResources {
-            stop: reader_stop,
-            receiver,
-            stdout: stdout_reader,
-            stderr: stderr_reader,
-        },
     );
     match (control_result, cleanup_result) {
         (Err(_), Err(cleanup)) => return Err(cleanup),
@@ -310,7 +297,7 @@ fn process_security_policy() -> &'static str {
     "unsupported"
 }
 
-fn credential_changes_blocked() -> bool {
+fn exec_privilege_gain_blocked() -> bool {
     cfg!(target_os = "linux")
 }
 
@@ -333,69 +320,6 @@ fn configure_command_security(command: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn configure_command_security(_command: &mut Command) {}
-
-#[cfg(unix)]
-fn spawn_process_group_sentinel(group_id: u32) -> std::io::Result<Child> {
-    use std::os::unix::process::CommandExt as _;
-
-    let group_id = i32::try_from(group_id).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "command process-group id does not fit in i32",
-        )
-    })?;
-    let mut sentinel = Command::new("/bin/sleep");
-    sentinel
-        .arg("2147483647")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    sentinel.process_group(group_id);
-    sentinel.spawn()
-}
-
-#[cfg(not(unix))]
-fn spawn_process_group_sentinel(_group_id: u32) -> std::io::Result<Child> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "command process-group sentinels are not supported on this platform",
-    ))
-}
-
-fn wait_for_sentinel(sentinel: &mut Child) -> Result<(), CommandError> {
-    loop {
-        match sentinel.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => break,
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(source) if child_already_reaped(&source) => return Ok(()),
-            Err(source) => return Err(CommandError::WaitSentinel(source)),
-        }
-    }
-    if let Err(source) = sentinel.kill() {
-        if !group_already_exited(&source) {
-            return Err(CommandError::KillSentinel(source));
-        }
-    }
-    loop {
-        match sentinel.wait() {
-            Ok(_) => return Ok(()),
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(source) if child_already_reaped(&source) => return Ok(()),
-            Err(source) => return Err(CommandError::WaitSentinel(source)),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn child_already_reaped(source: &std::io::Error) -> bool {
-    source.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error())
-}
-
-#[cfg(not(unix))]
-fn child_already_reaped(_source: &std::io::Error) -> bool {
-    false
-}
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
     #[cfg(all(test, unix))]
@@ -443,6 +367,23 @@ fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
         Err(CommandError::Kill(
             wrapper_result.expect_err("wrapper failure was checked above"),
         ))
+    }
+}
+
+fn terminate_signal_compatible_group_after_leader_exit(
+    child: &mut GroupChild,
+) -> Result<(), CommandError> {
+    match terminate_command_group(child) {
+        Err(CommandError::Kill(source))
+            if source.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            // The terminal leader is intentionally unreaped and can keep an otherwise
+            // empty group present. EPERM means no remaining member is signal-compatible
+            // with this process; credential-changing descendants are outside the
+            // portable tracking contract exposed in tool metadata.
+            Ok(())
+        }
+        result => result,
     }
 }
 
@@ -557,41 +498,6 @@ fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatu
     }
 }
 
-fn cleanup_command_resources(
-    child: &mut GroupChild,
-    sentinel: &mut Child,
-    process_exited: bool,
-    terminate_group: bool,
-    output: OutputReaderResources,
-) -> Result<(), CommandError> {
-    let mut first_error = cleanup_process_group(child, process_exited, terminate_group).err();
-
-    output.stop.store(true, Ordering::Relaxed);
-    drop(output.receiver);
-    if output.stdout.join().is_err() && first_error.is_none() {
-        first_error = Some(CommandError::ReaderPanicked);
-    }
-    if output.stderr.join().is_err() && first_error.is_none() {
-        first_error = Some(CommandError::ReaderPanicked);
-    }
-    if let Err(source) = wait_for_sentinel(sentinel) {
-        if first_error.is_none() {
-            first_error = Some(source);
-        }
-    }
-    match first_error {
-        Some(source) => Err(source),
-        None => Ok(()),
-    }
-}
-
-struct OutputReaderResources {
-    stop: Arc<AtomicBool>,
-    receiver: Receiver<StreamMessage>,
-    stdout: thread::JoinHandle<()>,
-    stderr: thread::JoinHandle<()>,
-}
-
 fn cleanup_process_group(
     child: &mut GroupChild,
     process_exited: bool,
@@ -663,82 +569,94 @@ fn shell_command(command: &str) -> Command {
     process
 }
 
-#[derive(Clone, Copy)]
-enum Stream {
-    Stdout,
-    Stderr,
-}
-
-enum StreamMessage {
-    Chunk(Stream, Vec<u8>),
-    Done(Stream),
-    Failed(Stream, std::io::Error),
-}
-
-fn spawn_reader<R>(
-    stream: Stream,
-    mut reader: R,
-    sender: SyncSender<StreamMessage>,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<()>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = vec![0u8; 8 * 1024];
-        loop {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            match reader.read(&mut buffer) {
-                Ok(0) => {
-                    let _ = sender.send(StreamMessage::Done(stream));
-                    return;
-                }
-                Ok(bytes_read) => {
-                    if sender
-                        .send(StreamMessage::Chunk(stream, buffer[..bytes_read].to_vec()))
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(POLL_INTERVAL);
-                }
-                Err(source) => {
-                    let _ = sender.send(StreamMessage::Failed(stream, source));
-                    return;
-                }
-            }
-        }
-    })
-}
-
-fn receive_stream_message(
-    receiver: &Receiver<StreamMessage>,
-    stdout: &mut CapturedStream,
-    stderr: &mut CapturedStream,
-    streams_done: &mut usize,
+fn read_available_stream<R: Read>(
+    reader: &mut R,
+    capture: &mut CapturedStream,
+    done: &mut bool,
     stream_error: &mut Option<std::io::Error>,
-) {
-    match receiver.recv_timeout(POLL_INTERVAL) {
-        Ok(StreamMessage::Chunk(Stream::Stdout, bytes)) => stdout.push(&bytes),
-        Ok(StreamMessage::Chunk(Stream::Stderr, bytes)) => stderr.push(&bytes),
-        Ok(StreamMessage::Done(stream)) => {
-            let _ = stream;
-            *streams_done += 1;
-        }
-        Ok(StreamMessage::Failed(stream, source)) => {
-            let _ = stream;
-            *streams_done += 1;
-            if stream_error.is_none() {
-                *stream_error = Some(source);
+) -> bool {
+    if *done {
+        return false;
+    }
+    let mut progressed = false;
+    let mut buffer = [0u8; 8 * 1024];
+    for _ in 0..MAX_STREAM_READS_PER_TICK {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                *done = true;
+                return true;
+            }
+            Ok(bytes_read) => {
+                capture.push(&buffer[..bytes_read]);
+                progressed = true;
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => return progressed,
+            Err(source) => {
+                *done = true;
+                progressed = true;
+                if stream_error.is_none() {
+                    *stream_error = Some(source);
+                }
+                return progressed;
             }
         }
-        Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
     }
+    progressed
+}
+
+#[cfg(unix)]
+fn wait_for_stream_activity<Out, Err>(
+    stdout: &Out,
+    stderr: &Err,
+    stdout_done: bool,
+    stderr_done: bool,
+) -> Result<(), CommandError>
+where
+    Out: std::os::fd::AsFd,
+    Err: std::os::fd::AsFd,
+{
+    let events = rustix::event::PollFlags::IN
+        | rustix::event::PollFlags::HUP
+        | rustix::event::PollFlags::ERR;
+    if stdout_done && stderr_done {
+        thread::sleep(Duration::from_millis(1));
+        return Ok(());
+    }
+    let mut stdout_descriptor = [rustix::event::PollFd::new(stdout, events)];
+    let mut stderr_descriptor = [rustix::event::PollFd::new(stderr, events)];
+    let mut both_descriptors = [
+        rustix::event::PollFd::new(stdout, events),
+        rustix::event::PollFd::new(stderr, events),
+    ];
+    let descriptors = match (stdout_done, stderr_done) {
+        (false, false) => &mut both_descriptors[..],
+        (false, true) => &mut stdout_descriptor[..],
+        (true, false) => &mut stderr_descriptor[..],
+        (true, true) => unreachable!("completed streams returned above"),
+    };
+    let timeout = rustix::event::Timespec {
+        tv_sec: 0,
+        tv_nsec: POLL_INTERVAL.as_nanos() as _,
+    };
+    loop {
+        match rustix::event::poll(descriptors, Some(&timeout)) {
+            Ok(_) => return Ok(()),
+            Err(source) if source == rustix::io::Errno::INTR => continue,
+            Err(source) => return Err(CommandError::ReadOutput(std::io::Error::from(source))),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_stream_activity<Out, Err>(
+    _stdout: &Out,
+    _stderr: &Err,
+    _stdout_done: bool,
+    _stderr_done: bool,
+) -> Result<(), CommandError> {
+    thread::sleep(POLL_INTERVAL);
+    Ok(())
 }
 
 struct CapturedStream {
@@ -774,15 +692,11 @@ impl CapturedStream {
 #[derive(Debug)]
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
-    SpawnSentinel(std::io::Error),
     WorkspaceChanged(std::io::Error),
     ConfigureOutput(std::io::Error),
     Kill(std::io::Error),
-    KillSentinel(std::io::Error),
     Wait(std::io::Error),
-    WaitSentinel(std::io::Error),
     ReadOutput(std::io::Error),
-    ReaderPanicked,
     Cancelled,
     OutputIncomplete,
     TerminationUnverified,
@@ -793,15 +707,11 @@ pub(crate) enum CommandError {
 impl CommandError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::Spawn(_) | Self::SpawnSentinel(_) => "command_spawn_failed",
+            Self::Spawn(_) => "command_spawn_failed",
             Self::WorkspaceChanged(_) => "workspace_changed",
-            Self::ConfigureOutput(_)
-            | Self::Kill(_)
-            | Self::KillSentinel(_)
-            | Self::Wait(_)
-            | Self::WaitSentinel(_)
-            | Self::ReadOutput(_)
-            | Self::ReaderPanicked => "command_io_error",
+            Self::ConfigureOutput(_) | Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) => {
+                "command_io_error"
+            }
             Self::Cancelled => "tool_cancelled",
             Self::OutputIncomplete => "command_output_incomplete",
             Self::TerminationUnverified => "command_termination_unverified",
@@ -815,9 +725,7 @@ impl CommandError {
             self,
             Self::ConfigureOutput(source)
             | Self::Kill(source)
-            | Self::KillSentinel(source)
             | Self::Wait(source)
-            | Self::WaitSentinel(source)
             | Self::ReadOutput(source)
                 if source.kind() == std::io::ErrorKind::Interrupted
         )
@@ -828,9 +736,6 @@ impl fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(source) => write!(formatter, "failed to start command: {source}"),
-            Self::SpawnSentinel(source) => {
-                write!(formatter, "failed to start command-group sentinel: {source}")
-            }
             Self::WorkspaceChanged(source) => {
                 write!(
                     formatter,
@@ -844,17 +749,10 @@ impl fmt::Display for CommandError {
                 )
             }
             Self::Kill(source) => write!(formatter, "failed to terminate command group: {source}"),
-            Self::KillSentinel(source) => {
-                write!(formatter, "failed to terminate command-group sentinel: {source}")
-            }
             Self::Wait(source) => write!(formatter, "failed to wait for command: {source}"),
-            Self::WaitSentinel(source) => {
-                write!(formatter, "failed to reap command-group sentinel: {source}")
-            }
             Self::ReadOutput(source) => {
                 write!(formatter, "failed to capture command output: {source}")
             }
-            Self::ReaderPanicked => formatter.write_str("command reader panicked"),
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
             Self::OutputIncomplete => formatter
                 .write_str("command output remained open after the command process group exited"),
