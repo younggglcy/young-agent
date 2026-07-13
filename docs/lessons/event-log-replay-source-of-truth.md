@@ -15,6 +15,13 @@ record。终止换行同时是第一版的 record commit marker：即使尾部 J
 完整，没有换行也仍视为 truncated；后续 append 必须拒绝这种日志，不能通过补
 换行把可能未完成的写入升级为 canonical event。
 
+Runtime 写出的每个 `AgentEvent` 还需要正式的 `event_sequence` wire 字段。物理
+行顺序决定 timeline，而 sequence 让持久化错误发生在 commit 前还是 commit 后都
+能幂等协调，即使相邻事件 payload 完全相同。它必须属于公开 `AgentEvent`
+contract，不能由 Store 私下塞入一个公开 decoder 会拒绝的未知字段。Store 在同一
+文件锁临界区内先校验 expected sequence 再 append；旧的全量 unsequenced 日志仍可
+读取，但不能和 sequenced runtime 日志混写。
+
 Replay model 应保留 ordered events 作为 canonical truth，只在其上派生 run
 status、tool call、approval request、error 和 terminal result。当前 contracts 中：
 
@@ -24,6 +31,8 @@ status、tool call、approval request、error 和 terminal result。当前 contr
   落地前，Replay 不能声称恢复了批准或拒绝结果。
 - `ToolResult` 已经证明该调用完成，因此它后面的 `ApprovalRequested` 是损坏的
   lifecycle，而不是新的等待状态。
+- `TurnStarted` 会切换唯一 active turn；新 turn 不能越过未完成的 tool call，且
+  后续 model、tool、approval、error 事件不能回流到已失活的旧 turn。
 - model-owned `ModelToolCallId` 和 kernel-owned `ToolCallId` 必须同时保留；
   `ToolResult` 只能通过后者关联具体执行。
 

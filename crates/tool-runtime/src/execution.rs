@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +26,25 @@ pub struct ToolCall {
     pub id: ToolCallId,
     pub tool_name: String,
     pub arguments: Value,
+}
+
+/// Execution boundary consumed by the Agent Runtime. Tool lookup, policy, and
+/// concrete implementations remain owned by the Tool Runtime.
+///
+/// This synchronous trait is an intentionally unstable first-phase proof
+/// boundary for deterministic fake tools. Long-lived or remote tool execution
+/// should move this seam to an async future before it becomes a stable API.
+pub trait ToolExecutor {
+    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+
+    /// Executes one invocation. Implementations that can block on external
+    /// work must observe `cancellation` and return promptly once it is set;
+    /// cancellation is cooperative, not forced.
+    /// Returns only the tool-owned output. The Agent Runtime attaches the
+    /// kernel-owned `ToolCall.id`, so executors cannot forge result correlation.
+    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput;
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -65,6 +86,8 @@ pub enum ToolContent {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolError {
+    /// `approval_denied` is reserved for the Agent Runtime's canonical denial
+    /// result and must not be returned by a ToolExecutor.
     pub code: String,
     pub message: String,
     /// Whether retrying the same low-level tool call is expected to help.

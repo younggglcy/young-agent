@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use young_model_runtime::{stream::ModelStreamEvent, ModelToolCallId};
-use young_tool_runtime::execution::{ToolCall, ToolResult};
+use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolResult};
 
 use crate::turn::TurnId;
 
@@ -23,6 +23,21 @@ impl RunId {
     }
 }
 
+/// Monotonic identity assigned to each event within one Canonical Event Log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventSequence(u64);
+
+impl EventSequence {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 /// Event envelopes are forward-readable so older surfaces and replay readers can
 /// tolerate additive fields written by newer kernels. Stable semantics still
 /// belong in typed fields, not ad hoc unknown fields.
@@ -31,12 +46,16 @@ impl RunId {
 pub enum AgentEvent {
     RunStarted {
         run_id: RunId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
     TurnStarted {
         run_id: RunId,
         turn_id: TurnId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -44,6 +63,8 @@ pub enum AgentEvent {
         run_id: RunId,
         turn_id: TurnId,
         event: ModelStreamEvent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -54,6 +75,8 @@ pub enum AgentEvent {
         /// invocation id carried by `call.id`.
         model_tool_call_id: ModelToolCallId,
         call: ToolCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -61,6 +84,18 @@ pub enum AgentEvent {
         run_id: RunId,
         turn_id: TurnId,
         request: ApprovalRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        extensions: BTreeMap<String, Value>,
+    },
+    ApprovalResolved {
+        run_id: RunId,
+        turn_id: TurnId,
+        approval_id: String,
+        decision: ApprovalDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -68,6 +103,8 @@ pub enum AgentEvent {
         run_id: RunId,
         turn_id: TurnId,
         result: ToolResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -76,6 +113,8 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<TurnId>,
         error: AgentError,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -84,6 +123,8 @@ pub enum AgentEvent {
     RunFinished {
         run_id: RunId,
         status: TerminalRunStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_sequence: Option<EventSequence>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         extensions: BTreeMap<String, Value>,
     },
@@ -98,10 +139,40 @@ impl AgentEvent {
             | Self::ModelOutput { run_id, .. }
             | Self::ToolCallRequested { run_id, .. }
             | Self::ApprovalRequested { run_id, .. }
+            | Self::ApprovalResolved { run_id, .. }
             | Self::ToolResult { run_id, .. }
             | Self::Error { run_id, .. }
             | Self::RunFinished { run_id, .. } => run_id,
         }
+    }
+
+    pub fn event_sequence(&self) -> Option<EventSequence> {
+        match self {
+            Self::RunStarted { event_sequence, .. }
+            | Self::TurnStarted { event_sequence, .. }
+            | Self::ModelOutput { event_sequence, .. }
+            | Self::ToolCallRequested { event_sequence, .. }
+            | Self::ApprovalRequested { event_sequence, .. }
+            | Self::ApprovalResolved { event_sequence, .. }
+            | Self::ToolResult { event_sequence, .. }
+            | Self::Error { event_sequence, .. }
+            | Self::RunFinished { event_sequence, .. } => *event_sequence,
+        }
+    }
+
+    pub fn with_event_sequence(mut self, sequence: EventSequence) -> Self {
+        match &mut self {
+            Self::RunStarted { event_sequence, .. }
+            | Self::TurnStarted { event_sequence, .. }
+            | Self::ModelOutput { event_sequence, .. }
+            | Self::ToolCallRequested { event_sequence, .. }
+            | Self::ApprovalRequested { event_sequence, .. }
+            | Self::ApprovalResolved { event_sequence, .. }
+            | Self::ToolResult { event_sequence, .. }
+            | Self::Error { event_sequence, .. }
+            | Self::RunFinished { event_sequence, .. } => *event_sequence = Some(sequence),
+        }
+        self
     }
 }
 
@@ -110,6 +181,7 @@ impl AgentEvent {
 pub enum RunStatus {
     Running,
     AwaitingApproval,
+    RecoveryRequired { call_ids: Vec<ToolCallId> },
     Finished { terminal_status: TerminalRunStatus },
 }
 
@@ -137,4 +209,11 @@ pub struct ApprovalRequest {
     pub id: String,
     pub call: ToolCall,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny { reason: String },
 }

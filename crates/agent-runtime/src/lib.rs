@@ -1,9 +1,17 @@
 #![doc = "Agent Run orchestration boundary for the Agent Kernel."]
 
 pub mod run;
+pub mod runtime;
 pub mod turn;
 
-pub use run::{AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus};
+pub use run::{
+    AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, EventSequence, RunId, RunStatus,
+    TerminalRunStatus,
+};
+pub use runtime::{
+    AgentEventSink, AgentRuntime, AgentRuntimeError, EventDurability, RunControl, RunControlFlow,
+    RunOutcome, RunRequest, RunStopToken,
+};
 pub use turn::TurnId;
 
 #[cfg(test)]
@@ -19,7 +27,8 @@ mod tests {
     };
 
     use crate::run::{
-        AgentError, AgentEvent, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
+        AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus,
+        TerminalRunStatus,
     };
     use crate::turn::TurnId;
 
@@ -51,11 +60,13 @@ mod tests {
         let events = vec![
             AgentEvent::RunStarted {
                 run_id: run_id.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::TurnStarted {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ModelOutput {
@@ -68,6 +79,7 @@ mod tests {
                     },
                     extensions: BTreeMap::new(),
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ToolCallRequested {
@@ -75,6 +87,7 @@ mod tests {
                 turn_id: turn_id.clone(),
                 model_tool_call_id: ModelToolCallId::new("model-call-001"),
                 call: call.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ApprovalRequested {
@@ -85,18 +98,21 @@ mod tests {
                     call: call.clone(),
                     reason: "command mutates the workspace".to_string(),
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ToolResult {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
                 result,
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::Error {
                 run_id: run_id.clone(),
                 turn_id: Some(turn_id),
                 error: error.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::RunFinished {
@@ -104,6 +120,7 @@ mod tests {
                 status: TerminalRunStatus::Completed {
                     final_message: "Done".to_string(),
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
         ];
@@ -130,11 +147,13 @@ mod tests {
         let events = vec![
             AgentEvent::RunStarted {
                 run_id: run_id.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::TurnStarted {
                 run_id: run_id.clone(),
                 turn_id: turn_id.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ModelOutput {
@@ -146,6 +165,7 @@ mod tests {
                     arguments: json!({ "path": "README.md" }),
                     extensions: BTreeMap::new(),
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ToolCallRequested {
@@ -153,6 +173,7 @@ mod tests {
                 turn_id: turn_id.clone(),
                 model_tool_call_id: model_call_id,
                 call: tool_call.clone(),
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ApprovalRequested {
@@ -163,6 +184,7 @@ mod tests {
                     call: tool_call.clone(),
                     reason: "command may read workspace files".to_string(),
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
             AgentEvent::ToolResult {
@@ -178,6 +200,7 @@ mod tests {
                         extensions: BTreeMap::from([("display".to_string(), json!("markdown"))]),
                     },
                 },
+                event_sequence: None,
                 extensions: BTreeMap::new(),
             },
         ];
@@ -261,6 +284,9 @@ mod tests {
         let statuses = vec![
             RunStatus::Running,
             RunStatus::AwaitingApproval,
+            RunStatus::RecoveryRequired {
+                call_ids: vec![ToolCallId::new("tool-call-001")],
+            },
             RunStatus::Finished {
                 terminal_status: TerminalRunStatus::Completed {
                     final_message: "Done".to_string(),
@@ -273,6 +299,34 @@ mod tests {
             serde_json::from_value(encoded).expect("statuses deserialize");
 
         assert_eq!(decoded, statuses);
+    }
+
+    #[test]
+    fn approval_resolution_serializes_a_replayable_wire_payload() {
+        let event = AgentEvent::ApprovalResolved {
+            run_id: RunId::new("run-001"),
+            turn_id: TurnId::new("turn-001"),
+            approval_id: "approval-001".to_string(),
+            decision: ApprovalDecision::Deny {
+                reason: "user denied the command".to_string(),
+            },
+            event_sequence: None,
+            extensions: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(event).expect("approval resolution serializes"),
+            json!({
+                "type": "approval_resolved",
+                "run_id": "run-001",
+                "turn_id": "turn-001",
+                "approval_id": "approval-001",
+                "decision": {
+                    "decision": "deny",
+                    "reason": "user denied the command"
+                }
+            })
+        );
     }
 
     #[test]
@@ -333,6 +387,7 @@ mod tests {
             status: TerminalRunStatus::Interrupted {
                 reason: "user paused the run".to_string(),
             },
+            event_sequence: None,
             extensions: BTreeMap::new(),
         };
 
@@ -399,6 +454,7 @@ mod tests {
     fn agent_event_extensions_round_trip_without_dropping_additive_fields() {
         let event = AgentEvent::RunStarted {
             run_id: RunId::new("run-001"),
+            event_sequence: None,
             extensions: BTreeMap::from([("future_hint".to_string(), json!("preserve"))]),
         };
 

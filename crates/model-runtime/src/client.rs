@@ -1,9 +1,31 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::id::ModelToolCallId;
+use crate::stream::{ModelError, ModelStreamEvent};
+
+/// Provider-neutral boundary consumed by the Agent Runtime.
+///
+/// This synchronous trait is an intentionally unstable first-phase proof
+/// boundary for deterministic fakes and local adapters. Real provider
+/// networking is out of scope for this phase and should move this seam to an
+/// async stream before the trait is treated as a stable adapter API.
+pub trait ModelClient {
+    type Stream: Iterator<Item = ModelStreamEvent>;
+
+    /// Starts one provider turn. Implementations and returned streams must
+    /// observe `cancellation` while waiting on external I/O and return
+    /// promptly once it is set; cancellation is cooperative, not forced.
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self::Stream, ModelError>;
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

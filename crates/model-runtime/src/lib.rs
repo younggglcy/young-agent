@@ -1,12 +1,15 @@
 #![doc = "Provider-neutral model runtime boundary for the Agent Kernel."]
 
 pub mod client;
+pub mod fake;
 pub mod id;
 pub mod stream;
 
 pub use client::{
-    ModelMessage, ModelMessageContent, ModelMessageRole, ModelRequest, ModelToolCall, ModelToolSpec,
+    ModelClient, ModelMessage, ModelMessageContent, ModelMessageRole, ModelRequest, ModelToolCall,
+    ModelToolSpec,
 };
+pub use fake::{FakeModelClient, ScriptedModelTurn};
 pub use id::{ModelRequestId, ModelToolCallId};
 pub use stream::{ModelError, ModelStreamEvent, ModelUsage};
 
