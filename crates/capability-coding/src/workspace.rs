@@ -11,6 +11,8 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, DirEntry, File, Metadata, OpenOptions, Permissions};
 use serde_json::{json, Value};
 
+pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct CodingWorkspace {
     context: Arc<WorkspaceContext>,
@@ -125,7 +127,13 @@ impl CodingWorkspace {
         #[cfg(unix)]
         {
             let before = file_stat_snapshot(&file.metadata()?);
-            let digest = file_digest(file)?;
+            if before.size > MAX_FILE_SNAPSHOT_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("safe file snapshots are limited to {MAX_FILE_SNAPSHOT_BYTES} bytes"),
+                ));
+            }
+            let digest = file_digest(file, before.size)?;
             let after = file_stat_snapshot(&file.metadata()?);
             if before != after {
                 return Err(io::Error::new(
@@ -647,28 +655,37 @@ fn file_stat_snapshot(metadata: &Metadata) -> FileStatSnapshot {
 }
 
 #[cfg(unix)]
-fn file_digest(file: &File) -> io::Result<[u8; 32]> {
+fn file_digest(file: &File, size: u64) -> io::Result<[u8; 32]> {
     use cap_std::fs::FileExt as _;
 
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0u64;
     let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let bytes_read = file.read_at(&mut buffer, offset)?;
+    while offset < size {
+        let remaining = usize::try_from((size - offset).min(buffer.len() as u64))
+            .expect("bounded digest chunk fits usize");
+        let bytes_read = file.read_at(&mut buffer[..remaining], offset)?;
         if bytes_read == 0 {
-            return Ok(*hasher.finalize().as_bytes());
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file became shorter while its content snapshot was being captured",
+            ));
         }
         hasher.update(&buffer[..bytes_read]);
         offset = offset.saturating_add(bytes_read as u64);
     }
+    let mut probe = [0u8; 1];
+    if file.read_at(&mut probe, size)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file grew while its content snapshot was being captured",
+        ));
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 #[cfg(unix)]
 impl FileSnapshot {
-    fn same_identity(&self, other: &Self) -> bool {
-        self.stat.device == other.stat.device && self.stat.inode == other.stat.inode
-    }
-
     fn same_payload_and_metadata(&self, other: &Self) -> bool {
         self.digest == other.digest
             && self.stat.device == other.stat.device
@@ -684,10 +701,6 @@ impl FileSnapshot {
 
 #[cfg(not(unix))]
 impl FileSnapshot {
-    fn same_identity(&self, _other: &Self) -> bool {
-        false
-    }
-
     fn same_payload_and_metadata(&self, _other: &Self) -> bool {
         false
     }
@@ -884,9 +897,15 @@ fn claimed_staging_matches(
 ) -> io::Result<bool> {
     let (claimed, _) =
         require_regular_file(directory.open_with(claimed_path, &regular_file_options())?)?;
+    if validate_security_metadata(staging_file, "patch staging file").is_err()
+        || validate_security_metadata(&claimed, "claimed patch staging file").is_err()
+    {
+        return Ok(false);
+    }
     let retained = CodingWorkspace::file_snapshot(staging_file)?;
     let claimed_snapshot = CodingWorkspace::file_snapshot(&claimed)?;
-    Ok(retained.same_identity(&expected) && claimed_snapshot.same_identity(&expected))
+    Ok(retained.same_payload_and_metadata(&expected)
+        && claimed_snapshot.same_payload_and_metadata(&expected))
 }
 
 fn cleanup_open_staging_after_error<T>(
@@ -896,6 +915,16 @@ fn cleanup_open_staging_after_error<T>(
     source: io::Error,
 ) -> io::Result<T> {
     let expected = CodingWorkspace::file_snapshot(staging_file)?;
+    cleanup_expected_staging_after_error(directory, staging_path, staging_file, expected, source)
+}
+
+fn cleanup_expected_staging_after_error<T>(
+    directory: &Dir,
+    staging_path: &Path,
+    staging_file: &File,
+    expected: FileSnapshot,
+    source: io::Error,
+) -> io::Result<T> {
     let claimed = match claim_path(directory, staging_path, "cleanup") {
         Ok(path) => path,
         Err(claim) if claim.kind() == io::ErrorKind::NotFound => return Err(source),
@@ -933,7 +962,13 @@ fn cleanup_owned_staging_after_error<T>(
     staged: &StagedFile,
     source: io::Error,
 ) -> io::Result<T> {
-    cleanup_open_staging_after_error(directory, &staged.path, &staged.file, source)
+    cleanup_expected_staging_after_error(
+        directory,
+        &staged.path,
+        &staged.file,
+        staged.snapshot,
+        source,
+    )
 }
 
 fn regular_file_options() -> OpenOptions {
@@ -1018,12 +1053,7 @@ fn rollback_new_file_commit(
             ),
         )
     })?;
-    let (claimed_file, _) =
-        require_regular_file(directory.open_with(&claimed, &regular_file_options())?)?;
-    let retained = CodingWorkspace::file_snapshot(&staged.file)?;
-    let claimed_snapshot = CodingWorkspace::file_snapshot(&claimed_file)?;
-    if retained.same_identity(&staged.snapshot) && claimed_snapshot.same_identity(&staged.snapshot)
-    {
+    if claimed_staging_matches(directory, &claimed, &staged.file, staged.snapshot)? {
         return cleanup_staging_after_error(
             directory,
             &claimed,
@@ -1062,13 +1092,7 @@ fn rollback_existing_exchange(
             ),
         )
     })?;
-    let (published, _) =
-        require_regular_file(directory.open_with(&published_claim, &regular_file_options())?)?;
-    let retained = CodingWorkspace::file_snapshot(&staged.file)?;
-    let published_snapshot = CodingWorkspace::file_snapshot(&published)?;
-    if !retained.same_identity(&staged.snapshot)
-        || !published_snapshot.same_identity(&staged.snapshot)
-    {
+    if !claimed_staging_matches(directory, &published_claim, &staged.file, staged.snapshot)? {
         restore_claimed_path(
             directory,
             &published_claim,
@@ -1691,9 +1715,72 @@ mod tests {
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn file_digest_rejects_growth_past_the_captured_size() {
+        use std::io::Write as _;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-growing-digest-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "first\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (file, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let captured_size = file.metadata().unwrap().len();
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("target.txt"))
+            .expect("append handle opens");
+        appender.write_all(b"growth\n").expect("target grows");
+
+        let error = super::file_digest(&file, captured_size)
+            .expect_err("digest must not chase a moving EOF");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop((appender, file, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_snapshot_rejects_files_above_the_transaction_limit() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-snapshot-limit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let target = std::fs::File::create(root.join("target.txt")).expect("target is created");
+        target
+            .set_len(super::MAX_FILE_SNAPSHOT_BYTES + 1)
+            .expect("sparse target exceeds the limit");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (file, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+
+        let error = CodingWorkspace::file_snapshot(&file)
+            .expect_err("oversized snapshots must fail before hashing");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        drop((file, workspace, target));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn new_file_validation_failure_removes_the_published_staging_identity() {
+    fn new_file_validation_failure_preserves_a_concurrently_modified_target() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after the Unix epoch")
@@ -1732,7 +1819,10 @@ mod tests {
         .expect_err("failed validation must roll back the new target");
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(!root.join("created.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("created.txt")).unwrap(),
+            "changed\n"
+        );
         drop((staged, directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
@@ -1754,6 +1844,7 @@ mod tests {
         let staged = workspace
             .stage_content(&directory, b"owned\n", None)
             .expect("content is staged");
+        let staged_path = staged.path.clone();
         #[cfg(target_os = "macos")]
         let attribute = "com.young-agent.concurrent";
         #[cfg(target_os = "linux")]
@@ -1770,15 +1861,16 @@ mod tests {
             .commit_new_file(&directory, staged, std::path::Path::new("created.txt"))
             .expect_err("staging xattrs must be rejected at commit");
 
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         assert!(!root.join("created.txt").exists());
-        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".young-agent-patch-")
-        }));
+        assert_eq!(
+            std::fs::read_to_string(root.join(&staged_path)).unwrap(),
+            "owned\n"
+        );
+        let (preserved, _) = workspace
+            .open_regular_file(&staged_path)
+            .expect("staging with concurrent metadata is preserved");
+        assert!(super::file_has_extended_attributes(&preserved).unwrap());
         drop((directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }

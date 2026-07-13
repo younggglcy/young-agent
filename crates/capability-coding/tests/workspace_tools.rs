@@ -1529,7 +1529,7 @@ fn run_command_cancellation_terminates_descendant_processes() {
 }
 
 #[test]
-fn run_command_bounds_background_process_pipe_lifetime() {
+fn run_command_waits_for_an_approved_background_process_with_open_pipes() {
     let test_workspace = TestWorkspace::new("command-background-pipe");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1537,7 +1537,7 @@ fn run_command_bounds_background_process_pipe_lifetime() {
     let call = ToolCall {
         id: ToolCallId::new("call-background-command"),
         tool_name: "run_command".to_string(),
-        arguments: json!({ "command": "sleep 60 &" }),
+        arguments: json!({ "command": "sleep 0.1 &" }),
     };
     let started = std::time::Instant::now();
 
@@ -1549,15 +1549,16 @@ fn run_command_bounds_background_process_pipe_lifetime() {
         Arc::new(AtomicBool::new(false)),
     );
 
+    assert!(started.elapsed() >= Duration::from_millis(75));
     assert!(started.elapsed() < Duration::from_secs(2));
-    let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("background command must be rejected");
+    let ToolOutput::Success { metadata, .. } = result.output else {
+        panic!("approved background command should run to completion");
     };
-    assert_eq!(error.code, "background_process_not_supported");
+    assert_eq!(metadata["output_incomplete"], json!(false));
 }
 
 #[test]
-fn run_command_terminates_an_approved_detached_background_task() {
+fn run_command_waits_for_an_approved_detached_background_task() {
     let test_workspace = TestWorkspace::new("command-detached-background");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1578,56 +1579,24 @@ fn run_command_terminates_an_approved_detached_background_task() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("detached background command must be rejected");
-    };
-    assert_eq!(error.code, "background_process_not_supported");
-    thread::sleep(Duration::from_millis(250));
-    assert!(
-        !test_workspace.path().join("background.txt").exists(),
-        "rejected background commands must not mutate the workspace later"
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("background.txt")).unwrap(),
+        "survived"
     );
 }
 
 #[test]
-fn run_command_rejects_background_work_after_the_shell_leader_exits() {
-    let test_workspace = TestWorkspace::new("command-cancel-after-leader");
+fn run_command_reports_success_only_after_background_work_finishes() {
+    let test_workspace = TestWorkspace::new("command-background-completion");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
     register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
     let call = ToolCall {
-        id: ToolCallId::new("call-cancel-after-leader"),
-        tool_name: "run_command".to_string(),
-        arguments: json!({ "command": "tail -f /dev/null &" }),
-    };
-    let started = std::time::Instant::now();
-
-    let result = runtime.dispatch(
-        call.clone(),
-        ToolExecutionAuthorization::ApprovalGranted {
-            call_id: call.id.clone(),
-        },
-        Arc::new(AtomicBool::new(false)),
-    );
-
-    assert!(started.elapsed() < Duration::from_secs(2));
-    let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("background command must fail");
-    };
-    assert_eq!(error.code, "background_process_not_supported");
-}
-
-#[test]
-fn run_command_does_not_wait_for_a_pipe_holder_that_escapes_the_process_group() {
-    let test_workspace = TestWorkspace::new("command-escaped-pipe");
-    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
-    let mut runtime = ToolRuntime::default();
-    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
-    let call = ToolCall {
-        id: ToolCallId::new("call-escaped-pipe-command"),
+        id: ToolCallId::new("call-background-completion"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import os,time; os.setsid(); open(\"escaped-ready\", \"w\").close(); time.sleep(2)' & while [ ! -f escaped-ready ]; do :; done"
+            "command": "(sleep 0.1; printf complete > completed-background.txt) &"
         }),
     };
     let started = std::time::Instant::now();
@@ -1640,10 +1609,42 @@ fn run_command_does_not_wait_for_a_pipe_holder_that_escapes_the_process_group() 
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() < Duration::from_millis(1500));
-    let output = result.output;
-    let ToolOutput::Failure { error, .. } = &output else {
-        panic!("escaped pipe holder must fail explicitly: {output:?}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("completed-background.txt")).unwrap(),
+        "complete"
+    );
+}
+
+#[test]
+fn run_command_waits_for_a_setsid_background_task_with_closed_pipes() {
+    let test_workspace = TestWorkspace::new("command-escaped-pipe");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-escaped-pipe-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "python3 -c 'import os,time; os.setsid(); time.sleep(0.15); open(\"escaped-finished\", \"w\").write(\"done\")' >/dev/null 2>&1 & exit 0"
+        }),
     };
-    assert_eq!(error.code, "command_output_incomplete");
+    let started = std::time::Instant::now();
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("escaped-finished")).unwrap(),
+        "done"
+    );
 }

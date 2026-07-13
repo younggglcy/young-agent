@@ -158,9 +158,8 @@ fn run_shell_command(
     let mut streams_done = 0usize;
     let mut stream_error = None;
     let mut status = None;
-    let mut exited_at = None;
+    let mut drain_started_at = None;
     let mut output_incomplete = false;
-    let mut background_process = false;
     let mut cancelled = false;
     let mut forced_at = None;
 
@@ -172,7 +171,6 @@ fn run_shell_command(
                 if status.is_none() {
                     status = Some(wait_for_command_group(&mut child)?);
                 }
-                exited_at = Some(Instant::now());
                 forced_at = Some(Instant::now());
             }
 
@@ -186,34 +184,25 @@ fn run_shell_command(
 
             if status.is_none() {
                 status = try_wait_for_command_group(&mut child)?;
-                if status.is_some() {
-                    exited_at = Some(Instant::now());
-                }
             }
 
-            if status.is_some()
-                && !cancelled
-                && !background_process
-                && forced_at.is_none()
-                && process_group_exists(&child)?
-            {
-                background_process = true;
-                terminate_command_group(&mut child)?;
-                forced_at = Some(Instant::now());
-            }
+            let group_running = status.is_some() && process_group_exists(&child)?;
 
-            if status.is_some() && streams_done == 2 && !background_process {
+            if status.is_some() && streams_done == 2 && !group_running {
                 return Ok(());
             }
             if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
                 return Ok(());
             }
-            if forced_at.is_none()
-                && exited_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE)
-            {
-                output_incomplete = true;
-                terminate_command_group(&mut child)?;
-                forced_at = Some(Instant::now());
+            if forced_at.is_none() && status.is_some() && !group_running {
+                let started = drain_started_at.get_or_insert_with(Instant::now);
+                if started.elapsed() >= OUTPUT_DRAIN_GRACE {
+                    output_incomplete = true;
+                    terminate_command_group(&mut child)?;
+                    forced_at = Some(Instant::now());
+                }
+            } else {
+                drain_started_at = None;
             }
         }
     })();
@@ -238,9 +227,6 @@ fn run_shell_command(
     }
     if cancelled {
         return Err(CommandError::Cancelled);
-    }
-    if background_process {
-        return Err(CommandError::BackgroundProcess);
     }
     if output_incomplete {
         return Err(CommandError::OutputIncomplete);
@@ -472,7 +458,10 @@ fn make_nonblocking<F>(_file: &F) -> std::io::Result<()> {
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
     let mut process = Command::new("/bin/sh");
-    process.args(["-c", command]);
+    let script = format!(
+        "trap '__young_agent_command_status=$?; trap - EXIT; wait; exit \"$__young_agent_command_status\"' EXIT\n{command}\n__young_agent_command_status=$?\ntrap - EXIT\nwait\nexit \"$__young_agent_command_status\""
+    );
+    process.args(["-c", &script]);
     process
 }
 
@@ -601,7 +590,6 @@ pub(crate) enum CommandError {
     ReadOutput(std::io::Error),
     ReaderPanicked,
     Cancelled,
-    BackgroundProcess,
     OutputIncomplete,
 }
 
@@ -616,7 +604,6 @@ impl CommandError {
             | Self::ReadOutput(_)
             | Self::ReaderPanicked => "command_io_error",
             Self::Cancelled => "tool_cancelled",
-            Self::BackgroundProcess => "background_process_not_supported",
             Self::OutputIncomplete => "command_output_incomplete",
         }
     }
@@ -656,9 +643,6 @@ impl fmt::Display for CommandError {
             }
             Self::ReaderPanicked => formatter.write_str("command output reader panicked"),
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
-            Self::BackgroundProcess => {
-                formatter.write_str("run_command does not support background processes")
-            }
             Self::OutputIncomplete => formatter
                 .write_str("command output remained open after the command process group exited"),
         }

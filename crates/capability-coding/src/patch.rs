@@ -11,11 +11,11 @@ use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 use crate::tool_support::{
     display_relative_path, failure, finalize_output, truncate_utf8, ToolArguments,
 };
-use crate::workspace::{CodingWorkspace, WorkspacePathError};
+use crate::workspace::{CodingWorkspace, WorkspacePathError, MAX_FILE_SNAPSHOT_BYTES};
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PATCH_LINES: usize = 200_000;
-const MAX_PATCH_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PATCH_FILE_BYTES: u64 = MAX_FILE_SNAPSHOT_BYTES;
 const MAX_PATCH_FILE_LINES: usize = 1_000_000;
 const MAX_CONFLICT_LINE_BYTES: usize = 1024;
 
