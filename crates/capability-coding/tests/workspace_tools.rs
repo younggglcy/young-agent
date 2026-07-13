@@ -1664,13 +1664,21 @@ fn run_command_does_not_report_cancelled_while_a_setsid_descendant_survives() {
         id: ToolCallId::new("call-escaped-command-cancellation"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import os,time; os.setsid(); time.sleep(0.6)' >/dev/null 2>&1 & wait"
+            "command": "python3 -c 'import os,time; os.setsid(); open(\"escaped-ready\", \"w\").close(); time.sleep(0.6)' >/dev/null 2>&1 & wait"
         }),
     };
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancellation_trigger = cancellation.clone();
+    let ready = test_workspace.path().join("escaped-ready");
     let trigger = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "escaped descendant did not become ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         cancellation_trigger.store(true, Ordering::Relaxed);
     });
 
