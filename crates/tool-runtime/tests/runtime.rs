@@ -295,7 +295,7 @@ fn tool_runtime_normalizes_the_reserved_approval_denied_error() {
     assert_eq!(error.code, "reserved_tool_error_code");
     assert_eq!(
         error.message,
-        "tool handler returned reserved error code 'approval_denied'"
+        "tool dispatcher returned reserved error code 'approval_denied'"
     );
     assert!(!error.retryable);
     assert!(extensions.is_empty());

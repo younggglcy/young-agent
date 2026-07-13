@@ -163,6 +163,25 @@ pub trait ToolDispatcher: sealed::Sealed {
     ) -> ToolOutput;
 }
 
+/// Normalizes output at the Tool Runtime boundary before it reaches the Agent
+/// Runtime. Every sealed dispatcher must apply this to adapter-produced output.
+pub(crate) fn normalize_dispatcher_output(output: ToolOutput) -> ToolOutput {
+    match output {
+        ToolOutput::Failure { error, .. } if error.code == "approval_denied" => {
+            ToolOutput::Failure {
+                error: ToolError {
+                    code: "reserved_tool_error_code".to_string(),
+                    message: "tool dispatcher returned reserved error code 'approval_denied'"
+                        .to_string(),
+                    retryable: false,
+                },
+                extensions: BTreeMap::new(),
+            }
+        }
+        output => output,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolResult {
@@ -203,7 +222,7 @@ pub enum ToolContent {
 #[serde(deny_unknown_fields)]
 pub struct ToolError {
     /// `approval_denied` is reserved for the Agent Runtime's canonical denial
-    /// result and must not be returned by a ToolHandler.
+    /// result and must not be returned by a Tool Runtime adapter.
     pub code: String,
     pub message: String,
     /// Whether retrying the same low-level tool call is expected to help.

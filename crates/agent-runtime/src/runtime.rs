@@ -607,13 +607,13 @@ where
                             .finish(run_id, status, stop)
                             .map(ToolCallProgress::Finished);
                     }
-                    normalize_tool_output(self.tool_dispatcher.execute_prepared(
+                    self.tool_dispatcher.execute_prepared(
                         prepared,
                         ToolExecutionAuthorization::ApprovalGranted {
                             call_id: call_id.clone(),
                         },
                         stop.cancellation_flag(),
-                    ))
+                    )
                 }
                 ApprovalDecision::Deny { reason } => ToolOutput::Failure {
                     error: young_tool_runtime::ToolError {
@@ -630,11 +630,11 @@ where
                     .finish(run_id, status, stop)
                     .map(ToolCallProgress::Finished);
             }
-            normalize_tool_output(self.tool_dispatcher.execute_prepared(
+            self.tool_dispatcher.execute_prepared(
                 prepared,
                 ToolExecutionAuthorization::NotRequired,
                 stop.cancellation_flag(),
-            ))
+            )
         };
 
         let result = ToolResult { call_id, output };
@@ -790,23 +790,6 @@ fn tool_result_content(output: ToolOutput) -> Vec<ModelMessageContent> {
         failure @ ToolOutput::Failure { .. } => vec![ModelMessageContent::json(
             serde_json::to_value(failure).expect("ToolOutput is serializable"),
         )],
-    }
-}
-
-fn normalize_tool_output(output: ToolOutput) -> ToolOutput {
-    match output {
-        ToolOutput::Failure { error, .. } if error.code == "approval_denied" => {
-            ToolOutput::Failure {
-                error: young_tool_runtime::ToolError {
-                    code: "reserved_tool_error_code".to_string(),
-                    message: "tool executor returned reserved error code 'approval_denied'"
-                        .to_string(),
-                    retryable: false,
-                },
-                extensions: BTreeMap::new(),
-            }
-        }
-        output => output,
     }
 }
 

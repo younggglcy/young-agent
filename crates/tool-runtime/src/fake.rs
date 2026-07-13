@@ -3,8 +3,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::execution::{
-    PreparedToolCall, ToolCall, ToolDispatcher, ToolError, ToolExecutionAuthorization, ToolHandler,
-    ToolOutput,
+    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher, ToolError,
+    ToolExecutionAuthorization, ToolHandler, ToolOutput,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -111,7 +111,7 @@ impl ToolDispatcher for FakeToolDispatcher {
         cancellation: Arc<AtomicBool>,
     ) -> ToolOutput {
         match prepared.into_authorized_call(authorization) {
-            Ok(call) => self.handler.execute(&call, cancellation),
+            Ok(call) => normalize_dispatcher_output(self.handler.execute(&call, cancellation)),
             Err(output) => output,
         }
     }
