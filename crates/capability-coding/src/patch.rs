@@ -74,7 +74,7 @@ fn apply_unified_patch(
     let resolved = workspace
         .resolve_for_write(path)
         .map_err(PatchError::Workspace)?;
-    let mut original_identity = None;
+    let mut original_snapshot = None;
     let original = if resolved.existed {
         let (file, metadata) = workspace
             .open_regular_file(&resolved.relative_path)
@@ -88,9 +88,9 @@ fn apply_unified_patch(
                 resolved.relative_path.display()
             )));
         }
-        original_identity =
+        original_snapshot =
             Some(
-                CodingWorkspace::file_identity(&file).map_err(|source| PatchError::Io {
+                CodingWorkspace::file_snapshot(&file).map_err(|source| PatchError::Io {
                     path: resolved.relative_path.clone(),
                     source,
                 })?,
@@ -113,7 +113,7 @@ fn apply_unified_patch(
             .replace_existing_atomically(
                 &resolved.relative_path,
                 content.as_bytes(),
-                original_identity.expect("existing patch targets have an identity"),
+                original_snapshot.expect("existing patch targets have a snapshot"),
             )
             .map_err(|source| PatchError::Io {
                 path: resolved.relative_path.clone(),

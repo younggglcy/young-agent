@@ -84,18 +84,19 @@ impl CodingWorkspace {
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
-                let canonical_parent = self
+                let directory = self
                     .root_dir
-                    .canonicalize(parent)
+                    .open_dir(parent)
                     .map_err(|source| self.path_access_error(parent, source))?;
-                let file_name = relative_path.file_name().ok_or_else(|| {
-                    WorkspacePathError::OutsideWorkspace {
+                drop(directory);
+                relative_path
+                    .file_name()
+                    .ok_or_else(|| WorkspacePathError::OutsideWorkspace {
                         path: requested_path.to_path_buf(),
                         root: self.context.root.clone(),
-                    }
-                })?;
+                    })?;
                 Ok(ResolvedWorkspacePath {
-                    relative_path: canonical_parent.join(file_name),
+                    relative_path,
                     existed: false,
                 })
             }
@@ -113,15 +114,18 @@ impl CodingWorkspace {
         require_regular_file(file)
     }
 
-    pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    pub(crate) fn file_snapshot(file: &File) -> io::Result<FileSnapshot> {
         #[cfg(unix)]
         {
             use cap_std::fs::MetadataExt as _;
 
             let metadata = file.metadata()?;
-            Ok(FileIdentity {
+            Ok(FileSnapshot {
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                size: metadata.size(),
+                modified_seconds: metadata.mtime(),
+                modified_nanoseconds: metadata.mtime_nsec(),
             })
         }
         #[cfg(not(unix))]
@@ -164,7 +168,7 @@ impl CodingWorkspace {
         &self,
         path: &Path,
         content: &[u8],
-        expected_identity: FileIdentity,
+        expected_snapshot: FileSnapshot,
     ) -> io::Result<()> {
         let parent = path
             .parent()
@@ -175,7 +179,7 @@ impl CodingWorkspace {
         })?;
         let directory = self.root_dir.open_dir(parent)?;
         let metadata = self.replacement_metadata(&directory, Path::new(file_name))?;
-        if metadata.identity != expected_identity {
+        if metadata.snapshot != expected_snapshot {
             return Err(patch_target_changed());
         }
         let temp_path = self.stage_content(&directory, content, Some(metadata))?;
@@ -183,7 +187,7 @@ impl CodingWorkspace {
             &directory,
             &temp_path,
             Path::new(file_name),
-            expected_identity,
+            expected_snapshot,
         )
     }
 
@@ -370,7 +374,7 @@ impl CodingWorkspace {
         directory: &Dir,
         temp_path: &Path,
         path: &Path,
-        expected_identity: FileIdentity,
+        expected_snapshot: FileSnapshot,
     ) -> io::Result<()> {
         #[cfg(any(
             target_vendor = "apple",
@@ -386,7 +390,7 @@ impl CodingWorkspace {
             let validation = self
                 .replacement_metadata(directory, temp_path)
                 .and_then(|metadata| {
-                    if metadata.identity == expected_identity {
+                    if metadata.snapshot == expected_snapshot {
                         Ok(())
                     } else {
                         Err(patch_target_changed())
@@ -408,7 +412,7 @@ impl CodingWorkspace {
             target_os = "redox"
         )))]
         {
-            let _ = (directory, temp_path, path, expected_identity);
+            let _ = (directory, temp_path, path, expected_snapshot);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic identity-bound patch commits are not supported on this platform",
@@ -447,9 +451,12 @@ impl CodingWorkspace {
             }
             Ok(ReplacementMetadata {
                 permissions: metadata.permissions(),
-                identity: FileIdentity {
+                snapshot: FileSnapshot {
                     device: metadata.dev(),
                     inode: metadata.ino(),
+                    size: metadata.size(),
+                    modified_seconds: metadata.mtime(),
+                    modified_nanoseconds: metadata.mtime_nsec(),
                 },
                 uid: metadata.uid(),
                 gid: metadata.gid(),
@@ -470,7 +477,7 @@ impl CodingWorkspace {
 #[derive(Clone)]
 struct ReplacementMetadata {
     permissions: Permissions,
-    identity: FileIdentity,
+    snapshot: FileSnapshot,
     #[cfg(unix)]
     uid: u32,
     #[cfg(unix)]
@@ -480,11 +487,17 @@ struct ReplacementMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FileIdentity {
+pub(crate) struct FileSnapshot {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    size: u64,
+    #[cfg(unix)]
+    modified_seconds: i64,
+    #[cfg(unix)]
+    modified_nanoseconds: i64,
 }
 
 fn patch_target_changed() -> io::Error {
@@ -1029,7 +1042,7 @@ mod tests {
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
         let original = directory.open("target.txt").expect("target opens");
-        let expected = CodingWorkspace::file_identity(&original).expect("identity is available");
+        let expected = CodingWorkspace::file_snapshot(&original).expect("snapshot is available");
         let metadata = workspace
             .replacement_metadata(&directory, std::path::Path::new("target.txt"))
             .expect("metadata validates");
