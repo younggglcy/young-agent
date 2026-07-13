@@ -230,6 +230,54 @@ fn dispatch_cannot_bypass_a_required_approval() {
 }
 
 #[test]
+fn prepared_call_cannot_cross_runtime_approval_boundaries() {
+    let mut allow_runtime = ToolRuntime::default();
+    allow_runtime
+        .register(read_file_definition(), FakeToolHandler::default())
+        .expect("allowing tool registers");
+
+    let mut protected_definition = read_file_definition();
+    protected_definition.approval_policy = ToolApprovalPolicy::RequiresApproval {
+        reason: "this runtime requires approval".to_string(),
+    };
+    let mut protected_runtime = ToolRuntime::default();
+    protected_runtime
+        .register(
+            protected_definition,
+            FakeToolHandler::new([ToolOutput::Success {
+                content: vec![ToolContent::Text {
+                    text: "must not execute".to_string(),
+                }],
+                metadata: BTreeMap::new(),
+                extensions: BTreeMap::new(),
+            }]),
+        )
+        .expect("protected tool registers");
+
+    let prepared_by_allowing_runtime = allow_runtime.prepare(ToolCall {
+        id: ToolCallId::new("call-cross-runtime"),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "protected.txt" }),
+    });
+    let output = protected_runtime.execute_prepared(
+        prepared_by_allowing_runtime,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, extensions } = output else {
+        panic!("a prepared call from another runtime must fail closed");
+    };
+    assert_eq!(error.code, "invalid_prepared_tool_call");
+    assert_eq!(
+        error.message,
+        "prepared tool call belongs to a different dispatcher"
+    );
+    assert!(!error.retryable);
+    assert!(extensions.is_empty());
+}
+
+#[test]
 fn registered_tool_failure_is_propagated_without_losing_details() {
     let expected = ToolOutput::Failure {
         error: young_tool_runtime::ToolError {

@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::execution::{
-    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher, ToolError,
-    ToolExecutionAuthorization, ToolHandler, ToolOutput, ToolResult,
+    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
+    ToolResult,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -140,9 +141,18 @@ pub struct McpCompatibility {
     pub protocol_version: String,
 }
 
-#[derive(Default)]
 pub struct ToolRuntime {
+    dispatcher_identity: ToolDispatcherIdentity,
     tools: BTreeMap<String, RegisteredTool>,
+}
+
+impl Default for ToolRuntime {
+    fn default() -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            tools: BTreeMap::new(),
+        }
+    }
 }
 
 struct RegisteredTool {
@@ -221,6 +231,7 @@ impl ToolDispatcher for ToolRuntime {
         let Some(tool) = self.tools.get(&call.tool_name) else {
             let message = format!("tool '{}' is not registered", call.tool_name);
             return PreparedToolCall::rejected(
+                self.dispatcher_identity,
                 call,
                 ToolError {
                     code: "unknown_tool".to_string(),
@@ -231,15 +242,20 @@ impl ToolDispatcher for ToolRuntime {
         };
 
         match &tool.definition.approval_policy {
-            ToolApprovalPolicy::AlwaysAllow => PreparedToolCall::ready(call),
+            ToolApprovalPolicy::AlwaysAllow => {
+                PreparedToolCall::ready(self.dispatcher_identity, call)
+            }
             ToolApprovalPolicy::RequiresApproval { reason } => {
-                PreparedToolCall::requiring_approval(call, reason.clone())
+                PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason.clone())
             }
             ToolApprovalPolicy::CallDependent => match tool.handler.approval_reason(&call) {
-                Some(reason) => PreparedToolCall::requiring_approval(call, reason),
-                None => PreparedToolCall::ready(call),
+                Some(reason) => {
+                    PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
+                }
+                None => PreparedToolCall::ready(self.dispatcher_identity, call),
             },
             ToolApprovalPolicy::AlwaysReject { reason } => PreparedToolCall::rejected(
+                self.dispatcher_identity,
                 call,
                 ToolError {
                     code: "tool_rejected".to_string(),
@@ -256,7 +272,7 @@ impl ToolDispatcher for ToolRuntime {
         authorization: ToolExecutionAuthorization,
         cancellation: Arc<AtomicBool>,
     ) -> ToolOutput {
-        match prepared.into_authorized_call(authorization) {
+        match prepared.into_authorized_call(self.dispatcher_identity, authorization) {
             Ok(call) => match self.tools.get_mut(&call.tool_name) {
                 Some(tool) => {
                     normalize_dispatcher_output(tool.handler.execute(&call, cancellation))

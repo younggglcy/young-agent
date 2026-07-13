@@ -3,8 +3,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::execution::{
-    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher, ToolError,
-    ToolExecutionAuthorization, ToolHandler, ToolOutput,
+    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -64,14 +64,34 @@ impl ToolHandler for FakeToolHandler {
 }
 
 /// Dedicated external fake for deterministic Agent Runtime tests.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct FakeToolDispatcher {
+    dispatcher_identity: ToolDispatcherIdentity,
     handler: FakeToolHandler,
+}
+
+impl Clone for FakeToolDispatcher {
+    fn clone(&self) -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            handler: self.handler.clone(),
+        }
+    }
+}
+
+impl Default for FakeToolDispatcher {
+    fn default() -> Self {
+        Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
+            handler: FakeToolHandler::default(),
+        }
+    }
 }
 
 impl FakeToolDispatcher {
     pub fn new(outputs: impl IntoIterator<Item = ToolOutput>) -> Self {
         Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
             handler: FakeToolHandler::new(outputs),
         }
     }
@@ -81,6 +101,7 @@ impl FakeToolDispatcher {
         outputs: impl IntoIterator<Item = ToolOutput>,
     ) -> Self {
         Self {
+            dispatcher_identity: ToolDispatcherIdentity::fresh(),
             handler: FakeToolHandler::requiring_approval(reason, outputs),
         }
     }
@@ -99,8 +120,10 @@ impl crate::execution::sealed::Sealed for FakeToolDispatcher {}
 impl ToolDispatcher for FakeToolDispatcher {
     fn prepare(&self, call: ToolCall) -> PreparedToolCall {
         match self.handler.approval_reason(&call) {
-            Some(reason) => PreparedToolCall::requiring_approval(call, reason),
-            None => PreparedToolCall::ready(call),
+            Some(reason) => {
+                PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
+            }
+            None => PreparedToolCall::ready(self.dispatcher_identity, call),
         }
     }
 
@@ -110,7 +133,7 @@ impl ToolDispatcher for FakeToolDispatcher {
         authorization: ToolExecutionAuthorization,
         cancellation: Arc<AtomicBool>,
     ) -> ToolOutput {
-        match prepared.into_authorized_call(authorization) {
+        match prepared.into_authorized_call(self.dispatcher_identity, authorization) {
             Ok(call) => normalize_dispatcher_output(self.handler.execute(&call, cancellation)),
             Err(output) => output,
         }

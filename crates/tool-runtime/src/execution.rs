@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -54,8 +54,21 @@ impl ToolExecutionAuthorization {
 /// to different arguments or invocation ids.
 #[derive(Debug, PartialEq)]
 pub struct PreparedToolCall {
+    dispatcher_identity: ToolDispatcherIdentity,
     call: ToolCall,
     disposition: ToolExecutionDisposition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ToolDispatcherIdentity(u64);
+
+impl ToolDispatcherIdentity {
+    pub(crate) fn fresh() -> Self {
+        static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+        let identity = NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(identity, 0, "tool dispatcher identity space exhausted");
+        Self(identity)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,15 +79,21 @@ enum ToolExecutionDisposition {
 }
 
 impl PreparedToolCall {
-    pub(crate) fn ready(call: ToolCall) -> Self {
+    pub(crate) fn ready(dispatcher_identity: ToolDispatcherIdentity, call: ToolCall) -> Self {
         Self {
+            dispatcher_identity,
             call,
             disposition: ToolExecutionDisposition::Ready,
         }
     }
 
-    pub(crate) fn requiring_approval(call: ToolCall, reason: impl Into<String>) -> Self {
+    pub(crate) fn requiring_approval(
+        dispatcher_identity: ToolDispatcherIdentity,
+        call: ToolCall,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
+            dispatcher_identity,
             call,
             disposition: ToolExecutionDisposition::RequiresApproval {
                 reason: reason.into(),
@@ -82,8 +101,13 @@ impl PreparedToolCall {
         }
     }
 
-    pub(crate) fn rejected(call: ToolCall, error: ToolError) -> Self {
+    pub(crate) fn rejected(
+        dispatcher_identity: ToolDispatcherIdentity,
+        call: ToolCall,
+        error: ToolError,
+    ) -> Self {
         Self {
+            dispatcher_identity,
             call,
             disposition: ToolExecutionDisposition::Reject { error },
         }
@@ -103,8 +127,20 @@ impl PreparedToolCall {
     /// Consumes this exact plan and validates the Agent Runtime's decision.
     pub(crate) fn into_authorized_call(
         self,
+        dispatcher_identity: ToolDispatcherIdentity,
         authorization: ToolExecutionAuthorization,
     ) -> Result<ToolCall, ToolOutput> {
+        if self.dispatcher_identity != dispatcher_identity {
+            return Err(ToolOutput::Failure {
+                error: ToolError {
+                    code: "invalid_prepared_tool_call".to_string(),
+                    message: "prepared tool call belongs to a different dispatcher".to_string(),
+                    retryable: false,
+                },
+                extensions: BTreeMap::new(),
+            });
+        }
+
         match self.disposition {
             ToolExecutionDisposition::Ready => Ok(self.call),
             ToolExecutionDisposition::RequiresApproval { .. }
