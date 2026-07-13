@@ -259,3 +259,77 @@ input_schema = "not-an-object"
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn direct_deserialization_cannot_bypass_manifest_invariants_during_conversion() {
+    let unsupported_schema_version = r#"
+schema_version = 2
+
+[capability]
+id = "coding"
+version = "0.1.0"
+name = "Coding"
+description = "Built-in coding tools."
+
+[[tools]]
+name = "read_file"
+description = "Read one workspace file."
+safety_class = "always_allow"
+input_schema = { type = "object" }
+"#;
+    let duplicate_tool_names = r#"
+schema_version = 1
+
+[capability]
+id = "coding"
+version = "0.1.0"
+name = "Coding"
+description = "Built-in coding tools."
+
+[[tools]]
+name = "read_file"
+description = "Read one workspace file."
+safety_class = "always_allow"
+input_schema = { type = "object" }
+
+[[tools]]
+name = "read_file"
+description = "Conflicting declaration."
+safety_class = "always_allow"
+input_schema = { type = "object" }
+"#;
+    let empty_tools = r#"
+schema_version = 1
+tools = []
+
+[capability]
+id = "coding"
+version = "0.1.0"
+name = "Coding"
+description = "Built-in coding tools."
+"#;
+
+    let cases = [
+        (unsupported_schema_version, "unsupported schema_version 2"),
+        (duplicate_tool_names, "duplicate tool name 'read_file'"),
+        (empty_tools, "tools must contain at least one tool"),
+    ];
+
+    for (source, expected) in cases {
+        let manifest: CapabilityManifest =
+            toml::from_str(source).expect("serde shape is syntactically valid");
+        let borrowed_error = manifest
+            .tool_definitions()
+            .expect_err("borrowed conversion owns all manifest invariants");
+        let consumed_error = manifest
+            .into_tool_definitions()
+            .expect_err("consuming conversion owns all manifest invariants");
+
+        for error in [borrowed_error, consumed_error] {
+            assert!(
+                error.to_string().contains(expected),
+                "expected '{expected}', got '{error}'"
+            );
+        }
+    }
+}

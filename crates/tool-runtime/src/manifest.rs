@@ -25,15 +25,22 @@ impl CapabilityManifest {
     /// capability packs or plugins.
     pub fn from_toml(source: &str) -> Result<Self, CapabilityManifestError> {
         let manifest: Self = toml::from_str(source).map_err(CapabilityManifestError::Parse)?;
-        manifest.validate_schema_version()?;
-        manifest.validate_required_metadata()?;
-        manifest.validate_unique_tool_names()?;
-        manifest.validate_tool_definitions()?;
+        manifest.validate()?;
         Ok(manifest)
     }
 
+    /// Validates the complete manifest contract regardless of how the value
+    /// was constructed. Conversion APIs call this too, so direct serde users
+    /// cannot bypass manifest-level invariants.
+    pub fn validate(&self) -> Result<(), CapabilityManifestError> {
+        self.validate_schema_version()?;
+        self.validate_required_metadata()?;
+        self.validate_unique_tool_names()?;
+        self.validate_tool_definitions()
+    }
+
     pub fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, CapabilityManifestError> {
-        self.validate_tool_definitions()?;
+        self.validate()?;
         let capability = CapabilityRef {
             id: self.capability.id.clone(),
             version: self.capability.version.clone(),
@@ -58,7 +65,7 @@ impl CapabilityManifest {
     /// schema documents or metadata. Built-in registration should prefer this
     /// consuming path because it no longer needs the manifest afterwards.
     pub fn into_tool_definitions(self) -> Result<Vec<ToolDefinition>, CapabilityManifestError> {
-        self.validate_tool_definitions()?;
+        self.validate()?;
         let capability = CapabilityRef {
             id: self.capability.id,
             version: self.capability.version,
