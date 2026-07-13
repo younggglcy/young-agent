@@ -32,22 +32,9 @@ pub(crate) fn execute(
         Ok(resolved) => resolved,
         Err(error) => return workspace_path_failure(error),
     };
-    let mut file = match workspace.open_file(&resolved.relative_path) {
-        Ok(file) => file,
-        Err(source) => {
-            return failure(
-                "workspace_io_error",
-                format!(
-                    "failed to open '{}': {source}",
-                    resolved.relative_path.display()
-                ),
-                source.kind() == std::io::ErrorKind::Interrupted,
-            )
-        }
-    };
-    let metadata = match file.metadata() {
-        Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => {
+    let (mut file, metadata) = match workspace.open_regular_file(&resolved.relative_path) {
+        Ok(opened) => opened,
+        Err(source) if source.kind() == std::io::ErrorKind::InvalidInput => {
             return failure(
                 "path_is_not_file",
                 format!("'{}' is not a file", resolved.relative_path.display()),
@@ -58,7 +45,7 @@ pub(crate) fn execute(
             return failure(
                 "workspace_io_error",
                 format!(
-                    "failed to inspect '{}': {source}",
+                    "failed to open '{}': {source}",
                     resolved.relative_path.display()
                 ),
                 source.kind() == std::io::ErrorKind::Interrupted,

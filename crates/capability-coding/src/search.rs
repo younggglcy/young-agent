@@ -17,6 +17,9 @@ const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_METADATA_SERIALIZED_BYTES: usize = 4 * 1024;
+const MAX_SEARCH_DIRECTORY_ENTRIES: usize = 100_000;
+const MAX_SEARCH_FILES: u64 = 100_000;
+const MAX_SEARCH_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
@@ -28,6 +31,13 @@ pub(crate) fn execute(
         Err(output) => return output,
     };
     let query = match arguments.required_string("query") {
+        Ok("") => {
+            return failure(
+                "invalid_arguments",
+                "argument 'query' must not be empty",
+                false,
+            )
+        }
         Ok(query) if query.len() <= MAX_SEARCH_QUERY_BYTES => query,
         Ok(_) => {
             return failure(
@@ -63,8 +73,8 @@ pub(crate) fn execute(
             }
         }
         Err(_) => {
-            let file = match workspace.open_file(&resolved.relative_path) {
-                Ok(file) => file,
+            let file = match workspace.open_regular_file(&resolved.relative_path) {
+                Ok((file, _)) => file,
                 Err(source) => {
                     return failure(
                         "workspace_io_error",
@@ -147,7 +157,7 @@ fn search_directory(
                 entries,
             });
         } else if file_type.is_file() {
-            let file = entry.open().map_err(|source| {
+            let (file, _) = CodingWorkspace::open_regular_entry(&entry).map_err(|source| {
                 failure(
                     "workspace_io_error",
                     format!("failed to open '{}': {source}", entry_path.display()),
@@ -192,6 +202,16 @@ fn sorted_entries(
                 source.kind() == std::io::ErrorKind::Interrupted,
             )
         })?);
+        if sorted.len() > MAX_SEARCH_DIRECTORY_ENTRIES {
+            return Err(failure(
+                "search_limit_exceeded",
+                format!(
+                    "directory '{}' exceeds {MAX_SEARCH_DIRECTORY_ENTRIES} entries",
+                    relative_path.display()
+                ),
+                false,
+            ));
+        }
     }
     sorted.sort_by_key(DirEntry::file_name);
     Ok(sorted.into_iter())
@@ -204,6 +224,12 @@ fn search_file(
     cancellation: &AtomicBool,
     results: &mut SearchResults,
 ) -> Result<(), ToolOutput> {
+    if results.files_searched == MAX_SEARCH_FILES {
+        results.truncated = true;
+        results.limit_reached = true;
+        return Ok(());
+    }
+    results.files_searched = results.files_searched.saturating_add(1);
     let checkpoint = results.checkpoint();
     let mut buffer = [0u8; 8 * 1024];
     let mut line = LineState::default();
@@ -218,7 +244,14 @@ fn search_file(
                 false,
             ));
         }
-        let bytes_read = file.read(&mut buffer).map_err(|source| {
+        let remaining_bytes = MAX_SEARCH_BYTES.saturating_sub(results.bytes_searched);
+        if remaining_bytes == 0 {
+            results.truncated = true;
+            results.limit_reached = true;
+            return Ok(());
+        }
+        let read_limit = buffer.len().min(remaining_bytes as usize);
+        let bytes_read = file.read(&mut buffer[..read_limit]).map_err(|source| {
             failure(
                 "workspace_io_error",
                 format!("failed to search '{display_path}': {source}"),
@@ -306,6 +339,7 @@ struct SearchResults {
     matches: Vec<Value>,
     serialized_bytes: usize,
     bytes_searched: u64,
+    files_searched: u64,
     binary_files_skipped: u64,
     lines_truncated: u64,
     truncated: bool,
@@ -455,6 +489,7 @@ fn bounded_search_output(
                 ("query_truncated".to_string(), json!(query_truncated)),
                 ("matches".to_string(), json!(results.matches.len())),
                 ("bytes_searched".to_string(), json!(results.bytes_searched)),
+                ("files_searched".to_string(), json!(results.files_searched)),
                 (
                     "binary_files_skipped".to_string(),
                     json!(results.binary_files_skipped),

@@ -336,6 +336,31 @@ fn file_tools_remain_bound_to_the_open_workspace_when_its_path_is_replaced() {
         "outside\n"
     );
 
+    let create_call = ToolCall {
+        id: ToolCallId::new("call-stable-root-create"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\n"
+        }),
+    };
+    let created = runtime.dispatch(
+        create_call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: create_call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(
+        matches!(created.output, ToolOutput::Success { .. }),
+        "unexpected create result: {:?}",
+        created.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(moved.join("created.txt")).unwrap(),
+        "created\n"
+    );
+    assert!(!outside.join("created.txt").exists());
+
     let command_call = ToolCall {
         id: ToolCallId::new("call-stable-root-command"),
         tool_name: "run_command".to_string(),
@@ -423,6 +448,62 @@ fn read_file_bounds_the_complete_serialized_output() {
         .len();
     assert!(matches!(result.output, ToolOutput::Success { .. }));
     assert!(serialized_len <= 64 * 1024, "serialized output is bounded");
+}
+
+#[cfg(unix)]
+#[test]
+fn file_tools_reject_a_fifo_without_blocking() {
+    let test_workspace = TestWorkspace::new("fifo");
+    let fifo = test_workspace.path().join("named-pipe");
+    let status = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo starts");
+    assert!(status.success(), "mkfifo must create the fixture");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let calls = [
+        ToolCall {
+            id: ToolCallId::new("call-read-fifo"),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "named-pipe" }),
+        },
+        ToolCall {
+            id: ToolCallId::new("call-search-fifo"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "path": "named-pipe", "query": "needle" }),
+        },
+        ToolCall {
+            id: ToolCallId::new("call-patch-fifo"),
+            tool_name: "apply_patch".to_string(),
+            arguments: json!({
+                "patch": "--- a/named-pipe\n+++ b/named-pipe\n@@ -1 +1 @@\n-old\n+new\n"
+            }),
+        },
+    ];
+
+    for call in calls {
+        let started = std::time::Instant::now();
+        let result = runtime.dispatch(
+            call.clone(),
+            ToolExecutionAuthorization::ApprovalGranted {
+                call_id: call.id.clone(),
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{} must not block while opening a FIFO",
+            call.tool_name
+        );
+        assert!(
+            matches!(result.output, ToolOutput::Failure { .. }),
+            "{} must reject a FIFO",
+            call.tool_name
+        );
+    }
 }
 
 #[test]
@@ -827,6 +908,42 @@ fn apply_patch_preserves_private_permissions() {
 
 #[cfg(unix)]
 #[test]
+fn apply_patch_preserves_setuid_mode_after_writing_staging_content() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let test_workspace = TestWorkspace::new("patch-setuid-mode");
+    let executable = test_workspace.path().join("tool.sh");
+    std::fs::write(&executable, "old\n").expect("fixture is written");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o4750))
+        .expect("fixture mode is set");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-setuid-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- a/tool.sh\n+++ b/tool.sh\n@@ -1 +1 @@\n-old\n+new\n"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::metadata(executable).unwrap().mode() & 0o7777,
+        0o4750
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn apply_patch_refuses_to_break_hard_link_identity() {
     let test_workspace = TestWorkspace::new("patch-hard-link");
     let notes = test_workspace.path().join("shared.txt");
@@ -1009,6 +1126,37 @@ fn apply_patch_rejects_multi_file_edits_without_mutating_any_file() {
         std::fs::read_to_string(old).expect("old file remains readable"),
         "obsolete\n"
     );
+}
+
+#[test]
+fn apply_patch_rejects_delete_file_edits_without_mutating_the_file() {
+    let test_workspace = TestWorkspace::new("patch-delete");
+    let obsolete = test_workspace.path().join("obsolete.txt");
+    std::fs::write(&obsolete, "obsolete\n").expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-delete-file"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- a/obsolete.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-obsolete\n"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("delete-file patch must be rejected");
+    };
+    assert_eq!(error.code, "invalid_patch");
+    assert_eq!(std::fs::read_to_string(obsolete).unwrap(), "obsolete\n");
 }
 
 #[test]

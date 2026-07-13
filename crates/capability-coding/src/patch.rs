@@ -74,29 +74,27 @@ fn apply_unified_patch(
     let resolved = workspace
         .resolve_for_write(path)
         .map_err(PatchError::Workspace)?;
+    let mut original_identity = None;
     let original = if resolved.existed {
-        let file = workspace
-            .open_file(&resolved.relative_path)
+        let (file, metadata) = workspace
+            .open_regular_file(&resolved.relative_path)
             .map_err(|source| PatchError::Io {
                 path: resolved.relative_path.clone(),
                 source,
             })?;
-        let metadata = file.metadata().map_err(|source| PatchError::Io {
-            path: resolved.relative_path.clone(),
-            source,
-        })?;
-        if !metadata.is_file() {
-            return Err(PatchError::Conflict(format!(
-                "'{}' is not a file",
-                resolved.relative_path.display()
-            )));
-        }
         if metadata.len() > MAX_PATCH_FILE_BYTES {
             return Err(PatchError::Limit(format!(
                 "patch target '{}' exceeds {MAX_PATCH_FILE_BYTES} bytes",
                 resolved.relative_path.display()
             )));
         }
+        original_identity =
+            Some(
+                CodingWorkspace::file_identity(&file).map_err(|source| PatchError::Io {
+                    path: resolved.relative_path.clone(),
+                    source,
+                })?,
+            );
         Some(read_patch_target(
             file,
             &resolved.relative_path,
@@ -112,7 +110,11 @@ fn apply_unified_patch(
     }
     match change {
         FileChange::Write(content) if resolved.existed => workspace
-            .replace_existing_atomically(&resolved.relative_path, content.as_bytes())
+            .replace_existing_atomically(
+                &resolved.relative_path,
+                content.as_bytes(),
+                original_identity.expect("existing patch targets have an identity"),
+            )
             .map_err(|source| PatchError::Io {
                 path: resolved.relative_path.clone(),
                 source,
@@ -125,12 +127,6 @@ fn apply_unified_patch(
                     source,
                 })?;
         }
-        FileChange::Delete => workspace
-            .remove_file(&resolved.relative_path)
-            .map_err(|source| PatchError::Io {
-                path: resolved.relative_path.clone(),
-                source,
-            })?,
     }
     Ok(vec![display_relative_path(&resolved.relative_path)])
 }
@@ -171,18 +167,12 @@ impl FilePatch {
             (Some(_), _, None) => Err(PatchError::Conflict(
                 "patch source file does not exist".to_string(),
             )),
+            (Some(_), None, Some(_)) => Err(PatchError::InvalidPatch(
+                "delete-file patches are not supported by the minimal patch tool".to_string(),
+            )),
             _ => {
                 let updated = apply_hunks(original.unwrap_or_default(), &self.hunks, cancellation)?;
-                if self.new_path.is_none() {
-                    if !updated.is_empty() {
-                        return Err(PatchError::Conflict(
-                            "delete-file patch did not remove all content".to_string(),
-                        ));
-                    }
-                    Ok(FileChange::Delete)
-                } else {
-                    Ok(FileChange::Write(updated))
-                }
+                Ok(FileChange::Write(updated))
             }
         }
     }
@@ -205,7 +195,6 @@ enum PatchLine {
 
 enum FileChange {
     Write(String),
-    Delete,
 }
 
 fn parse_patch(patch: &str, cancellation: &AtomicBool) -> Result<Vec<FilePatch>, PatchError> {
@@ -593,6 +582,12 @@ impl PatchError {
             Self::Workspace(error) => error.code(),
             Self::Io { source, .. } if source.kind() == std::io::ErrorKind::Unsupported => {
                 "unsupported_file_metadata"
+            }
+            Self::Io { source, .. } if source.kind() == std::io::ErrorKind::WouldBlock => {
+                "patch_conflict"
+            }
+            Self::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput => {
+                "patch_conflict"
             }
             Self::Io { .. } => "workspace_io_error",
             Self::Cancelled => "tool_cancelled",

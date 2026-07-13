@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, File, OpenOptions, Permissions};
+use cap_std::fs::{Dir, DirEntry, File, Metadata, OpenOptions, Permissions};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -56,15 +56,18 @@ impl CodingWorkspace {
         requested_path: &Path,
     ) -> Result<ResolvedWorkspacePath, WorkspacePathError> {
         let relative_path = self.relative_request_path(requested_path)?;
-        let canonical_path = self
+        let metadata = self
             .root_dir
-            .canonicalize(&relative_path)
+            .symlink_metadata(&relative_path)
             .map_err(|source| self.path_access_error(requested_path, source))?;
-        self.root_dir
-            .metadata(&canonical_path)
-            .map_err(|source| self.path_access_error(requested_path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(WorkspacePathError::OutsideWorkspace {
+                path: requested_path.to_path_buf(),
+                root: self.context.root.clone(),
+            });
+        }
         Ok(ResolvedWorkspacePath {
-            relative_path: canonical_path,
+            relative_path,
             existed: true,
         })
     }
@@ -77,7 +80,10 @@ impl CodingWorkspace {
         match self.root_dir.symlink_metadata(&relative_path) {
             Ok(_) => self.resolve_existing(requested_path),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                let parent = relative_path.parent().unwrap_or_else(|| Path::new("."));
+                let parent = relative_path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
                 let canonical_parent = self
                     .root_dir
                     .canonicalize(parent)
@@ -97,8 +103,35 @@ impl CodingWorkspace {
         }
     }
 
-    pub(crate) fn open_file(&self, path: &Path) -> io::Result<File> {
-        self.root_dir.open(path)
+    pub(crate) fn open_regular_file(&self, path: &Path) -> io::Result<(File, Metadata)> {
+        let file = self.root_dir.open_with(path, &regular_file_options())?;
+        require_regular_file(file)
+    }
+
+    pub(crate) fn open_regular_entry(entry: &DirEntry) -> io::Result<(File, Metadata)> {
+        let file = entry.open_with(&regular_file_options())?;
+        require_regular_file(file)
+    }
+
+    pub(crate) fn file_identity(file: &File) -> io::Result<FileIdentity> {
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt as _;
+
+            let metadata = file.metadata()?;
+            Ok(FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "stable patch target identities are not supported on this platform",
+            ))
+        }
     }
 
     pub(crate) fn open_dir(&self, path: &Path) -> io::Result<Dir> {
@@ -131,29 +164,44 @@ impl CodingWorkspace {
         &self,
         path: &Path,
         content: &[u8],
+        expected_identity: FileIdentity,
     ) -> io::Result<()> {
-        let metadata = self.replacement_metadata(path)?;
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_path = self.stage_content(parent, content, Some(metadata))?;
-        let result = self.root_dir.rename(&temp_path, &self.root_dir, path);
-        if result.is_err() {
-            let _ = self.root_dir.remove_file(&temp_path);
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
+        })?;
+        let directory = self.root_dir.open_dir(parent)?;
+        let metadata = self.replacement_metadata(&directory, Path::new(file_name))?;
+        if metadata.identity != expected_identity {
+            return Err(patch_target_changed());
         }
-        result
+        let temp_path = self.stage_content(&directory, content, Some(metadata))?;
+        self.commit_existing_file(
+            &directory,
+            &temp_path,
+            Path::new(file_name),
+            expected_identity,
+        )
     }
 
     pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_path = self.stage_content(parent, content, None)?;
-        let result = self.commit_new_file(&temp_path, path);
-        if result.is_err() {
-            let _ = self.root_dir.remove_file(&temp_path);
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
+        })?;
+        let directory = self.root_dir.open_dir(parent)?;
+        let temp_path = self.stage_content(&directory, content, None)?;
+        let result = self.commit_new_file(&directory, &temp_path, Path::new(file_name));
+        match result {
+            Ok(()) => Ok(()),
+            Err(source) => cleanup_staging_after_error(&directory, &temp_path, source),
         }
-        result
-    }
-
-    pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
-        self.root_dir.remove_file(path)
     }
 
     pub(crate) fn metadata(&self) -> Value {
@@ -206,7 +254,7 @@ impl CodingWorkspace {
 
     fn stage_content(
         &self,
-        parent: &Path,
+        directory: &Dir,
         content: &[u8],
         replacement: Option<ReplacementMetadata>,
     ) -> io::Result<PathBuf> {
@@ -216,19 +264,25 @@ impl CodingWorkspace {
 
         for _ in 0..100 {
             let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-            let candidate = parent.join(format!(
+            let candidate = PathBuf::from(format!(
                 ".young-agent-patch-{}-{nonce}.tmp",
                 std::process::id()
             ));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
-            let mut file = match self.root_dir.open_with(&candidate, &options) {
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt as _;
+
+                options.mode(0o600);
+            }
+            let mut file = match directory.open_with(&candidate, &options) {
                 Ok(file) => file,
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(source) => return Err(source),
             };
             let result = (|| {
-                if let Some(replacement) = replacement {
+                if let Some(replacement) = replacement.as_ref() {
                     #[cfg(unix)]
                     {
                         use cap_std::fs::MetadataExt as _;
@@ -247,15 +301,29 @@ impl CodingWorkspace {
                             ));
                         }
                     }
-                    file.set_permissions(replacement.permissions)?;
                 }
                 file.write_all(content)?;
-                file.sync_all()
+                file.sync_all()?;
+                if let Some(replacement) = replacement.as_ref() {
+                    file.set_permissions(replacement.permissions.clone())?;
+                    #[cfg(unix)]
+                    {
+                        use cap_std::fs::MetadataExt as _;
+
+                        if file.metadata()?.mode() != replacement.mode {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "atomic patch could not preserve the target mode",
+                            ));
+                        }
+                    }
+                    file.sync_all()?;
+                }
+                Ok(())
             })();
             drop(file);
             if let Err(source) = result {
-                let _ = self.root_dir.remove_file(&candidate);
-                return Err(source);
+                return cleanup_staging_after_error(directory, &candidate, source);
             }
             return Ok(candidate);
         }
@@ -265,7 +333,7 @@ impl CodingWorkspace {
         ))
     }
 
-    fn commit_new_file(&self, temp_path: &Path, path: &Path) -> io::Result<()> {
+    fn commit_new_file(&self, directory: &Dir, temp_path: &Path, path: &Path) -> io::Result<()> {
         #[cfg(any(
             target_vendor = "apple",
             target_os = "linux",
@@ -274,9 +342,9 @@ impl CodingWorkspace {
         ))]
         {
             rustix::fs::renameat_with(
-                &*self.root_dir,
+                directory,
                 temp_path,
-                &*self.root_dir,
+                directory,
                 path,
                 rustix::fs::RenameFlags::NOREPLACE,
             )
@@ -289,22 +357,76 @@ impl CodingWorkspace {
             target_os = "redox"
         )))]
         {
-            self.root_dir.hard_link(temp_path, &self.root_dir, path)?;
-            if let Err(source) = self.root_dir.remove_file(temp_path) {
-                let _ = self.root_dir.remove_file(path);
-                return Err(source);
-            }
-            Ok(())
+            let _ = (directory, temp_path, path);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic no-replace patch commits are not supported on this platform",
+            ))
         }
     }
 
-    fn replacement_metadata(&self, path: &Path) -> io::Result<ReplacementMetadata> {
+    fn commit_existing_file(
+        &self,
+        directory: &Dir,
+        temp_path: &Path,
+        path: &Path,
+        expected_identity: FileIdentity,
+    ) -> io::Result<()> {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        ))]
+        {
+            if let Err(source) = exchange_files(directory, temp_path, path) {
+                return cleanup_staging_after_error(directory, temp_path, source);
+            }
+
+            let validation = self
+                .replacement_metadata(directory, temp_path)
+                .and_then(|metadata| {
+                    if metadata.identity == expected_identity {
+                        Ok(())
+                    } else {
+                        Err(patch_target_changed())
+                    }
+                });
+            if let Err(source) = validation {
+                return rollback_existing_exchange(directory, temp_path, path, source);
+            }
+
+            if let Err(source) = directory.remove_file(temp_path) {
+                return rollback_existing_exchange(directory, temp_path, path, source);
+            }
+            Ok(())
+        }
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        )))]
+        {
+            let _ = (directory, temp_path, path, expected_identity);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "atomic identity-bound patch commits are not supported on this platform",
+            ))
+        }
+    }
+
+    fn replacement_metadata(
+        &self,
+        directory: &Dir,
+        path: &Path,
+    ) -> io::Result<ReplacementMetadata> {
         #[cfg(unix)]
         {
             use cap_std::fs::MetadataExt as _;
 
-            let file = self.root_dir.open(path)?;
-            let metadata = file.metadata()?;
+            let (file, metadata) =
+                require_regular_file(directory.open_with(path, &regular_file_options())?)?;
             if metadata.nlink() != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -325,16 +447,22 @@ impl CodingWorkspace {
             }
             Ok(ReplacementMetadata {
                 permissions: metadata.permissions(),
+                identity: FileIdentity {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                },
                 uid: metadata.uid(),
                 gid: metadata.gid(),
+                mode: metadata.mode(),
             })
         }
         #[cfg(not(unix))]
         {
-            let metadata = self.root_dir.metadata(path)?;
-            Ok(ReplacementMetadata {
-                permissions: metadata.permissions(),
-            })
+            let _ = (directory, path);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "safe replacement metadata validation is not supported on this platform",
+            ))
         }
     }
 }
@@ -342,10 +470,114 @@ impl CodingWorkspace {
 #[derive(Clone)]
 struct ReplacementMetadata {
     permissions: Permissions,
+    identity: FileIdentity,
     #[cfg(unix)]
     uid: u32,
     #[cfg(unix)]
     gid: u32,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn patch_target_changed() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "patch target changed while the patch was being applied",
+    )
+}
+
+fn cleanup_staging_after_error<T>(
+    directory: &Dir,
+    staging_path: &Path,
+    source: io::Error,
+) -> io::Result<T> {
+    match directory.remove_file(staging_path) {
+        Ok(()) => Err(source),
+        Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(source),
+        Err(cleanup) => Err(io::Error::new(
+            cleanup.kind(),
+            format!(
+                "patch operation failed ({source}); staging file '{}' could not be removed ({cleanup})",
+                staging_path.display()
+            ),
+        )),
+    }
+}
+
+fn regular_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+
+        let flags = rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW;
+        options.custom_flags(flags.bits() as i32);
+    }
+    options
+}
+
+fn require_regular_file(file: File) -> io::Result<(File, Metadata)> {
+    let metadata = file.metadata()?;
+    if metadata.is_file() {
+        Ok((file, metadata))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ))
+    }
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn exchange_files(directory: &Dir, left: &Path, right: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        directory,
+        left,
+        directory,
+        right,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn rollback_existing_exchange(
+    directory: &Dir,
+    temp_path: &Path,
+    path: &Path,
+    source: io::Error,
+) -> io::Result<()> {
+    if let Err(rollback) = exchange_files(directory, temp_path, path) {
+        return Err(io::Error::other(format!(
+                "patch commit failed ({source}) and restoring the original target also failed ({rollback})"
+            )));
+    }
+    if let Err(cleanup) = directory.remove_file(temp_path) {
+        return Err(io::Error::new(
+            cleanup.kind(),
+            format!("patch commit failed ({source}); target was restored but staging cleanup failed ({cleanup})"),
+        ));
+    }
+    Err(source)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
@@ -377,11 +609,29 @@ fn has_extended_acl(file: &File) -> io::Result<bool> {
     }));
 }
 
-#[cfg(unix)]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "hurd"
+))]
 fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
     let mut names: Vec<u8> = Vec::with_capacity(64 * 1024);
     rustix::fs::flistxattr(file, &mut names).map_err(io::Error::from)?;
     Ok(!names.is_empty())
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "hurd"
+)))]
+fn file_has_extended_attributes(_file: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic patch extended-attribute validation is not supported on this platform",
+    ))
 }
 
 #[cfg(all(
@@ -760,6 +1010,66 @@ mod tests {
         );
 
         drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_commit_rolls_back_when_the_target_identity_changes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-target-swap-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
+        let original = directory.open("target.txt").expect("target opens");
+        let expected = CodingWorkspace::file_identity(&original).expect("identity is available");
+        let metadata = workspace
+            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
+            .expect("metadata validates");
+        let staging = workspace
+            .stage_content(&directory, b"patched\n", Some(metadata))
+            .expect("content is staged");
+
+        directory
+            .rename("target.txt", &directory, "original.txt")
+            .expect("original target is moved");
+        std::fs::write(root.join("target.txt"), "concurrent\n")
+            .expect("concurrent target is written");
+
+        let error = workspace
+            .commit_existing_file(
+                &directory,
+                &staging,
+                std::path::Path::new("target.txt"),
+                expected,
+            )
+            .expect_err("identity mismatch must fail the commit");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "concurrent\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("original.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".young-agent-patch-")
+        }));
+
+        drop((directory, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 }

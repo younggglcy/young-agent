@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use command_group::{CommandGroup, GroupChild};
 use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
@@ -20,6 +23,11 @@ use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+thread_local! {
+    static INJECT_NEXT_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
+}
 
 pub(crate) const APPROVAL_REASON: &str =
     "command execution requires approval until a command safety policy is configured";
@@ -122,8 +130,8 @@ fn run_shell_command(
         .take()
         .expect("stderr was configured as piped");
     if let Err(source) = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr)) {
-        let _ = terminate_command_group(&mut child);
-        let _ = child.wait();
+        terminate_command_group(&mut child)?;
+        wait_for_command_group(&mut child)?;
         return Err(CommandError::ConfigureOutput(source));
     }
     let (sender, receiver) = mpsc::sync_channel(16);
@@ -141,55 +149,63 @@ fn run_shell_command(
     let mut cancelled = false;
     let mut forced_at = None;
 
-    loop {
-        if cancellation.load(Ordering::Relaxed) && !cancelled {
-            cancelled = true;
-            terminate_command_group(&mut child)?;
-            if status.is_none() {
-                status = Some(child.wait().map_err(CommandError::Wait)?);
-            }
-            exited_at = Some(Instant::now());
-            forced_at = Some(Instant::now());
-        }
-
-        receive_stream_message(
-            &receiver,
-            &mut stdout_capture,
-            &mut stderr_capture,
-            &mut streams_done,
-            &mut stream_error,
-        );
-
-        if status.is_none() {
-            status = child.try_wait().map_err(CommandError::Wait)?;
-            if status.is_some() {
+    let control_result = (|| -> Result<(), CommandError> {
+        loop {
+            if cancellation.load(Ordering::Relaxed) && !cancelled {
+                cancelled = true;
+                terminate_command_group(&mut child)?;
+                if status.is_none() {
+                    status = Some(wait_for_command_group(&mut child)?);
+                }
                 exited_at = Some(Instant::now());
+                forced_at = Some(Instant::now());
+            }
+
+            receive_stream_message(
+                &receiver,
+                &mut stdout_capture,
+                &mut stderr_capture,
+                &mut streams_done,
+                &mut stream_error,
+            );
+
+            if status.is_none() {
+                status = try_wait_for_command_group(&mut child)?;
+                if status.is_some() {
+                    exited_at = Some(Instant::now());
+                }
+            }
+
+            if status.is_some() && streams_done == 2 {
+                return Ok(());
+            }
+            if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
+                return Ok(());
+            }
+            if forced_at.is_none()
+                && exited_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE)
+            {
+                output_incomplete = true;
+                terminate_command_group(&mut child)?;
+                forced_at = Some(Instant::now());
             }
         }
+    })();
 
-        if status.is_some() && streams_done == 2 {
-            break;
-        }
-        if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
-            break;
-        }
-        if forced_at.is_none()
-            && exited_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE)
-        {
-            output_incomplete = true;
-            terminate_command_group(&mut child)?;
-            forced_at = Some(Instant::now());
-        }
+    let cleanup_result = cleanup_command_resources(
+        &mut child,
+        status.is_some(),
+        reader_stop,
+        receiver,
+        stdout_reader,
+        stderr_reader,
+    );
+    match (control_result, cleanup_result) {
+        (Err(_), Err(cleanup)) => return Err(cleanup),
+        (Err(source), Ok(())) => return Err(source),
+        (Ok(()), Err(cleanup)) => return Err(cleanup),
+        (Ok(()), Ok(())) => {}
     }
-
-    reader_stop.store(true, Ordering::Relaxed);
-    drop(receiver);
-    stdout_reader
-        .join()
-        .map_err(|_| CommandError::ReaderPanicked)?;
-    stderr_reader
-        .join()
-        .map_err(|_| CommandError::ReaderPanicked)?;
     if let Some(source) = stream_error {
         return Err(CommandError::ReadOutput(source));
     }
@@ -210,10 +226,70 @@ fn run_shell_command(
 }
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
-    match child.kill() {
-        Ok(()) => Ok(()),
-        Err(source) if group_already_exited(&source) => Ok(()),
-        Err(source) => Err(CommandError::Kill(source)),
+    #[cfg(test)]
+    if INJECT_NEXT_KILL_FAILURE.with(|failure| failure.replace(false)) {
+        return Err(CommandError::Kill(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected process-control failure",
+        )));
+    }
+    loop {
+        match child.kill() {
+            Ok(()) => return Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) if group_already_exited(&source) => return Ok(()),
+            Err(source) => return Err(CommandError::Kill(source)),
+        }
+    }
+}
+
+fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandError> {
+    loop {
+        match child.wait() {
+            Ok(status) => return Ok(status),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => return Err(CommandError::Wait(source)),
+        }
+    }
+}
+
+fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatus>, CommandError> {
+    loop {
+        match child.try_wait() {
+            Ok(status) => return Ok(status),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => return Err(CommandError::Wait(source)),
+        }
+    }
+}
+
+fn cleanup_command_resources(
+    child: &mut GroupChild,
+    process_exited: bool,
+    reader_stop: Arc<AtomicBool>,
+    receiver: Receiver<StreamMessage>,
+    stdout_reader: thread::JoinHandle<()>,
+    stderr_reader: thread::JoinHandle<()>,
+) -> Result<(), CommandError> {
+    let mut first_error = terminate_command_group(child).err();
+    if !process_exited && first_error.is_none() {
+        if let Err(source) = wait_for_command_group(child) {
+            first_error = Some(source);
+        }
+    }
+
+    reader_stop.store(true, Ordering::Relaxed);
+    drop(receiver);
+    if stdout_reader.join().is_err() && first_error.is_none() {
+        first_error = Some(CommandError::ReaderPanicked);
+    }
+    if stderr_reader.join().is_err() && first_error.is_none() {
+        first_error = Some(CommandError::ReaderPanicked);
+    }
+
+    match first_error {
+        Some(source) => Err(source),
+        None => Ok(()),
     }
 }
 
@@ -429,5 +505,54 @@ impl fmt::Display for CommandError {
             Self::ReaderPanicked => formatter.write_str("command output reader panicked"),
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use super::{run_shell_command, CommandError, INJECT_NEXT_KILL_FAILURE};
+    use crate::workspace::CodingWorkspace;
+
+    #[test]
+    fn process_control_failure_still_runs_the_cleanup_epilogue() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-command-cleanup-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let trigger_flag = cancellation.clone();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            trigger_flag.store(true, Ordering::Relaxed);
+        });
+        INJECT_NEXT_KILL_FAILURE.with(|failure| failure.set(true));
+        let started = Instant::now();
+
+        let result = run_shell_command(
+            &workspace,
+            "(sleep 0.2; printf leaked > delayed.txt) & wait",
+            &cancellation,
+            1024,
+        );
+
+        trigger.join().expect("cancellation trigger finishes");
+        assert!(matches!(result, Err(CommandError::Kill(_))));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(250));
+        assert!(!root.join("delayed.txt").exists());
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 }
