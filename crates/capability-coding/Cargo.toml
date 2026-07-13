@@ -16,6 +16,9 @@ young-tool-runtime = { path = "../tool-runtime" }
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+cap-fs-ext.workspace = true
+
 [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))'.dependencies]
 exacl.workspace = true
 

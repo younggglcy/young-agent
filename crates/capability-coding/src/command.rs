@@ -31,8 +31,10 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 #[cfg(all(test, unix))]
 thread_local! {
     static INJECT_GROUP_KILL_WRAPPER_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_PERSISTENT_GROUP_KILL_FAILURE: Cell<bool> = const { Cell::new(false) };
     static INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE: Cell<bool> = const { Cell::new(false) };
     static COMMAND_GROUP_TERMINATION_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+    static LIVE_COMMAND_SUPERVISOR_HANDOFFS: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) const APPROVAL_REASON: &str =
@@ -167,7 +169,7 @@ fn run_shell_command(
     #[cfg(not(all(test, unix)))]
     let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
     if let Err(source) = configure_result {
-        let cleanup = cleanup_process_group(&mut child, false, true);
+        let cleanup = cleanup_process_group(child, false, true);
         return match cleanup {
             Err(cleanup) => Err(cleanup),
             Ok(()) => Err(CommandError::ConfigureOutput(source)),
@@ -262,7 +264,7 @@ fn run_shell_command(
     })();
 
     let cleanup_result = cleanup_process_group(
-        &mut child,
+        child,
         status.is_some(),
         control_result.is_err() && status.is_none() && !termination_sent,
     );
@@ -342,7 +344,8 @@ fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
     #[cfg(all(test, unix))]
     COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
     #[cfg(all(test, unix))]
-    let injected_failure = INJECT_GROUP_KILL_WRAPPER_FAILURE.with(Cell::get);
+    let injected_failure = INJECT_GROUP_KILL_WRAPPER_FAILURE.with(Cell::get)
+        || INJECT_PERSISTENT_GROUP_KILL_FAILURE.with(Cell::get);
     #[cfg(not(all(test, unix)))]
     let injected_failure = false;
     let wrapper_result = if injected_failure {
@@ -366,7 +369,18 @@ fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
 
     #[cfg(unix)]
     {
-        let fallback = kill_process_group_by_id(child.id());
+        #[cfg(all(test, unix))]
+        let direct_failure = INJECT_PERSISTENT_GROUP_KILL_FAILURE.with(Cell::get);
+        #[cfg(not(all(test, unix)))]
+        let direct_failure = false;
+        let fallback = if direct_failure {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected direct process-group termination failure",
+            ))
+        } else {
+            kill_process_group_by_id(child.id())
+        };
         #[cfg(all(test, unix))]
         INJECT_GROUP_KILL_WRAPPER_FAILURE.with(|failure| failure.set(false));
         fallback.map_err(|fallback| {
@@ -516,21 +530,41 @@ fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatu
 }
 
 fn cleanup_process_group(
-    child: &mut GroupChild,
+    mut child: GroupChild,
     process_exited: bool,
     terminate_group: bool,
 ) -> Result<(), CommandError> {
     let mut first_error = None;
     if terminate_group {
-        if let Err(source) = terminate_command_group(child) {
+        if let Err(source) = terminate_command_group(&mut child) {
             first_error = Some(source);
         }
     }
     if !process_exited {
         let wait_result = if terminate_group && first_error.is_some() {
-            try_wait_for_command_group(child).map(|_| ())
+            match try_wait_for_command_group(&mut child) {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => {
+                    return Err(supervise_live_command(
+                        child,
+                        first_error
+                            .take()
+                            .expect("termination failure was recorded"),
+                        None,
+                    ));
+                }
+                Err(wait) => {
+                    return Err(supervise_live_command(
+                        child,
+                        first_error
+                            .take()
+                            .expect("termination failure was recorded"),
+                        Some(wait),
+                    ));
+                }
+            }
         } else {
-            wait_for_command_group(child).map(|_| ())
+            wait_for_command_group(&mut child).map(|_| ())
         };
         if let Err(source) = wait_result {
             if first_error.is_none() {
@@ -542,6 +576,75 @@ fn cleanup_process_group(
         Some(source) => Err(source),
         None => Ok(()),
     }
+}
+
+fn supervise_live_command(
+    child: GroupChild,
+    termination_error: CommandError,
+    wait_error: Option<CommandError>,
+) -> CommandError {
+    #[cfg(all(test, unix))]
+    {
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.set(handoffs.get() + 1));
+        INJECT_PERSISTENT_GROUP_KILL_FAILURE.with(|failure| failure.set(false));
+    }
+    let kind = match &termination_error {
+        CommandError::Kill(source) => source.kind(),
+        _ => std::io::ErrorKind::Other,
+    };
+    let wait_context = wait_error.map_or_else(String::new, |source| {
+        format!("; nonblocking reap inspection also failed ({source})")
+    });
+    let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let worker_owner = owner.clone();
+    let spawn = thread::Builder::new()
+        .name("young-command-reaper".to_string())
+        .spawn(move || {
+            let mut child = worker_owner
+                .lock()
+                .expect("command supervisor ownership lock was poisoned")
+                .take()
+                .expect("command supervisor takes ownership once");
+            supervise_and_reap_command(&mut child);
+        });
+    if let Err(source) = spawn {
+        let mut child = owner
+            .lock()
+            .expect("command supervisor ownership lock was poisoned")
+            .take()
+            .expect("failed supervisor spawn retains command ownership");
+        let _ = wait_for_command_group(&mut child);
+        return CommandError::Kill(std::io::Error::new(
+            kind,
+            format!(
+                "{termination_error}{wait_context}; background supervisor could not start ({source}), so cleanup waited for the command leader"
+            ),
+        ));
+    }
+    CommandError::Kill(std::io::Error::new(
+        kind,
+        format!(
+            "{termination_error}{wait_context}; a live command may remain while a background supervisor retries termination and retains reaping ownership"
+        ),
+    ))
+}
+
+fn supervise_and_reap_command(child: &mut GroupChild) {
+    let mut retry_delay = Duration::from_millis(10);
+    for _ in 0..8 {
+        if matches!(try_wait_for_command_group(child), Ok(Some(_))) {
+            return;
+        }
+        if terminate_command_group(child).is_ok() {
+            let _ = wait_for_command_group(child);
+            return;
+        }
+        thread::sleep(retry_delay);
+        retry_delay = retry_delay
+            .saturating_mul(2)
+            .min(Duration::from_millis(250));
+    }
+    let _ = wait_for_command_group(child);
 }
 
 #[cfg(unix)]
@@ -800,6 +903,7 @@ mod tests {
     use super::{
         run_shell_command, CommandError, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
+        INJECT_PERSISTENT_GROUP_KILL_FAILURE, LIVE_COMMAND_SUPERVISOR_HANDOFFS,
     };
     use crate::workspace::CodingWorkspace;
 
@@ -843,6 +947,52 @@ mod tests {
             "a reaped group must never be signalled again through its stale process id"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(250));
+        assert!(!root.join("delayed.txt").exists());
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
+    fn double_termination_failure_hands_the_live_child_to_a_supervisor() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-command-supervisor-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let trigger_flag = cancellation.clone();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            trigger_flag.store(true, Ordering::Relaxed);
+        });
+        INJECT_PERSISTENT_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.set(0));
+
+        let result = run_shell_command(
+            &workspace,
+            "(sleep 0.2; printf leaked > delayed.txt) & wait",
+            &cancellation,
+            1024,
+        );
+
+        trigger.join().expect("cancellation trigger finishes");
+        let Err(CommandError::Kill(source)) = result else {
+            panic!("double termination failure must be reported: {result:?}");
+        };
+        assert!(source
+            .to_string()
+            .contains("background supervisor retries termination"));
+        assert_eq!(
+            LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.get()),
+            1
+        );
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());
 

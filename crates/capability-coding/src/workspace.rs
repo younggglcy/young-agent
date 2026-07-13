@@ -21,6 +21,7 @@ thread_local! {
     static INJECT_RECOVERY_NAMESPACE_SWAP_AFTER_CLEANUP_MOVE: Cell<bool> = const { Cell::new(false) };
     static INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
     static INJECT_RECOVERY_CONTENT_REPLACEMENT_BEFORE_EXCHANGE_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_RECOVERY_SECURITY_METADATA_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
@@ -631,6 +632,16 @@ impl CodingWorkspace {
                     ));
                 }
             }
+            #[cfg(test)]
+            if INJECT_RECOVERY_SECURITY_METADATA_AFTER_EXCHANGE
+                .with(|injected| injected.replace(false))
+            {
+                if let Err(source) = inject_recovery_extended_attribute(&expected.file) {
+                    return Err(published_commit_failure(
+                        directory, recovery, &staged, &expected, source,
+                    ));
+                }
+            }
             if let Err(source) = refresh_snapshot_after_rename(
                 &staged.file,
                 &mut staged.snapshot,
@@ -922,6 +933,10 @@ pub(crate) struct FileStatSnapshot {
     #[cfg(unix)]
     mode: u32,
 }
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FileStatSnapshot;
 
 #[cfg(unix)]
 fn file_stat_snapshot(metadata: &Metadata) -> FileStatSnapshot {
@@ -1371,6 +1386,18 @@ fn preserved_recovery_evidence(
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn preserved_recovery_evidence(
+    parent: &Dir,
+    recovery: &RecoveryNamespace,
+    path: &Path,
+    file: &File,
+    expected: FileSnapshot,
+) -> PublishedRecovery {
+    let _ = (parent, recovery, path, file, expected);
+    PublishedRecovery::Unlocated
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Clone, Copy)]
 enum RecoveryContentEvidence {
@@ -1406,10 +1433,9 @@ fn inspect_preserved_recovery_content(
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn recovery_content_failure_kind(source: &io::Error) -> RecoveryContentEvidence {
     match source.kind() {
-        io::ErrorKind::WouldBlock
-        | io::ErrorKind::NotFound
-        | io::ErrorKind::InvalidInput
-        | io::ErrorKind::Unsupported => RecoveryContentEvidence::Mismatch,
+        io::ErrorKind::WouldBlock | io::ErrorKind::NotFound | io::ErrorKind::InvalidInput => {
+            RecoveryContentEvidence::Mismatch
+        }
         _ => RecoveryContentEvidence::InspectionFailed,
     }
 }
@@ -1568,6 +1594,21 @@ fn inject_replaced_recovery_content(
     let mut replacement = recovery.open_with(path, &options)?;
     replacement.write_all(b"concurrent replacement\n")?;
     replacement.sync_all()
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+fn inject_recovery_extended_attribute(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let attribute = "com.young-agent.concurrent-recovery";
+    #[cfg(target_os = "linux")]
+    let attribute = "user.young-agent.concurrent-recovery";
+    rustix::fs::fsetxattr(
+        file,
+        attribute,
+        b"injected",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .map_err(io::Error::from)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -2203,27 +2244,30 @@ fn ensure_opened_root_matches_path(
                 path: root_path.to_path_buf(),
                 source,
             })?;
-    let ambient = fs::metadata(root_path).map_err(|source| CodingWorkspaceError::ResolveRoot {
-        path: root_path.to_path_buf(),
-        source,
-    })?;
-
     #[cfg(unix)]
     let matches = {
         use cap_std::fs::MetadataExt as _;
         use std::os::unix::fs::MetadataExt as _;
 
+        let ambient =
+            fs::metadata(root_path).map_err(|source| CodingWorkspaceError::ResolveRoot {
+                path: root_path.to_path_buf(),
+                source,
+            })?;
+
         opened.dev() == ambient.dev() && opened.ino() == ambient.ino()
     };
     #[cfg(windows)]
     let matches = {
-        use cap_std::fs::MetadataExt as _;
-        use std::os::windows::fs::MetadataExt as _;
+        use cap_fs_ext::MetadataExt as _;
 
-        opened.volume_serial_number() == ambient.volume_serial_number()
-            && opened.file_index() == ambient.file_index()
-            && opened.volume_serial_number().is_some()
-            && opened.file_index().is_some()
+        let ambient = Dir::open_ambient_dir(root_path, ambient_authority())
+            .and_then(|directory| directory.metadata("."))
+            .map_err(|source| CodingWorkspaceError::ResolveRoot {
+                path: root_path.to_path_buf(),
+                source,
+            })?;
+        opened.dev() == ambient.dev() && opened.ino() == ambient.ino()
     };
     #[cfg(not(any(unix, windows)))]
     let matches = false;
@@ -2642,6 +2686,54 @@ mod tests {
         );
 
         drop((target, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn post_publication_recovery_security_metadata_is_reported_as_a_candidate() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-security-metadata-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (target, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let snapshot = CodingWorkspace::file_snapshot(&target).expect("snapshot reads");
+        super::INJECT_RECOVERY_SECURITY_METADATA_AFTER_EXCHANGE.with(|injected| injected.set(true));
+
+        let error = workspace
+            .replace_existing_atomically(std::path::Path::new("target.txt"), b"patched\n", snapshot)
+            .expect_err("recovery security metadata must fail post-publication validation");
+
+        let super::AtomicReplaceError::Published {
+            recovery: super::PublishedRecovery::LocatedContentUnverified(candidate),
+            ..
+        } = error
+        else {
+            panic!("security inspection failure must preserve a recovery candidate");
+        };
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "patched\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(&candidate)).unwrap(),
+            "original\n"
+        );
+        let (candidate_file, _) = workspace
+            .open_regular_file(&candidate)
+            .expect("candidate remains addressable");
+        assert!(super::file_has_extended_attributes(&candidate_file).unwrap());
+
+        drop((candidate_file, target, workspace));
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
