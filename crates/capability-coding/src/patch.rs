@@ -106,18 +106,9 @@ fn apply_unified_patch(
                 resolved.relative_path.display()
             )));
         }
-        original_snapshot =
-            Some(
-                CodingWorkspace::file_snapshot(&file).map_err(|source| PatchError::Io {
-                    path: resolved.relative_path.clone(),
-                    source,
-                })?,
-            );
-        Some(read_patch_target(
-            file,
-            &resolved.relative_path,
-            cancellation,
-        )?)
+        let (content, snapshot) = read_patch_target(file, &resolved.relative_path, cancellation)?;
+        original_snapshot = Some(snapshot);
+        Some(content)
     } else {
         None
     };
@@ -567,7 +558,11 @@ fn read_patch_target(
     mut file: File,
     path: &Path,
     cancellation: &AtomicBool,
-) -> Result<String, PatchError> {
+) -> Result<(String, crate::workspace::FileSnapshot), PatchError> {
+    let before = CodingWorkspace::begin_file_snapshot(&file).map_err(|source| PatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 8 * 1024];
     let mut newline_count = 0usize;
@@ -611,10 +606,16 @@ fn read_patch_target(
             path.display()
         )));
     }
-    String::from_utf8(bytes).map_err(|source| PatchError::Io {
+    let snapshot = CodingWorkspace::finish_file_snapshot_from_content(&file, before, &bytes)
+        .map_err(|source| PatchError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let content = String::from_utf8(bytes).map_err(|source| PatchError::Io {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
-    })
+    })?;
+    Ok((content, snapshot))
 }
 
 fn require_original_line(
@@ -669,46 +670,53 @@ impl PatchError {
                 source,
             } => {
                 let target = display_relative_path(&target);
-                let (code, recoveries, recovery_state, recovery_policy) = match recovery {
-                    PublishedRecovery::LocatedVerified(path) => (
-                        "patch_not_published_with_recovery",
-                        vec![display_relative_path(&path)],
-                        "located_verified",
-                        "verified_search_and_git_ignored",
-                    ),
-                    PublishedRecovery::LocatedContentUnverified(path) => (
-                        "patch_not_published_with_recovery",
-                        vec![display_relative_path(&path)],
-                        "located_content_unverified",
-                        "verified_search_and_git_ignored",
-                    ),
-                    PublishedRecovery::LocatedPolicyUnverified(path) => (
-                        "patch_not_published_with_recovery",
-                        vec![display_relative_path(&path)],
-                        "located_policy_unverified",
-                        "unverified",
-                    ),
-                    PublishedRecovery::LocatedContentAndPolicyUnverified(path) => (
-                        "patch_not_published_with_recovery",
-                        vec![display_relative_path(&path)],
-                        "located_content_and_policy_unverified",
-                        "unverified",
-                    ),
-                    PublishedRecovery::Unlocated => (
-                        "patch_not_published_recovery_unlocated",
-                        Vec::new(),
-                        "unlocated",
-                        "unverified",
-                    ),
-                    PublishedRecovery::NotApplicableNewFile => (
-                        "patch_not_published_without_recovery",
-                        Vec::new(),
-                        "not_applicable_new_file",
-                        "not_applicable",
-                    ),
-                };
+                let (code, recoveries, recovery_candidates, recovery_state, recovery_policy) =
+                    match recovery {
+                        PublishedRecovery::LocatedVerified(path) => (
+                            "patch_not_published_with_recovery",
+                            vec![display_relative_path(&path)],
+                            Vec::new(),
+                            "located_verified",
+                            "verified_search_and_git_ignored",
+                        ),
+                        PublishedRecovery::LocatedContentUnverified(path) => (
+                            "patch_not_published_with_recovery_candidate",
+                            Vec::new(),
+                            vec![display_relative_path(&path)],
+                            "located_content_unverified",
+                            "verified_search_and_git_ignored",
+                        ),
+                        PublishedRecovery::LocatedPolicyUnverified(path) => (
+                            "patch_not_published_with_recovery",
+                            vec![display_relative_path(&path)],
+                            Vec::new(),
+                            "located_policy_unverified",
+                            "unverified",
+                        ),
+                        PublishedRecovery::LocatedContentAndPolicyUnverified(path) => (
+                            "patch_not_published_with_recovery_candidate",
+                            Vec::new(),
+                            vec![display_relative_path(&path)],
+                            "located_content_and_policy_unverified",
+                            "unverified",
+                        ),
+                        PublishedRecovery::Unlocated => (
+                            "patch_not_published_recovery_unlocated",
+                            Vec::new(),
+                            Vec::new(),
+                            "unlocated",
+                            "unverified",
+                        ),
+                        PublishedRecovery::NotApplicableNewFile => (
+                            "patch_not_published_without_recovery",
+                            Vec::new(),
+                            Vec::new(),
+                            "not_applicable_new_file",
+                            "not_applicable",
+                        ),
+                    };
                 let message = format!(
-                    "patch was not published at '{target}', and staged data was preserved: {source}"
+                    "patch was not published at '{target}', and recovery evidence was recorded: {source}"
                 );
                 let (message, _) = truncate_json_string(&message, 8 * 1024);
                 ToolOutput::Failure {
@@ -721,6 +729,10 @@ impl PatchError {
                         ("publication_state".to_string(), json!("not_published")),
                         ("changed_files".to_string(), json!([])),
                         ("recovery_files".to_string(), json!(recoveries)),
+                        (
+                            "recovery_candidates".to_string(),
+                            json!(recovery_candidates),
+                        ),
                         ("recovery_state".to_string(), json!(recovery_state)),
                         ("recovery_policy".to_string(), json!(recovery_policy)),
                     ]),
@@ -732,51 +744,63 @@ impl PatchError {
                 source,
             } => {
                 let changed = display_relative_path(&target);
-                let (code, publication_state, recoveries, recovery_state, recovery_policy) =
-                    match recovery {
-                        PublishedRecovery::LocatedVerified(path) => (
-                            "patch_published_with_recovery",
-                            "published_with_recovery",
-                            vec![display_relative_path(&path)],
-                            "located_verified",
-                            "verified_search_and_git_ignored",
-                        ),
-                        PublishedRecovery::LocatedContentUnverified(path) => (
-                            "patch_published_with_recovery",
-                            "published_with_recovery",
-                            vec![display_relative_path(&path)],
-                            "located_content_unverified",
-                            "verified_search_and_git_ignored",
-                        ),
-                        PublishedRecovery::LocatedPolicyUnverified(path) => (
-                            "patch_published_with_recovery",
-                            "published_with_recovery",
-                            vec![display_relative_path(&path)],
-                            "located_policy_unverified",
-                            "unverified",
-                        ),
-                        PublishedRecovery::LocatedContentAndPolicyUnverified(path) => (
-                            "patch_published_with_recovery",
-                            "published_with_recovery",
-                            vec![display_relative_path(&path)],
-                            "located_content_and_policy_unverified",
-                            "unverified",
-                        ),
-                        PublishedRecovery::NotApplicableNewFile => (
-                            "patch_published_without_recovery",
-                            "published_without_recovery",
-                            Vec::new(),
-                            "not_applicable_new_file",
-                            "not_applicable",
-                        ),
-                        PublishedRecovery::Unlocated => (
-                            "patch_published_recovery_unlocated",
-                            "published_recovery_unlocated",
-                            Vec::new(),
-                            "unlocated",
-                            "unverified",
-                        ),
-                    };
+                let (
+                    code,
+                    publication_state,
+                    recoveries,
+                    recovery_candidates,
+                    recovery_state,
+                    recovery_policy,
+                ) = match recovery {
+                    PublishedRecovery::LocatedVerified(path) => (
+                        "patch_published_with_recovery",
+                        "published_with_recovery",
+                        vec![display_relative_path(&path)],
+                        Vec::new(),
+                        "located_verified",
+                        "verified_search_and_git_ignored",
+                    ),
+                    PublishedRecovery::LocatedContentUnverified(path) => (
+                        "patch_published_with_recovery_candidate",
+                        "published_recovery_candidate",
+                        Vec::new(),
+                        vec![display_relative_path(&path)],
+                        "located_content_unverified",
+                        "verified_search_and_git_ignored",
+                    ),
+                    PublishedRecovery::LocatedPolicyUnverified(path) => (
+                        "patch_published_with_recovery",
+                        "published_with_recovery",
+                        vec![display_relative_path(&path)],
+                        Vec::new(),
+                        "located_policy_unverified",
+                        "unverified",
+                    ),
+                    PublishedRecovery::LocatedContentAndPolicyUnverified(path) => (
+                        "patch_published_with_recovery_candidate",
+                        "published_recovery_candidate",
+                        Vec::new(),
+                        vec![display_relative_path(&path)],
+                        "located_content_and_policy_unverified",
+                        "unverified",
+                    ),
+                    PublishedRecovery::NotApplicableNewFile => (
+                        "patch_published_without_recovery",
+                        "published_without_recovery",
+                        Vec::new(),
+                        Vec::new(),
+                        "not_applicable_new_file",
+                        "not_applicable",
+                    ),
+                    PublishedRecovery::Unlocated => (
+                        "patch_published_recovery_unlocated",
+                        "published_recovery_unlocated",
+                        Vec::new(),
+                        Vec::new(),
+                        "unlocated",
+                        "unverified",
+                    ),
+                };
                 let message = format!(
                     "patch was published at '{changed}', but commit validation failed: {source}"
                 );
@@ -791,6 +815,10 @@ impl PatchError {
                         ("publication_state".to_string(), json!(publication_state)),
                         ("changed_files".to_string(), json!([changed])),
                         ("recovery_files".to_string(), json!(recoveries)),
+                        (
+                            "recovery_candidates".to_string(),
+                            json!(recovery_candidates),
+                        ),
                         ("recovery_state".to_string(), json!(recovery_state)),
                         ("recovery_policy".to_string(), json!(recovery_policy)),
                     ]),
@@ -824,6 +852,12 @@ impl PatchError {
                 recovery: PublishedRecovery::NotApplicableNewFile,
                 ..
             } => "patch_not_published_without_recovery",
+            Self::Preserved {
+                recovery:
+                    PublishedRecovery::LocatedContentUnverified(_)
+                    | PublishedRecovery::LocatedContentAndPolicyUnverified(_),
+                ..
+            } => "patch_not_published_with_recovery_candidate",
             Self::Preserved { .. } => "patch_not_published_with_recovery",
             Self::Published {
                 recovery: PublishedRecovery::Unlocated,
@@ -833,6 +867,12 @@ impl PatchError {
                 recovery: PublishedRecovery::NotApplicableNewFile,
                 ..
             } => "patch_published_without_recovery",
+            Self::Published {
+                recovery:
+                    PublishedRecovery::LocatedContentUnverified(_)
+                    | PublishedRecovery::LocatedContentAndPolicyUnverified(_),
+                ..
+            } => "patch_published_with_recovery_candidate",
             Self::Published { .. } => "patch_published_with_recovery",
             Self::Cancelled => "tool_cancelled",
         }
@@ -969,6 +1009,32 @@ mod tests {
         assert_eq!(extensions["recovery_files"], json!([]));
         assert_eq!(extensions["recovery_state"], json!("unlocated"));
         assert_eq!(extensions["recovery_policy"], json!("unverified"));
+    }
+
+    #[test]
+    fn content_unverified_path_is_exposed_only_as_a_recovery_candidate() {
+        let candidate = "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp";
+        let output = PatchError::Published {
+            target: "src/target.txt".into(),
+            recovery: PublishedRecovery::LocatedContentUnverified(candidate.into()),
+            source: std::io::Error::other("injected recovery inspection failure"),
+        }
+        .into_output();
+
+        let ToolOutput::Failure { error, extensions } = output else {
+            panic!("published patch validation must fail structurally");
+        };
+        assert_eq!(error.code, "patch_published_with_recovery_candidate");
+        assert_eq!(
+            extensions["publication_state"],
+            json!("published_recovery_candidate")
+        );
+        assert_eq!(extensions["recovery_files"], json!([]));
+        assert_eq!(extensions["recovery_candidates"], json!([candidate]));
+        assert_eq!(
+            extensions["recovery_state"],
+            json!("located_content_unverified")
+        );
     }
 
     #[test]

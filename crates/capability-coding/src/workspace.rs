@@ -20,6 +20,7 @@ thread_local! {
     static INJECT_NEW_FILE_VALIDATION_FAILURE_AFTER_RENAME: Cell<bool> = const { Cell::new(false) };
     static INJECT_RECOVERY_NAMESPACE_SWAP_AFTER_CLEANUP_MOVE: Cell<bool> = const { Cell::new(false) };
     static INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_RECOVERY_CONTENT_REPLACEMENT_BEFORE_EXCHANGE_FAILURE: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
@@ -138,13 +139,7 @@ impl CodingWorkspace {
     pub(crate) fn file_snapshot(file: &File) -> io::Result<FileSnapshot> {
         #[cfg(unix)]
         {
-            let before = file_stat_snapshot(&file.metadata()?);
-            if before.size > MAX_FILE_SNAPSHOT_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("safe file snapshots are limited to {MAX_FILE_SNAPSHOT_BYTES} bytes"),
-                ));
-            }
+            let before = Self::begin_file_snapshot(file)?;
             let digest = file_digest(file, before.size)?;
             let after = file_stat_snapshot(&file.metadata()?);
             if before != after {
@@ -166,6 +161,63 @@ impl CodingWorkspace {
                 "stable patch target identities are not supported on this platform",
             ))
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn begin_file_snapshot(file: &File) -> io::Result<FileStatSnapshot> {
+        let before = file_stat_snapshot(&file.metadata()?);
+        if before.size > MAX_FILE_SNAPSHOT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("safe file snapshots are limited to {MAX_FILE_SNAPSHOT_BYTES} bytes"),
+            ));
+        }
+        Ok(before)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn finish_file_snapshot_from_content(
+        file: &File,
+        before: FileStatSnapshot,
+        content: &[u8],
+    ) -> io::Result<FileSnapshot> {
+        if content.len() as u64 != before.size {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file length did not match the captured content",
+            ));
+        }
+        let after = file_stat_snapshot(&file.metadata()?);
+        if before != after {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file changed while its content snapshot was being captured",
+            ));
+        }
+        Ok(FileSnapshot {
+            stat: after,
+            digest: *blake3::hash(content).as_bytes(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn begin_file_snapshot(_file: &File) -> io::Result<FileStatSnapshot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe file snapshots are not supported on this platform",
+        ))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn finish_file_snapshot_from_content(
+        _file: &File,
+        _before: FileStatSnapshot,
+        _content: &[u8],
+    ) -> io::Result<FileSnapshot> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe file snapshots are not supported on this platform",
+        ))
     }
 
     pub(crate) fn open_dir(&self, path: &Path) -> io::Result<Dir> {
@@ -207,7 +259,7 @@ impl CodingWorkspace {
             .open_dir(parent)
             .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         let metadata = self
-            .replacement_metadata(&directory, Path::new(file_name))
+            .replacement_metadata(&directory, Path::new(file_name), expected_snapshot)
             .map_err(|source| AtomicReplaceError::before_within(source, parent))?;
         if metadata.snapshot != expected_snapshot {
             return Err(AtomicReplaceError::before_within(
@@ -406,7 +458,9 @@ impl CodingWorkspace {
             if let Err(source) = result {
                 return cleanup_open_staging_after_error(directory, &candidate, &file, source);
             }
-            let snapshot = match Self::file_snapshot(&file) {
+            let snapshot = match Self::begin_file_snapshot(&file)
+                .and_then(|before| Self::finish_file_snapshot_from_content(&file, before, content))
+            {
                 Ok(snapshot) => snapshot,
                 Err(source) => {
                     return cleanup_open_staging_after_error(directory, &candidate, &file, source)
@@ -525,11 +579,30 @@ impl CodingWorkspace {
                 ));
             }
             if let Err(error) = validate_recovery_namespace_slot(directory, recovery) {
-                return Err(preserved_namespace_failure(&staged, error));
+                return Err(preserved_commit_failure(
+                    directory,
+                    recovery,
+                    &staged,
+                    recovery_namespace_error_source(error),
+                ));
             }
-            if let Err(source) =
-                exchange_files_between(&recovery.directory, &staged.path, directory, path)
+            #[cfg(test)]
+            let exchange = if INJECT_RECOVERY_CONTENT_REPLACEMENT_BEFORE_EXCHANGE_FAILURE
+                .with(|injected| injected.replace(false))
             {
+                inject_replaced_recovery_content(
+                    &recovery.directory,
+                    &staged.path,
+                    "moved-staging-before-exchange",
+                )
+                .and_then(|()| Err(io::Error::other("injected exchange failure")))
+            } else {
+                exchange_files_between(&recovery.directory, &staged.path, directory, path)
+            };
+            #[cfg(not(test))]
+            let exchange =
+                exchange_files_between(&recovery.directory, &staged.path, directory, path);
+            if let Err(source) = exchange {
                 return Err(preserved_commit_failure(
                     directory, recovery, &staged, source,
                 ));
@@ -540,7 +613,7 @@ impl CodingWorkspace {
             {
                 if let Err(source) = inject_invalid_recovery_policy(&recovery.directory) {
                     return Err(published_commit_failure(
-                        directory, recovery, &staged, source,
+                        directory, recovery, &staged, &expected, source,
                     ));
                 }
             }
@@ -548,11 +621,13 @@ impl CodingWorkspace {
             if INJECT_RECOVERY_CONTENT_REPLACEMENT_AFTER_EXCHANGE
                 .with(|injected| injected.replace(false))
             {
-                if let Err(source) =
-                    inject_replaced_recovery_content(&recovery.directory, &staged.path)
-                {
+                if let Err(source) = inject_replaced_recovery_content(
+                    &recovery.directory,
+                    &staged.path,
+                    "moved-original-after-exchange",
+                ) {
                     return Err(published_commit_failure(
-                        directory, recovery, &staged, source,
+                        directory, recovery, &staged, &expected, source,
                     ));
                 }
             }
@@ -564,7 +639,7 @@ impl CodingWorkspace {
             .and_then(|()| refresh_replacement_after_rename(&mut expected))
             {
                 return Err(published_commit_failure(
-                    directory, recovery, &staged, source,
+                    directory, recovery, &staged, &expected, source,
                 ));
             }
 
@@ -574,11 +649,17 @@ impl CodingWorkspace {
                 });
             if let Err(source) = validation {
                 return Err(published_commit_failure(
-                    directory, recovery, &staged, source,
+                    directory, recovery, &staged, &expected, source,
                 ));
             }
             if let Err(error) = validate_recovery_namespace_slot(directory, recovery) {
-                return Err(published_namespace_failure(&staged, error));
+                return Err(published_commit_failure(
+                    directory,
+                    recovery,
+                    &staged,
+                    &expected,
+                    recovery_namespace_error_source(error),
+                ));
             }
             Ok(PathBuf::from(RECOVERY_DIRECTORY).join(staged.path))
         }
@@ -594,12 +675,11 @@ impl CodingWorkspace {
 
     fn validate_staging_slot(&self, directory: &Dir, staged: &StagedFile) -> io::Result<()> {
         validate_security_metadata(&staged.file, "patch staging file")?;
-        if Self::file_snapshot(&staged.file)? != staged.snapshot {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "patch staging file changed before commit",
-            ));
-        }
+        validate_retained_snapshot_metadata(
+            &staged.file,
+            &staged.snapshot,
+            "patch staging file changed before commit",
+        )?;
         validate_snapshot_slot(
             directory,
             &staged.path,
@@ -613,6 +693,7 @@ impl CodingWorkspace {
         &self,
         directory: &Dir,
         path: &Path,
+        expected_snapshot: FileSnapshot,
     ) -> io::Result<ReplacementMetadata> {
         #[cfg(unix)]
         {
@@ -627,24 +708,29 @@ impl CodingWorkspace {
                 ));
             }
             validate_security_metadata(&file, "atomic patch target")?;
-            let snapshot = Self::file_snapshot(&file)?;
             let metadata = file.metadata()?;
-            if metadata.nlink() != 1 || file_stat_snapshot(&metadata) != snapshot.stat {
+            if metadata.nlink() != 1 || file_stat_snapshot(&metadata) != expected_snapshot.stat {
                 return Err(patch_target_changed());
             }
             validate_security_metadata(&file, "atomic patch target")?;
+            let final_metadata = file.metadata()?;
+            if final_metadata.nlink() != 1
+                || file_stat_snapshot(&final_metadata) != expected_snapshot.stat
+            {
+                return Err(patch_target_changed());
+            }
             Ok(ReplacementMetadata {
-                permissions: metadata.permissions(),
-                snapshot,
+                permissions: final_metadata.permissions(),
+                snapshot: expected_snapshot,
                 file,
-                uid: metadata.uid(),
-                gid: metadata.gid(),
-                mode: metadata.mode(),
+                uid: final_metadata.uid(),
+                gid: final_metadata.gid(),
+                mode: final_metadata.mode(),
             })
         }
         #[cfg(not(unix))]
         {
-            let _ = (directory, path);
+            let _ = (directory, path, expected_snapshot);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "safe replacement metadata validation is not supported on this platform",
@@ -814,7 +900,7 @@ pub(crate) struct FileSnapshot {
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileStatSnapshot {
+pub(crate) struct FileStatSnapshot {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -1002,6 +1088,29 @@ fn validate_replacement_slot(
         return Err(patch_target_changed());
     }
     validate_replacement_slot_identity(directory, path, expected)
+}
+
+fn validate_retained_snapshot_metadata(
+    file: &File,
+    expected: &FileSnapshot,
+    changed_message: &str,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if file_stat_snapshot(&file.metadata()?) == expected.stat {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, changed_message))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, expected, changed_message);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe retained snapshot validation is not supported on this platform",
+        ))
+    }
 }
 
 fn validate_installed_staging_slot(
@@ -1228,15 +1337,16 @@ fn preserved_recovery_evidence(
     path: &Path,
     file: &File,
     expected: FileSnapshot,
-    refreshed: bool,
 ) -> PublishedRecovery {
     let policy_before = match validate_recovery_namespace_slot(parent, recovery) {
         Ok(()) => true,
         Err(RecoveryNamespaceError::Policy(_)) => false,
         Err(RecoveryNamespaceError::Identity(_)) => return PublishedRecovery::Unlocated,
     };
-    let content_verified =
-        refreshed && validate_preserved_recovery_content(recovery, path, file, expected).is_ok();
+    let content = inspect_preserved_recovery_content(recovery, path, file, expected);
+    if matches!(content, RecoveryContentEvidence::Mismatch) {
+        return PublishedRecovery::Unlocated;
+    }
     let policy_after = match validate_recovery_namespace_slot(parent, recovery) {
         Ok(()) => true,
         Err(RecoveryNamespaceError::Policy(_)) => false,
@@ -1244,35 +1354,64 @@ fn preserved_recovery_evidence(
     };
     let policy_verified = policy_before && policy_after;
     let located = PathBuf::from(RECOVERY_DIRECTORY).join(path);
-    match (content_verified, policy_verified) {
-        (true, true) => PublishedRecovery::LocatedVerified(located),
-        (false, true) => PublishedRecovery::LocatedContentUnverified(located),
-        (true, false) => PublishedRecovery::LocatedPolicyUnverified(located),
-        (false, false) => PublishedRecovery::LocatedContentAndPolicyUnverified(located),
+    match (content, policy_verified) {
+        (RecoveryContentEvidence::Verified, true) => PublishedRecovery::LocatedVerified(located),
+        (RecoveryContentEvidence::InspectionFailed, true) => {
+            PublishedRecovery::LocatedContentUnverified(located)
+        }
+        (RecoveryContentEvidence::Verified, false) => {
+            PublishedRecovery::LocatedPolicyUnverified(located)
+        }
+        (RecoveryContentEvidence::InspectionFailed, false) => {
+            PublishedRecovery::LocatedContentAndPolicyUnverified(located)
+        }
+        (RecoveryContentEvidence::Mismatch, _) => {
+            unreachable!("content mismatches return before path publication")
+        }
     }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn validate_preserved_recovery_content(
+#[derive(Clone, Copy)]
+enum RecoveryContentEvidence {
+    Verified,
+    InspectionFailed,
+    Mismatch,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn inspect_preserved_recovery_content(
     recovery: &RecoveryNamespace,
     path: &Path,
     file: &File,
-    expected: FileSnapshot,
-) -> io::Result<()> {
-    validate_security_metadata(file, "preserved patch staging file")?;
-    if CodingWorkspace::file_snapshot(file)? != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "preserved patch staging content changed during recovery",
-        ));
+    mut expected: FileSnapshot,
+) -> RecoveryContentEvidence {
+    if let Err(source) =
+        refresh_snapshot_after_rename(file, &mut expected, "preserved patch staging file")
+    {
+        return recovery_content_failure_kind(&source);
     }
-    validate_snapshot_slot(
+    match validate_snapshot_slot(
         &recovery.directory,
         path,
         &expected,
         "preserved patch staging file",
         "preserved patch staging entry changed during recovery",
-    )
+    ) {
+        Ok(()) => RecoveryContentEvidence::Verified,
+        Err(source) => recovery_content_failure_kind(&source),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn recovery_content_failure_kind(source: &io::Error) -> RecoveryContentEvidence {
+    match source.kind() {
+        io::ErrorKind::WouldBlock
+        | io::ErrorKind::NotFound
+        | io::ErrorKind::InvalidInput
+        | io::ErrorKind::Unsupported => RecoveryContentEvidence::Mismatch,
+        _ => RecoveryContentEvidence::InspectionFailed,
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1282,26 +1421,15 @@ fn preserved_content_failure(
     staged: &StagedFile,
     source: io::Error,
 ) -> CommitError {
-    let path = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
-    match validate_recovery_namespace_slot(parent, recovery) {
-        Ok(()) => CommitError::BeforePublication {
-            source,
-            recovery: Some(PublishedRecovery::LocatedContentUnverified(path)),
-        },
-        Err(RecoveryNamespaceError::Policy(policy)) => CommitError::BeforePublication {
-            source: io::Error::new(
-                source.kind(),
-                format!("{source}; recovery policy validation failed ({policy})"),
-            ),
-            recovery: Some(PublishedRecovery::LocatedContentAndPolicyUnverified(path)),
-        },
-        Err(RecoveryNamespaceError::Identity(identity)) => CommitError::BeforePublication {
-            source: io::Error::new(
-                source.kind(),
-                format!("{source}; recovery namespace identity was lost ({identity})"),
-            ),
-            recovery: Some(PublishedRecovery::Unlocated),
-        },
+    CommitError::BeforePublication {
+        source,
+        recovery: Some(preserved_recovery_evidence(
+            parent,
+            recovery,
+            &staged.path,
+            &staged.file,
+            staged.snapshot,
+        )),
     }
 }
 
@@ -1312,49 +1440,15 @@ fn preserved_commit_failure(
     staged: &StagedFile,
     source: io::Error,
 ) -> CommitError {
-    let path = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
-    match validate_recovery_namespace_slot(parent, recovery) {
-        Ok(()) => CommitError::BeforePublication {
-            source,
-            recovery: Some(PublishedRecovery::LocatedVerified(path)),
-        },
-        Err(error) => preserved_namespace_failure_with_source(staged, error, source),
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn preserved_namespace_failure(staged: &StagedFile, error: RecoveryNamespaceError) -> CommitError {
-    let source = match &error {
-        RecoveryNamespaceError::Identity(source) | RecoveryNamespaceError::Policy(source) => {
-            io::Error::new(source.kind(), source.to_string())
-        }
-    };
-    preserved_namespace_failure_with_source(staged, error, source)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn preserved_namespace_failure_with_source(
-    staged: &StagedFile,
-    error: RecoveryNamespaceError,
-    source: io::Error,
-) -> CommitError {
-    match error {
-        RecoveryNamespaceError::Policy(policy) => CommitError::BeforePublication {
-            source: io::Error::new(
-                source.kind(),
-                format!("{source}; recovery policy validation failed ({policy})"),
-            ),
-            recovery: Some(PublishedRecovery::LocatedPolicyUnverified(
-                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
-            )),
-        },
-        RecoveryNamespaceError::Identity(identity) => CommitError::BeforePublication {
-            source: io::Error::new(
-                source.kind(),
-                format!("{source}; recovery namespace identity was lost ({identity})"),
-            ),
-            recovery: Some(PublishedRecovery::Unlocated),
-        },
+    CommitError::BeforePublication {
+        source,
+        recovery: Some(preserved_recovery_evidence(
+            parent,
+            recovery,
+            &staged.path,
+            &staged.file,
+            staged.snapshot,
+        )),
     }
 }
 
@@ -1363,47 +1457,25 @@ fn published_commit_failure(
     parent: &Dir,
     recovery: &RecoveryNamespace,
     staged: &StagedFile,
+    expected: &ReplacementMetadata,
     source: io::Error,
 ) -> CommitError {
-    match validate_recovery_namespace_slot(parent, recovery) {
-        Ok(()) => CommitError::Published {
-            source,
-            recovery: PublishedRecovery::LocatedContentUnverified(
-                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
-            ),
-        },
-        Err(RecoveryNamespaceError::Policy(policy)) => CommitError::Published {
-            source: io::Error::new(
-                source.kind(),
-                format!("{source}; recovery policy validation failed ({policy})"),
-            ),
-            recovery: PublishedRecovery::LocatedContentAndPolicyUnverified(
-                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
-            ),
-        },
-        Err(RecoveryNamespaceError::Identity(identity)) => CommitError::Published {
-            source: io::Error::new(
-                source.kind(),
-                format!("{source}; recovery namespace identity was lost ({identity})"),
-            ),
-            recovery: PublishedRecovery::Unlocated,
-        },
+    CommitError::Published {
+        source,
+        recovery: preserved_recovery_evidence(
+            parent,
+            recovery,
+            &staged.path,
+            &expected.file,
+            expected.snapshot,
+        ),
     }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn published_namespace_failure(staged: &StagedFile, error: RecoveryNamespaceError) -> CommitError {
+fn recovery_namespace_error_source(error: RecoveryNamespaceError) -> io::Error {
     match error {
-        RecoveryNamespaceError::Policy(source) => CommitError::Published {
-            source,
-            recovery: PublishedRecovery::LocatedPolicyUnverified(
-                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
-            ),
-        },
-        RecoveryNamespaceError::Identity(source) => CommitError::Published {
-            source,
-            recovery: PublishedRecovery::Unlocated,
-        },
+        RecoveryNamespaceError::Policy(source) | RecoveryNamespaceError::Identity(source) => source,
     }
 }
 
@@ -1477,10 +1549,14 @@ fn inject_invalid_recovery_policy(recovery: &Dir) -> io::Result<()> {
 }
 
 #[cfg(test)]
-fn inject_replaced_recovery_content(recovery: &Dir, path: &Path) -> io::Result<()> {
+fn inject_replaced_recovery_content(
+    recovery: &Dir,
+    path: &Path,
+    moved_name: &str,
+) -> io::Result<()> {
     use std::io::Write as _;
 
-    recovery.rename(path, recovery, "moved-original-after-exchange")?;
+    recovery.rename(path, recovery, moved_name)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1652,19 +1728,12 @@ fn cleanup_expected_staging_after_error<T>(
         )?;
         drop(open_recovery_namespace(directory)?);
     }
-    let mut recovery_snapshot = expected;
-    let recovery_refresh = refresh_snapshot_after_rename(
-        staging_file,
-        &mut recovery_snapshot,
-        "preserved patch staging file",
-    );
     let recovery = preserved_recovery_evidence(
         directory,
         &recovery_namespace,
         &recovery_path,
         staging_file,
-        recovery_snapshot,
-        recovery_refresh.is_ok(),
+        expected,
     );
     Err(io::Error::new(
         source.kind(),
@@ -1683,11 +1752,15 @@ impl fmt::Display for PreservedStagingError {
         write!(formatter, "patch operation failed ({})", self.source)?;
         match &self.recovery {
             PublishedRecovery::LocatedVerified(path)
-            | PublishedRecovery::LocatedContentUnverified(path)
-            | PublishedRecovery::LocatedPolicyUnverified(path)
-            | PublishedRecovery::LocatedContentAndPolicyUnverified(path) => write!(
+            | PublishedRecovery::LocatedPolicyUnverified(path) => write!(
                 formatter,
                 "; owned staging data was preserved as recovery file '{}'",
+                path.display()
+            ),
+            PublishedRecovery::LocatedContentUnverified(path)
+            | PublishedRecovery::LocatedContentAndPolicyUnverified(path) => write!(
+                formatter,
+                "; a possible recovery path was retained at '{}', but its content could not be verified",
                 path.display()
             ),
             PublishedRecovery::Unlocated => formatter.write_str(
@@ -2274,6 +2347,21 @@ mod tests {
     use super::{git_probe_command, CodingWorkspace};
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn replacement_metadata(
+        workspace: &CodingWorkspace,
+        directory: &cap_std::fs::Dir,
+        path: &std::path::Path,
+    ) -> super::ReplacementMetadata {
+        let (target, _) = workspace
+            .open_regular_file(path)
+            .expect("target opens for its initial snapshot");
+        let snapshot = CodingWorkspace::file_snapshot(&target).expect("target snapshot reads");
+        workspace
+            .replacement_metadata(directory, path, snapshot)
+            .expect("replacement metadata validates")
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn assert_invalid_recovery_namespace_does_not_publish(root: &std::path::Path) {
         std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
         let workspace = CodingWorkspace::resolve(root).expect("workspace resolves");
@@ -2391,9 +2479,8 @@ mod tests {
         std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
-        let metadata = workspace
-            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
-            .expect("metadata validates");
+        let metadata =
+            replacement_metadata(&workspace, &directory, std::path::Path::new("target.txt"));
         let staged = workspace
             .stage_content(&directory, b"patched\n", Some(&metadata))
             .expect("content is staged");
@@ -2518,18 +2605,31 @@ mod tests {
             .expect_err("replaced recovery entry must fail post-publication validation");
 
         let super::AtomicReplaceError::Published {
-            recovery: super::PublishedRecovery::LocatedContentUnverified(recovery),
+            recovery: super::PublishedRecovery::Unlocated,
             ..
         } = error
         else {
-            panic!("replaced recovery content must be located but content-unverified");
+            panic!("a known recovery mismatch must not expose the replacement as original data");
         };
         assert_eq!(
             std::fs::read_to_string(root.join("target.txt")).unwrap(),
             "patched\n"
         );
         assert_eq!(
-            std::fs::read_to_string(root.join(&recovery)).unwrap(),
+            std::fs::read_to_string(
+                std::fs::read_dir(root.join(super::RECOVERY_DIRECTORY))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".young-agent-patch-displaced-")
+                    })
+                    .expect("concurrent replacement remains visible")
+                    .path()
+            )
+            .unwrap(),
             "concurrent replacement\n"
         );
         assert_eq!(
@@ -2539,6 +2639,55 @@ mod tests {
             )
             .unwrap(),
             "original\n"
+        );
+
+        drop((target, workspace));
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn exchange_failure_does_not_verify_a_replaced_recovery_entry() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-pre-publication-recovery-content-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let (target, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let snapshot = CodingWorkspace::file_snapshot(&target).expect("snapshot reads");
+        super::INJECT_RECOVERY_CONTENT_REPLACEMENT_BEFORE_EXCHANGE_FAILURE
+            .with(|injected| injected.set(true));
+
+        let error = workspace
+            .replace_existing_atomically(std::path::Path::new("target.txt"), b"patched\n", snapshot)
+            .expect_err("injected exchange failure must preserve publication state");
+
+        let super::AtomicReplaceError::BeforePublication {
+            recovery: Some(super::PublishedRecovery::Unlocated),
+            ..
+        } = error
+        else {
+            panic!("a replaced pre-publication recovery entry must be unlocated");
+        };
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                root.join(super::RECOVERY_DIRECTORY)
+                    .join("moved-staging-before-exchange")
+            )
+            .unwrap(),
+            "patched\n"
         );
 
         drop((target, workspace));
@@ -2888,9 +3037,8 @@ mod tests {
         std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
-        let metadata = workspace
-            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
-            .expect("metadata validates");
+        let metadata =
+            replacement_metadata(&workspace, &directory, std::path::Path::new("target.txt"));
         let staging = workspace
             .stage_content(&directory, b"patched\n", Some(&metadata))
             .expect("content is staged");
@@ -2957,9 +3105,8 @@ mod tests {
         std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
-        let mut metadata = workspace
-            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
-            .expect("metadata validates");
+        let mut metadata =
+            replacement_metadata(&workspace, &directory, std::path::Path::new("target.txt"));
         let staging = workspace
             .stage_content(&directory, b"patched\n", Some(&metadata))
             .expect("content is staged");
@@ -3080,9 +3227,8 @@ mod tests {
         std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
-        let expected = workspace
-            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
-            .expect("metadata validates");
+        let expected =
+            replacement_metadata(&workspace, &directory, std::path::Path::new("target.txt"));
         let staged = workspace
             .stage_content(&directory, b"patched\n", Some(&expected))
             .expect("content is staged");
@@ -3139,9 +3285,8 @@ mod tests {
             .expect("initial mode is set");
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let directory = workspace.root_dir.open_dir(".").expect("root dir opens");
-        let expected = workspace
-            .replacement_metadata(&directory, std::path::Path::new("target.txt"))
-            .expect("metadata validates");
+        let expected =
+            replacement_metadata(&workspace, &directory, std::path::Path::new("target.txt"));
         let staged = workspace
             .stage_content(&directory, b"patched\n", Some(&expected))
             .expect("content is staged");

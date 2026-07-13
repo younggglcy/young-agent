@@ -1630,7 +1630,7 @@ fn run_command_observes_cooperative_cancellation() {
     assert_eq!(error.code, "command_termination_unverified");
     assert_eq!(
         error.message,
-        "command process group was terminated, but detached descendants could not be verified"
+        "termination was requested for signal-compatible process-group members; detached or credential-changing descendants were not verified"
     );
 }
 

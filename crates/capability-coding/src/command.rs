@@ -22,6 +22,8 @@ use crate::tool_support::{
 use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const INITIAL_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const FOREGROUND_EXIT_SETTLE_YIELDS: usize = 8;
 const MAX_STREAM_READS_PER_TICK: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -183,6 +185,7 @@ fn run_shell_command(
     let mut cancelled = false;
     let mut forced_at = None;
     let mut termination_sent = false;
+    let mut exit_poll_interval = INITIAL_EXIT_POLL_INTERVAL;
 
     let control_result = (|| -> Result<(), CommandError> {
         loop {
@@ -208,6 +211,9 @@ fn run_shell_command(
                 &mut stderr_done,
                 &mut stream_error,
             );
+            if stdout_progress || stderr_progress {
+                exit_poll_interval = INITIAL_EXIT_POLL_INTERVAL;
+            }
 
             if status.is_none() && !leader_terminal {
                 leader_terminal = command_leader_terminal(&child)?;
@@ -239,7 +245,18 @@ fn run_shell_command(
                 drain_started_at = None;
             }
             if !stdout_progress && !stderr_progress {
-                wait_for_stream_activity(&stdout, &stderr, stdout_done, stderr_done)?;
+                wait_for_stream_activity(
+                    &stdout,
+                    &stderr,
+                    stdout_done,
+                    stderr_done,
+                    exit_poll_interval,
+                )?;
+                if stdout_done && stderr_done {
+                    exit_poll_interval = exit_poll_interval
+                        .saturating_mul(2)
+                        .min(MAX_EXIT_POLL_INTERVAL);
+                }
             }
         }
     })();
@@ -611,6 +628,7 @@ fn wait_for_stream_activity<Out, Err>(
     stderr: &Err,
     stdout_done: bool,
     stderr_done: bool,
+    exit_poll_interval: Duration,
 ) -> Result<(), CommandError>
 where
     Out: std::os::fd::AsFd,
@@ -620,7 +638,7 @@ where
         | rustix::event::PollFlags::HUP
         | rustix::event::PollFlags::ERR;
     if stdout_done && stderr_done {
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(exit_poll_interval);
         return Ok(());
     }
     let mut stdout_descriptor = [rustix::event::PollFd::new(stdout, events)];
@@ -654,8 +672,13 @@ fn wait_for_stream_activity<Out, Err>(
     _stderr: &Err,
     _stdout_done: bool,
     _stderr_done: bool,
+    exit_poll_interval: Duration,
 ) -> Result<(), CommandError> {
-    thread::sleep(POLL_INTERVAL);
+    if _stdout_done && _stderr_done {
+        thread::sleep(exit_poll_interval);
+    } else {
+        thread::sleep(POLL_INTERVAL);
+    }
     Ok(())
 }
 
@@ -757,7 +780,7 @@ impl fmt::Display for CommandError {
             Self::OutputIncomplete => formatter
                 .write_str("command output remained open after the command process group exited"),
             Self::TerminationUnverified => formatter.write_str(
-                "command process group was terminated, but detached descendants could not be verified",
+                "termination was requested for signal-compatible process-group members; detached or credential-changing descendants were not verified",
             ),
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             Self::UnsupportedProcessTracking => formatter.write_str(
