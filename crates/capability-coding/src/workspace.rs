@@ -347,7 +347,9 @@ impl CodingWorkspace {
             target_os = "redox"
         ))]
         {
-            self.validate_staging_slot(directory, staged)?;
+            if let Err(source) = self.validate_staging_slot(directory, staged) {
+                return cleanup_owned_staging_after_error(directory, staged, source);
+            }
             let result = rustix::fs::renameat_with(
                 directory,
                 &staged.path,
@@ -390,7 +392,9 @@ impl CodingWorkspace {
             target_os = "redox"
         ))]
         {
-            self.validate_staging_slot(directory, staged)?;
+            if let Err(source) = self.validate_staging_slot(directory, staged) {
+                return cleanup_owned_staging_after_error(directory, staged, source);
+            }
             if let Err(source) = exchange_files(directory, &staged.path, path) {
                 return cleanup_owned_staging_after_error(directory, staged, source);
             }
@@ -472,10 +476,7 @@ impl CodingWorkspace {
         } else {
             Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!(
-                    "patch target changed during commit; displaced file was preserved as '{}'",
-                    staged.path.display()
-                ),
+                "patch target changed during commit; automatic cleanup was skipped",
             ))
         }
     }
