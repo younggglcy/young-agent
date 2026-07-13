@@ -8,8 +8,8 @@ use serde_json::{json, Value};
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
-    display_relative_path, failure, truncate_json_string, workspace_path_failure, ToolArguments,
-    MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
+    display_relative_path, failure, finalize_output, truncate_json_string, workspace_path_failure,
+    ToolArguments, MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
 
@@ -473,7 +473,7 @@ fn bounded_search_output(
             .len()
             <= MAX_OUTPUT_BYTES
         {
-            return output;
+            return finalize_output(output);
         }
         if results.matches.pop().is_none() {
             return failure(

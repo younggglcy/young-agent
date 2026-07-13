@@ -7,8 +7,8 @@ use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
-    display_relative_path, failure, truncate_json_string, workspace_path_failure, ToolArguments,
-    MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
+    display_relative_path, failure, finalize_output, truncate_json_string, workspace_path_failure,
+    ToolArguments, MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
 
@@ -112,13 +112,13 @@ pub(crate) fn execute(
         );
     }
 
-    ToolOutput::Success {
+    finalize_output(ToolOutput::Success {
         content: vec![ToolContent::Text {
             text: text.to_string(),
         }],
         metadata: output_metadata,
         extensions: BTreeMap::new(),
-    }
+    })
 }
 
 fn utf8_prefix(bytes: &[u8], truncated: bool) -> Result<&str, String> {

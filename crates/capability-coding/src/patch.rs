@@ -8,7 +8,9 @@ use cap_std::fs::File;
 use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
-use crate::tool_support::{display_relative_path, failure, truncate_utf8, ToolArguments};
+use crate::tool_support::{
+    display_relative_path, failure, finalize_output, truncate_utf8, ToolArguments,
+};
 use crate::workspace::{CodingWorkspace, WorkspacePathError};
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -41,7 +43,7 @@ pub(crate) fn execute(
         Ok(changed_files) => changed_files,
         Err(error) => return failure(error.code(), error.to_string(), error.retryable()),
     };
-    ToolOutput::Success {
+    finalize_output(ToolOutput::Success {
         content: vec![ToolContent::Json {
             value: json!({ "changed_files": changed_files }),
         }],
@@ -50,7 +52,7 @@ pub(crate) fn execute(
             ("workspace".to_string(), workspace.metadata()),
         ]),
         extensions: BTreeMap::new(),
-    }
+    })
 }
 
 fn apply_unified_patch(
@@ -589,6 +591,9 @@ impl PatchError {
             Self::Limit(_) => "patch_too_large",
             Self::Conflict(_) => "patch_conflict",
             Self::Workspace(error) => error.code(),
+            Self::Io { source, .. } if source.kind() == std::io::ErrorKind::Unsupported => {
+                "unsupported_file_metadata"
+            }
             Self::Io { .. } => "workspace_io_error",
             Self::Cancelled => "tool_cancelled",
         }

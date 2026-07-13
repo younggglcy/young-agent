@@ -105,23 +105,26 @@ impl CodingWorkspace {
         self.root_dir.open_dir(path)
     }
 
-    pub(crate) fn command_working_directory(&self) -> io::Result<PathBuf> {
-        let authority = self.root_dir.dir_metadata()?;
-        let ambient = std::fs::metadata(&self.context.root)?;
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    pub(crate) fn bind_command_working_directory(&self, command: &mut Command) -> io::Result<()> {
+        use std::os::unix::process::CommandExt;
 
-        #[cfg(unix)]
-        {
-            use cap_std::fs::MetadataExt as _;
-            use std::os::unix::fs::MetadataExt as _;
-
-            if authority.dev() != ambient.dev() || authority.ino() != ambient.ino() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "workspace root identity changed after it was selected",
-                ));
-            }
+        let directory = self.root_dir.try_clone()?;
+        // SAFETY: the closure performs only the async-signal-safe fchdir syscall on an
+        // already-open directory handle. It allocates nothing and touches no shared state.
+        unsafe {
+            command.pre_exec(move || rustix::process::fchdir(&directory).map_err(io::Error::from));
         }
-        Ok(self.context.root.clone())
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn bind_command_working_directory(&self, _command: &mut Command) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-bound command working directories are not supported on this platform",
+        ))
     }
 
     pub(crate) fn replace_existing_atomically(
@@ -129,9 +132,9 @@ impl CodingWorkspace {
         path: &Path,
         content: &[u8],
     ) -> io::Result<()> {
-        let permissions = self.root_dir.metadata(path)?.permissions();
+        let metadata = self.replacement_metadata(path)?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_path = self.stage_content(parent, content, Some(permissions))?;
+        let temp_path = self.stage_content(parent, content, Some(metadata))?;
         let result = self.root_dir.rename(&temp_path, &self.root_dir, path);
         if result.is_err() {
             let _ = self.root_dir.remove_file(&temp_path);
@@ -142,8 +145,10 @@ impl CodingWorkspace {
     pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let temp_path = self.stage_content(parent, content, None)?;
-        let result = self.root_dir.hard_link(&temp_path, &self.root_dir, path);
-        let _ = self.root_dir.remove_file(&temp_path);
+        let result = self.commit_new_file(&temp_path, path);
+        if result.is_err() {
+            let _ = self.root_dir.remove_file(&temp_path);
+        }
         result
     }
 
@@ -203,7 +208,7 @@ impl CodingWorkspace {
         &self,
         parent: &Path,
         content: &[u8],
-        permissions: Option<Permissions>,
+        replacement: Option<ReplacementMetadata>,
     ) -> io::Result<PathBuf> {
         use std::io::Write;
 
@@ -223,8 +228,26 @@ impl CodingWorkspace {
                 Err(source) => return Err(source),
             };
             let result = (|| {
-                if let Some(permissions) = permissions {
-                    file.set_permissions(permissions)?;
+                if let Some(replacement) = replacement {
+                    #[cfg(unix)]
+                    {
+                        use cap_std::fs::MetadataExt as _;
+
+                        let staging = file.metadata()?;
+                        if staging.uid() != replacement.uid || staging.gid() != replacement.gid {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "atomic patch cannot preserve the target owner or group",
+                            ));
+                        }
+                        if file_has_extended_attributes(&file)? || has_extended_acl(&file)? {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "atomic patch staging file inherited unsupported security metadata",
+                            ));
+                        }
+                    }
+                    file.set_permissions(replacement.permissions)?;
                 }
                 file.write_all(content)?;
                 file.sync_all()
@@ -241,6 +264,135 @@ impl CodingWorkspace {
             "could not allocate a unique patch staging file",
         ))
     }
+
+    fn commit_new_file(&self, temp_path: &Path, path: &Path) -> io::Result<()> {
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        ))]
+        {
+            rustix::fs::renameat_with(
+                &*self.root_dir,
+                temp_path,
+                &*self.root_dir,
+                path,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from)
+        }
+        #[cfg(not(any(
+            target_vendor = "apple",
+            target_os = "linux",
+            target_os = "android",
+            target_os = "redox"
+        )))]
+        {
+            self.root_dir.hard_link(temp_path, &self.root_dir, path)?;
+            if let Err(source) = self.root_dir.remove_file(temp_path) {
+                let _ = self.root_dir.remove_file(path);
+                return Err(source);
+            }
+            Ok(())
+        }
+    }
+
+    fn replacement_metadata(&self, path: &Path) -> io::Result<ReplacementMetadata> {
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt as _;
+
+            let file = self.root_dir.open(path)?;
+            let metadata = file.metadata()?;
+            if metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic patch refuses files with multiple hard links",
+                ));
+            }
+            if file_has_extended_attributes(&file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic patch refuses files with extended attributes",
+                ));
+            }
+            if has_extended_acl(&file)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "atomic patch refuses files with an extended ACL",
+                ));
+            }
+            Ok(ReplacementMetadata {
+                permissions: metadata.permissions(),
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = self.root_dir.metadata(path)?;
+            Ok(ReplacementMetadata {
+                permissions: metadata.permissions(),
+            })
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReplacementMetadata {
+    permissions: Permissions,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+fn has_extended_acl(file: &File) -> io::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    let path = PathBuf::from(
+        rustix::fs::getpath(file)
+            .map_err(io::Error::from)?
+            .to_string_lossy()
+            .into_owned(),
+    );
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let path = if cfg!(target_os = "linux") {
+        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    } else {
+        PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
+    };
+    let entries = exacl::getfacl(path, None)?;
+    #[cfg(target_os = "macos")]
+    return Ok(!entries.is_empty());
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    return Ok(entries.iter().any(|entry| {
+        !entry.name.is_empty()
+            || !entry.flags.is_empty()
+            || matches!(entry.kind, exacl::AclEntryKind::Mask)
+    }));
+}
+
+#[cfg(unix)]
+fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
+    let mut names: Vec<u8> = Vec::with_capacity(64 * 1024);
+    rustix::fs::flistxattr(file, &mut names).map_err(io::Error::from)?;
+    Ok(!names.is_empty())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))
+))]
+fn has_extended_acl(_file: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic patch ACL validation is not supported on this platform",
+    ))
 }
 
 impl fmt::Debug for CodingWorkspace {
@@ -268,19 +420,46 @@ impl WorkspaceContext {
     }
 
     fn metadata(&self) -> Value {
+        let (root, mut metadata_truncated) = bounded_metadata_path(&self.root);
         let git_worktree = self.git_worktree.as_ref().map(|git| {
+            let (worktree_root, worktree_truncated) = bounded_metadata_path(&git.worktree_root);
+            let (git_dir, git_dir_truncated) = bounded_metadata_path(&git.git_dir);
+            let (common_dir, common_dir_truncated) = bounded_metadata_path(&git.common_dir);
+            metadata_truncated |= worktree_truncated || git_dir_truncated || common_dir_truncated;
             json!({
-                "worktree_root": git.worktree_root.display().to_string(),
-                "git_dir": git.git_dir.display().to_string(),
-                "common_dir": git.common_dir.display().to_string(),
+                "worktree_root": worktree_root,
+                "git_dir": git_dir,
+                "common_dir": common_dir,
                 "linked": git.is_linked_worktree(),
             })
         });
         json!({
-            "root": self.root.display().to_string(),
+            "root": root,
             "git_worktree": git_worktree,
+            "metadata_truncated": metadata_truncated,
         })
     }
+}
+
+fn bounded_metadata_path(path: &Path) -> (String, bool) {
+    const MAX_SERIALIZED_BYTES: usize = 2 * 1024;
+
+    let value = path.display().to_string();
+    let mut serialized_bytes = 2usize;
+    let mut boundary = 0usize;
+    for (index, character) in value.char_indices() {
+        let character_bytes = match character {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        if serialized_bytes.saturating_add(character_bytes) > MAX_SERIALIZED_BYTES {
+            return (value[..boundary].to_string(), true);
+        }
+        serialized_bytes = serialized_bytes.saturating_add(character_bytes);
+        boundary = index + character.len_utf8();
+    }
+    (value, false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,21 +546,19 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn detect_git_worktree(root: &Path) -> Result<Option<GitWorktreeContext>, CodingWorkspaceError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--show-toplevel",
-            "--absolute-git-dir",
-            "--git-common-dir",
-        ])
+    let output = git_probe_command(root)
         .output()
         .map_err(CodingWorkspaceError::StartGitProbe)?;
 
     if !output.status.success() {
-        return Ok(None);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if stderr.contains("not a git repository") {
+            return Ok(None);
+        }
+        return Err(CodingWorkspaceError::GitProbeFailed {
+            exit_code: output.status.code(),
+            stderr,
+        });
     }
 
     let stdout = String::from_utf8(output.stdout).map_err(CodingWorkspaceError::GitOutputUtf8)?;
@@ -404,14 +581,69 @@ fn detect_git_worktree(root: &Path) -> Result<Option<GitWorktreeContext>, Coding
     }))
 }
 
+fn git_probe_command(root: &Path) -> Command {
+    const REPOSITORY_ENVIRONMENT: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_INTERNAL_SUPER_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_PREFIX",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    ];
+
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ])
+        .env("LC_ALL", "C");
+    for name in REPOSITORY_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    command
+}
+
 #[derive(Debug)]
 pub enum CodingWorkspaceError {
-    ResolveRoot { path: PathBuf, source: io::Error },
-    RootIsNotDirectory { path: PathBuf },
-    OpenRoot { path: PathBuf, source: io::Error },
+    ResolveRoot {
+        path: PathBuf,
+        source: io::Error,
+    },
+    RootIsNotDirectory {
+        path: PathBuf,
+    },
+    OpenRoot {
+        path: PathBuf,
+        source: io::Error,
+    },
     StartGitProbe(io::Error),
+    GitProbeFailed {
+        exit_code: Option<i32>,
+        stderr: String,
+    },
     GitOutputUtf8(std::string::FromUtf8Error),
-    UnexpectedGitOutput { stdout: String },
+    UnexpectedGitOutput {
+        stdout: String,
+    },
 }
 
 impl fmt::Display for CodingWorkspaceError {
@@ -435,6 +667,11 @@ impl fmt::Display for CodingWorkspaceError {
             Self::StartGitProbe(source) => {
                 write!(formatter, "failed to start git worktree probe: {source}")
             }
+            Self::GitProbeFailed { exit_code, stderr } => write!(
+                formatter,
+                "git worktree probe failed with exit code {exit_code:?}: {}",
+                stderr.trim()
+            ),
             Self::GitOutputUtf8(source) => write!(
                 formatter,
                 "git worktree probe returned invalid UTF-8: {source}"
@@ -454,7 +691,9 @@ impl Error for CodingWorkspaceError {
             | Self::OpenRoot { source, .. }
             | Self::StartGitProbe(source) => Some(source),
             Self::GitOutputUtf8(source) => Some(source),
-            Self::RootIsNotDirectory { .. } | Self::UnexpectedGitOutput { .. } => None,
+            Self::RootIsNotDirectory { .. }
+            | Self::GitProbeFailed { .. }
+            | Self::UnexpectedGitOutput { .. } => None,
         }
     }
 }
@@ -463,7 +702,27 @@ impl Error for CodingWorkspaceError {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::CodingWorkspace;
+    use super::{git_probe_command, CodingWorkspace};
+
+    #[test]
+    fn git_probe_clears_repository_environment_overrides() {
+        let command = git_probe_command(std::path::Path::new("."));
+        let environment = command.get_envs().collect::<Vec<_>>();
+
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+        ] {
+            assert!(
+                environment
+                    .iter()
+                    .any(|(key, value)| { *key == std::ffi::OsStr::new(name) && value.is_none() }),
+                "{name} must be removed from the git probe environment"
+            );
+        }
+    }
 
     #[test]
     fn create_new_never_removes_an_existing_file() {

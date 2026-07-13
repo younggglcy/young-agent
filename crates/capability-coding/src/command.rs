@@ -4,6 +4,7 @@ use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
-    failure, truncate_json_string, ToolArguments, MAX_OUTPUT_BYTES,
+    failure, finalize_output, truncate_json_string, ToolArguments, MAX_OUTPUT_BYTES,
     MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
@@ -41,12 +42,13 @@ pub(crate) fn execute(
         Err(error) => return failure(error.code(), error.to_string(), error.retryable()),
     };
     let cwd = workspace.context().root().display().to_string();
+    let (cwd, cwd_truncated) = truncate_json_string(&cwd, 2 * 1024);
     let stream_budget = MAX_TOOL_CONTENT_SERIALIZED_BYTES / 2;
     let (stdout, stdout_serialization_truncated) =
         truncate_json_string(&outcome.stdout, stream_budget);
     let (stderr, stderr_serialization_truncated) =
         truncate_json_string(&outcome.stderr, stream_budget);
-    ToolOutput::Success {
+    finalize_output(ToolOutput::Success {
         content: vec![ToolContent::Json {
             value: json!({
                 "success": outcome.status.success(),
@@ -57,6 +59,7 @@ pub(crate) fn execute(
         }],
         metadata: BTreeMap::from([
             ("cwd".to_string(), json!(cwd)),
+            ("cwd_truncated".to_string(), json!(cwd_truncated)),
             ("stdout_bytes".to_string(), json!(outcome.stdout_bytes)),
             ("stderr_bytes".to_string(), json!(outcome.stderr_bytes)),
             (
@@ -74,7 +77,7 @@ pub(crate) fn execute(
             ("workspace".to_string(), workspace.metadata()),
         ]),
         extensions: BTreeMap::new(),
-    }
+    })
 }
 
 pub(crate) struct CommandOutcome {
@@ -99,16 +102,15 @@ fn run_shell_command(
     }
 
     let mut process = shell_command(command);
-    let working_directory = workspace
-        .command_working_directory()
+    workspace
+        .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
-    let mut child = process
-        .current_dir(working_directory)
+    let child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .group_spawn()
-        .map_err(CommandError::Spawn)?;
+        .group_spawn();
+    let mut child = child.map_err(CommandError::Spawn)?;
     let stdout = child
         .inner()
         .stdout
@@ -119,9 +121,15 @@ fn run_shell_command(
         .stderr
         .take()
         .expect("stderr was configured as piped");
+    if let Err(source) = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr)) {
+        let _ = terminate_command_group(&mut child);
+        let _ = child.wait();
+        return Err(CommandError::ConfigureOutput(source));
+    }
     let (sender, receiver) = mpsc::sync_channel(16);
-    let stdout_reader = spawn_reader(Stream::Stdout, stdout, sender.clone());
-    let stderr_reader = spawn_reader(Stream::Stderr, stderr, sender);
+    let reader_stop = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_reader(Stream::Stdout, stdout, sender.clone(), reader_stop.clone());
+    let stderr_reader = spawn_reader(Stream::Stderr, stderr, sender, reader_stop.clone());
 
     let mut stdout_capture = CapturedStream::new(max_output_bytes);
     let mut stderr_capture = CapturedStream::new(max_output_bytes);
@@ -174,18 +182,14 @@ fn run_shell_command(
         }
     }
 
-    if streams_done == 2 {
-        stdout_reader
-            .join()
-            .map_err(|_| CommandError::ReaderPanicked)?;
-        stderr_reader
-            .join()
-            .map_err(|_| CommandError::ReaderPanicked)?;
-    } else {
-        drop(receiver);
-        drop(stdout_reader);
-        drop(stderr_reader);
-    }
+    reader_stop.store(true, Ordering::Relaxed);
+    drop(receiver);
+    stdout_reader
+        .join()
+        .map_err(|_| CommandError::ReaderPanicked)?;
+    stderr_reader
+        .join()
+        .map_err(|_| CommandError::ReaderPanicked)?;
     if let Some(source) = stream_error {
         return Err(CommandError::ReadOutput(source));
     }
@@ -208,16 +212,37 @@ fn run_shell_command(
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
     match child.kill() {
         Ok(()) => Ok(()),
-        Err(source)
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
-            Ok(())
-        }
+        Err(source) if group_already_exited(&source) => Ok(()),
         Err(source) => Err(CommandError::Kill(source)),
     }
+}
+
+#[cfg(unix)]
+fn group_already_exited(source: &std::io::Error) -> bool {
+    matches!(
+        source.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+    ) || source.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
+}
+
+#[cfg(not(unix))]
+fn group_already_exited(source: &std::io::Error) -> bool {
+    matches!(
+        source.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+    )
+}
+
+#[cfg(unix)]
+fn make_nonblocking<F: std::os::fd::AsFd>(file: &F) -> std::io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(file).map_err(std::io::Error::from)?;
+    rustix::fs::fcntl_setfl(file, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn make_nonblocking<F>(_file: &F) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -250,6 +275,7 @@ fn spawn_reader<R>(
     stream: Stream,
     mut reader: R,
     sender: SyncSender<StreamMessage>,
+    stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
@@ -257,6 +283,9 @@ where
     thread::spawn(move || {
         let mut buffer = vec![0u8; 8 * 1024];
         loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     let _ = sender.send(StreamMessage::Done(stream));
@@ -271,6 +300,9 @@ where
                     }
                 }
                 Err(source) if source.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(POLL_INTERVAL);
+                }
                 Err(source) => {
                     let _ = sender.send(StreamMessage::Failed(stream, source));
                     return;
@@ -339,6 +371,7 @@ impl CapturedStream {
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
     WorkspaceChanged(std::io::Error),
+    ConfigureOutput(std::io::Error),
     Kill(std::io::Error),
     Wait(std::io::Error),
     ReadOutput(std::io::Error),
@@ -351,9 +384,11 @@ impl CommandError {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
             Self::WorkspaceChanged(_) => "workspace_changed",
-            Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) | Self::ReaderPanicked => {
-                "command_io_error"
-            }
+            Self::ConfigureOutput(_)
+            | Self::Kill(_)
+            | Self::Wait(_)
+            | Self::ReadOutput(_)
+            | Self::ReaderPanicked => "command_io_error",
             Self::Cancelled => "tool_cancelled",
         }
     }
@@ -361,7 +396,10 @@ impl CommandError {
     pub(crate) fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Kill(source) | Self::Wait(source) | Self::ReadOutput(source)
+            Self::ConfigureOutput(source)
+            | Self::Kill(source)
+            | Self::Wait(source)
+            | Self::ReadOutput(source)
                 if source.kind() == std::io::ErrorKind::Interrupted
         )
     }
@@ -375,6 +413,12 @@ impl fmt::Display for CommandError {
                 write!(
                     formatter,
                     "selected workspace is no longer available: {source}"
+                )
+            }
+            Self::ConfigureOutput(source) => {
+                write!(
+                    formatter,
+                    "failed to configure command output capture: {source}"
                 )
             }
             Self::Kill(source) => write!(formatter, "failed to terminate command group: {source}"),

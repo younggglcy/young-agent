@@ -99,6 +99,22 @@ pub(crate) fn workspace_path_failure(error: WorkspacePathError) -> ToolOutput {
     failure(error.code(), error.to_string(), error.retryable())
 }
 
+pub(crate) fn finalize_output(output: ToolOutput) -> ToolOutput {
+    if serde_json::to_vec(&output)
+        .expect("tool output JSON serializes")
+        .len()
+        <= MAX_OUTPUT_BYTES
+    {
+        output
+    } else {
+        failure(
+            "output_too_large",
+            "tool output exceeds the serialized event budget",
+            false,
+        )
+    }
+}
+
 pub(crate) fn failure(code: &str, message: impl Into<String>, retryable: bool) -> ToolOutput {
     let message = message.into();
     let (message, _) = truncate_json_string(&message, MAX_ERROR_MESSAGE_SERIALIZED_BYTES);

@@ -348,11 +348,11 @@ fn file_tools_remain_bound_to_the_open_workspace_when_its_path_is_replaced() {
         },
         Arc::new(AtomicBool::new(false)),
     );
-    let ToolOutput::Failure { error, .. } = commanded.output else {
-        panic!("command must reject a replaced ambient workspace root");
-    };
-    assert_eq!(error.code, "workspace_changed");
-    assert!(!moved.join("command.txt").exists());
+    assert!(matches!(commanded.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::read_to_string(moved.join("command.txt")).unwrap(),
+        "command"
+    );
     assert!(
         !outside.join("command.txt").exists(),
         "command cwd must remain the opened workspace"
@@ -394,6 +394,35 @@ fn read_file_truncates_at_a_valid_utf8_boundary() {
     assert_eq!(metadata["returned_bytes"], json!(48 * 1024 - 2));
     assert_eq!(metadata["truncated"], json!(true));
     assert_eq!(metadata["truncation_limit_bytes"], json!(48 * 1024));
+}
+
+#[test]
+fn read_file_bounds_the_complete_serialized_output() {
+    let test_workspace = TestWorkspace::new("read-output-budget");
+    std::fs::write(
+        test_workspace.path().join("control-bytes.txt"),
+        vec![0u8; 70_000],
+    )
+    .expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-read-output-budget"),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "control-bytes.txt" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let serialized_len = serde_json::to_vec(&result.output)
+        .expect("tool output serializes")
+        .len();
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert!(serialized_len <= 64 * 1024, "serialized output is bounded");
 }
 
 #[test]
@@ -794,6 +823,80 @@ fn apply_patch_preserves_private_permissions() {
 
     assert!(matches!(result.output, ToolOutput::Success { .. }));
     assert_eq!(std::fs::metadata(notes).unwrap().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_patch_refuses_to_break_hard_link_identity() {
+    let test_workspace = TestWorkspace::new("patch-hard-link");
+    let notes = test_workspace.path().join("shared.txt");
+    let alias = test_workspace.path().join("alias.txt");
+    std::fs::write(&notes, "old\n").expect("fixture is written");
+    std::fs::hard_link(&notes, &alias).expect("hard-link fixture is created");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-hard-link-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("hard-linked patch target must be rejected");
+    };
+    assert_eq!(error.code, "unsupported_file_metadata");
+    assert_eq!(std::fs::read_to_string(notes).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(alias).unwrap(), "old\n");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apply_patch_refuses_to_drop_an_extended_acl() {
+    let test_workspace = TestWorkspace::new("patch-extended-acl");
+    let notes = test_workspace.path().join("protected.txt");
+    std::fs::write(&notes, "old\n").expect("fixture is written");
+    let user = std::env::var("USER").expect("test user is available");
+    exacl::setfacl(
+        &[&notes],
+        &[exacl::AclEntry::deny_user(&user, exacl::Perm::WRITE, None)],
+        None,
+    )
+    .expect("extended ACL fixture is set");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-extended-acl-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- a/protected.txt\n+++ b/protected.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("ACL-bearing patch target must be rejected");
+    };
+    assert_eq!(error.code, "unsupported_file_metadata");
+    assert_eq!(std::fs::read_to_string(notes).unwrap(), "old\n");
 }
 
 #[test]
@@ -1336,4 +1439,35 @@ fn run_command_cancellation_still_terminates_after_the_shell_leader_exits() {
         panic!("cancelled command must fail");
     };
     assert_eq!(error.code, "tool_cancelled");
+}
+
+#[test]
+fn run_command_does_not_wait_for_a_pipe_holder_that_escapes_the_process_group() {
+    let test_workspace = TestWorkspace::new("command-escaped-pipe");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-escaped-pipe-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "python3 -c 'import os,time; os.setsid(); time.sleep(2)' &"
+        }),
+    };
+    let started = std::time::Instant::now();
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    let output = result.output;
+    let ToolOutput::Success { metadata, .. } = &output else {
+        panic!("escaped pipe holder must not block command completion: {output:?}");
+    };
+    assert_eq!(metadata["output_incomplete"], json!(true));
 }
