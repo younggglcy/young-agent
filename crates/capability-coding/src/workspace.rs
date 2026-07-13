@@ -12,6 +12,7 @@ use cap_std::fs::{Dir, DirEntry, File, Metadata, OpenOptions, Permissions};
 use serde_json::{json, Value};
 
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const RECOVERY_DIRECTORY: &str = ".young-agent-recovery";
 
 #[derive(Clone)]
 pub struct CodingWorkspace {
@@ -448,7 +449,8 @@ impl CodingWorkspace {
             {
                 return Err(published_target_changed(path, Some(&recovery_path), source));
             }
-            Ok(recovery_path)
+            move_claimed_to_recovery_namespace(directory, &recovery_path, "displaced")
+                .map_err(|source| published_target_changed(path, Some(&recovery_path), source))
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
@@ -838,6 +840,103 @@ fn claim_path(directory: &Dir, path: &Path, kind: &str) -> io::Result<PathBuf> {
     ))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn move_claimed_to_recovery_namespace(
+    directory: &Dir,
+    claimed_path: &Path,
+    kind: &str,
+) -> io::Result<PathBuf> {
+    let recovery = open_recovery_namespace(directory)?;
+    for _ in 0..100 {
+        let destination = random_patch_path(kind)?;
+        match rustix::fs::renameat_with(
+            directory,
+            claimed_path,
+            &recovery,
+            &destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => return Ok(PathBuf::from(RECOVERY_DIRECTORY).join(destination)),
+            Err(source) if io::Error::from(source).kind() == io::ErrorKind::AlreadyExists => {
+                continue
+            }
+            Err(source) => return Err(io::Error::from(source)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique namespaced recovery path",
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn move_claimed_to_recovery_namespace(
+    _directory: &Dir,
+    _claimed_path: &Path,
+    _kind: &str,
+) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "namespaced patch recovery is not supported on this platform",
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn open_recovery_namespace(directory: &Dir) -> io::Result<Dir> {
+    match directory.create_dir(RECOVERY_DIRECTORY) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => return Err(source),
+    }
+    let metadata = directory.symlink_metadata(RECOVERY_DIRECTORY)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("recovery namespace '{RECOVERY_DIRECTORY}' is not a real directory"),
+        ));
+    }
+    let recovery = directory.open_dir(RECOVERY_DIRECTORY)?;
+    ensure_recovery_gitignore(&recovery)?;
+    Ok(recovery)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn ensure_recovery_gitignore(recovery: &Dir) -> io::Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    const CONTENT: &[u8] = b"*\n";
+    let mut create = OpenOptions::new();
+    create.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        create.mode(0o600);
+    }
+    match recovery.open_with(".gitignore", &create) {
+        Ok(mut file) => {
+            file.write_all(CONTENT)?;
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            let (file, _) =
+                require_regular_file(recovery.open_with(".gitignore", &regular_file_options())?)?;
+            let mut content = Vec::with_capacity(CONTENT.len() + 1);
+            file.take((CONTENT.len() + 1) as u64)
+                .read_to_end(&mut content)?;
+            if content == CONTENT {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recovery namespace .gitignore has unexpected content",
+                ))
+            }
+        }
+        Err(source) => Err(source),
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn claim_path(_directory: &Dir, _path: &Path, _kind: &str) -> io::Result<PathBuf> {
     Err(io::Error::new(
@@ -976,11 +1075,21 @@ fn cleanup_expected_staging_after_error<T>(
             ));
         }
     }
+    let recovery = move_claimed_to_recovery_namespace(directory, &claimed, "failed")
+        .map_err(|recovery| {
+            io::Error::new(
+                recovery.kind(),
+                format!(
+                    "patch operation failed ({source}); owned staging data remained at '{}' because it could not enter the recovery namespace ({recovery})",
+                    claimed.display()
+                ),
+            )
+        })?;
     Err(io::Error::new(
         source.kind(),
         format!(
             "patch operation failed ({source}); owned staging data was preserved as recovery file '{}'",
-            claimed.display()
+            recovery.display()
         ),
     ))
 }
@@ -1580,14 +1689,14 @@ mod tests {
             std::fs::read_to_string(root.join("owned.txt")).unwrap(),
             "concurrent owner\n"
         );
-        let recoveries = std::fs::read_dir(&root)
+        let recoveries = std::fs::read_dir(root.join(super::RECOVERY_DIRECTORY))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".young-agent-patch-cleanup-")
+                    .starts_with(".young-agent-patch-failed-")
             })
             .collect::<Vec<_>>();
         assert_eq!(recoveries.len(), 1);
@@ -1844,14 +1953,14 @@ mod tests {
             std::fs::read_to_string(root.join("original.txt")).unwrap(),
             "original\n"
         );
-        let recoveries = std::fs::read_dir(&root)
+        let recoveries = std::fs::read_dir(root.join(super::RECOVERY_DIRECTORY))
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| {
                 entry
                     .file_name()
                     .to_string_lossy()
-                    .starts_with(".young-agent-patch-cleanup-")
+                    .starts_with(".young-agent-patch-failed-")
             })
             .collect::<Vec<_>>();
         assert_eq!(recoveries.len(), 1);

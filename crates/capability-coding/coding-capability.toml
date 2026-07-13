@@ -47,7 +47,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "apply_patch"
-description = "Apply a unified diff to UTF-8 files inside the workspace boundary and report preserved recovery files."
+description = "Apply a unified diff to UTF-8 files inside the workspace boundary; displaced originals are reported in a search- and Git-ignored recovery namespace until the caller removes them."
 safety_class = "requires_approval"
 safety_reason = "patching mutates workspace files"
 

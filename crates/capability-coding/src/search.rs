@@ -11,7 +11,7 @@ use crate::tool_support::{
     display_relative_path, failure, finalize_output, truncate_json_string, workspace_path_failure,
     ToolArguments, MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
-use crate::workspace::CodingWorkspace;
+use crate::workspace::{CodingWorkspace, RECOVERY_DIRECTORY};
 
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
@@ -148,7 +148,7 @@ fn search_directory(
         let file_name = entry.file_name();
         let entry_path = frame.relative_path.join(&file_name);
         if file_type.is_dir() {
-            if file_name == ".git" {
+            if file_name == ".git" || file_name == RECOVERY_DIRECTORY {
                 continue;
             }
             if stack.len() == MAX_SEARCH_DEPTH {

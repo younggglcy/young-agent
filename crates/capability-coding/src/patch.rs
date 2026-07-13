@@ -59,6 +59,10 @@ pub(crate) fn execute(
                 "recovery_files".to_string(),
                 json!(result.recovery_files.len()),
             ),
+            (
+                "recovery_policy".to_string(),
+                json!("ignored_by_search_and_git_until_caller_removes"),
+            ),
             ("workspace".to_string(), workspace.metadata()),
         ]),
         extensions: BTreeMap::new(),

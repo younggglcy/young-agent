@@ -228,7 +228,7 @@ fn run_shell_command(
         return Err(CommandError::ReadOutput(source));
     }
     if cancelled {
-        return Err(CommandError::TerminationIncomplete);
+        return Err(CommandError::TerminationUnverified);
     }
     if output_incomplete {
         return Err(CommandError::OutputIncomplete);
@@ -556,7 +556,7 @@ pub(crate) enum CommandError {
     ReaderPanicked,
     Cancelled,
     OutputIncomplete,
-    TerminationIncomplete,
+    TerminationUnverified,
 }
 
 impl CommandError {
@@ -571,7 +571,7 @@ impl CommandError {
             | Self::ReaderPanicked => "command_io_error",
             Self::Cancelled => "tool_cancelled",
             Self::OutputIncomplete => "command_output_incomplete",
-            Self::TerminationIncomplete => "command_termination_incomplete",
+            Self::TerminationUnverified => "command_termination_unverified",
         }
     }
 
@@ -612,8 +612,9 @@ impl fmt::Display for CommandError {
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
             Self::OutputIncomplete => formatter
                 .write_str("command output remained open after the command process group exited"),
-            Self::TerminationIncomplete => formatter
-                .write_str("command descendants remained alive after process-group termination"),
+            Self::TerminationUnverified => formatter.write_str(
+                "command process group was terminated, but detached descendants could not be verified",
+            ),
         }
     }
 }
@@ -660,7 +661,7 @@ mod tests {
         );
 
         trigger.join().expect("cancellation trigger finishes");
-        assert!(matches!(result, Err(CommandError::TerminationIncomplete)));
+        assert!(matches!(result, Err(CommandError::TerminationUnverified)));
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());

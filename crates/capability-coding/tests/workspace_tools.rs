@@ -863,6 +863,7 @@ fn search_files_rejects_an_explicit_symlink_escape() {
 #[test]
 fn apply_patch_updates_a_workspace_file_after_approval() {
     let test_workspace = TestWorkspace::new("apply-patch");
+    test_workspace.git(&["init", "--quiet"]);
     let notes = test_workspace.path().join("notes.txt");
     std::fs::write(&notes, "first\nold value\nlast\n").expect("fixture is written");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
@@ -915,14 +916,59 @@ fn apply_patch_updates_a_workspace_file_after_approval() {
     let recovery = recovery_files[0]
         .as_str()
         .expect("recovery path is a string");
-    assert!(recovery.starts_with(".young-agent-patch-displaced-"));
+    assert!(recovery.starts_with(".young-agent-recovery/.young-agent-patch-displaced-"));
     assert_eq!(
         std::fs::read_to_string(test_workspace.path().join(recovery)).unwrap(),
         "first\nold value\nlast\n"
     );
     assert_eq!(metadata["files_changed"], json!(1));
     assert_eq!(metadata["recovery_files"], json!(1));
+    assert_eq!(
+        metadata["recovery_policy"],
+        json!("ignored_by_search_and_git_until_caller_removes")
+    );
     assert!(extensions.is_empty());
+
+    let search = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-after-patch"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "old value" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Success { content, .. } = search.output else {
+        panic!("search after patch should succeed");
+    };
+    assert_eq!(
+        content,
+        vec![ToolContent::Json {
+            value: json!({ "matches": [] }),
+        }]
+    );
+
+    let ignored = Command::new("git")
+        .arg("-C")
+        .arg(test_workspace.path())
+        .args(["check-ignore", "--quiet", recovery])
+        .status()
+        .expect("git check-ignore starts");
+    assert!(ignored.success(), "recovery file must be ignored by Git");
+    let ignore_rule = Command::new("git")
+        .arg("-C")
+        .arg(test_workspace.path())
+        .args([
+            "check-ignore",
+            "--quiet",
+            ".young-agent-recovery/.gitignore",
+        ])
+        .status()
+        .expect("git check-ignore starts");
+    assert!(
+        ignore_rule.success(),
+        "the recovery namespace ignore rule must not be staged by git add"
+    );
 }
 
 #[cfg(unix)]
@@ -1537,7 +1583,11 @@ fn run_command_observes_cooperative_cancellation() {
     let ToolOutput::Failure { error, .. } = result.output else {
         panic!("cancelled command must fail");
     };
-    assert_eq!(error.code, "command_termination_incomplete");
+    assert_eq!(error.code, "command_termination_unverified");
+    assert_eq!(
+        error.message,
+        "command process group was terminated, but detached descendants could not be verified"
+    );
 }
 
 #[test]
@@ -1572,7 +1622,7 @@ fn run_command_cancellation_terminates_descendant_processes() {
     let ToolOutput::Failure { error, .. } = result.output else {
         panic!("cancelled command must fail");
     };
-    assert_eq!(error.code, "command_termination_incomplete");
+    assert_eq!(error.code, "command_termination_unverified");
     thread::sleep(Duration::from_millis(250));
     assert!(
         !test_workspace.path().join("descendant.txt").exists(),
@@ -1681,7 +1731,7 @@ fn run_command_fails_closed_when_a_close_fds_descendant_survives_cancellation() 
     let ToolOutput::Failure { error, .. } = result.output else {
         panic!("incompletely terminated command must fail");
     };
-    assert_eq!(error.code, "command_termination_incomplete");
+    assert_eq!(error.code, "command_termination_unverified");
     thread::sleep(Duration::from_millis(700));
     assert_eq!(
         std::fs::read_to_string(test_workspace.path().join("escaped-after-cancel")).unwrap(),
