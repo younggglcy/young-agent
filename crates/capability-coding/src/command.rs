@@ -30,6 +30,9 @@ const TERMINAL_GROUP_SEAL_ROUNDS: usize = 8;
 const MAX_STREAM_READS_PER_TICK: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const MAX_COMMAND_SUPERVISION_SLOTS: usize = 64;
+const MAX_COMMAND_PROCESSING_PANICS: u8 = 8;
+const INITIAL_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(10);
+const MAX_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(250);
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -341,9 +344,7 @@ fn prepare_command_supervision() -> Result<CommandSupervisionPermit, CommandErro
 fn prepare_command_supervision_with(
     supervisor: &std::sync::Arc<CommandSupervisor>,
 ) -> Result<CommandSupervisionPermit, CommandError> {
-    supervisor
-        .ensure_worker_started()
-        .map_err(CommandError::SupervisorUnavailable)?;
+    supervisor.ensure_worker_started()?;
     supervisor.reserve_slot()
 }
 
@@ -671,9 +672,11 @@ struct CommandSupervisor {
     #[cfg(all(test, unix))]
     fail_next_worker_start: AtomicBool,
     #[cfg(all(test, unix))]
-    panic_next_processing: AtomicBool,
+    processing_panics_to_inject: AtomicUsize,
     #[cfg(all(test, unix))]
-    processing_panics: AtomicUsize,
+    processing_panic_command_id: AtomicU64,
+    #[cfg(all(test, unix))]
+    observed_processing_panics: AtomicUsize,
     #[cfg(all(test, unix))]
     fail_next_wait: AtomicBool,
     #[cfg(all(test, unix))]
@@ -696,9 +699,11 @@ impl CommandSupervisor {
             #[cfg(all(test, unix))]
             fail_next_worker_start: AtomicBool::new(false),
             #[cfg(all(test, unix))]
-            panic_next_processing: AtomicBool::new(false),
+            processing_panics_to_inject: AtomicUsize::new(0),
             #[cfg(all(test, unix))]
-            processing_panics: AtomicUsize::new(0),
+            processing_panic_command_id: AtomicU64::new(0),
+            #[cfg(all(test, unix))]
+            observed_processing_panics: AtomicUsize::new(0),
             #[cfg(all(test, unix))]
             fail_next_wait: AtomicBool::new(false),
             #[cfg(all(test, unix))]
@@ -708,11 +713,23 @@ impl CommandSupervisor {
 
     #[cfg(all(test, unix))]
     fn enqueue(&self, child: GroupChild, permit: CommandSupervisionPermit) -> u64 {
+        self.enqueue_at(child, permit, Instant::now())
+    }
+
+    #[cfg(all(test, unix))]
+    fn enqueue_at(
+        &self,
+        child: GroupChild,
+        permit: CommandSupervisionPermit,
+        next_action: Instant,
+    ) -> u64 {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
+        let mut command = SupervisedCommand::new(id, child, permit);
+        command.next_action = next_action;
         self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(SupervisedCommand::new(id, child, permit));
+            .push(command);
         self.wake.notify_one();
         id
     }
@@ -726,20 +743,22 @@ impl CommandSupervisor {
         self.wake.notify_one();
     }
 
-    fn ensure_worker_started(self: &std::sync::Arc<Self>) -> std::io::Result<()> {
+    fn ensure_worker_started(self: &std::sync::Arc<Self>) -> Result<(), CommandError> {
         #[cfg(all(test, unix))]
         if self.fail_next_worker_start.swap(false, Ordering::Relaxed) {
-            return Err(std::io::Error::new(
+            return Err(CommandError::SupervisorUnavailable(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "injected worker start failure",
-            ));
+            )));
         }
         let mut state = self
             .worker_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *state == SupervisorWorkerState::Running {
-            return Ok(());
+        match *state {
+            SupervisorWorkerState::Running => return Ok(()),
+            SupervisorWorkerState::Degraded => return Err(CommandError::SupervisorDegraded),
+            SupervisorWorkerState::Stopped => {}
         }
         *state = SupervisorWorkerState::Running;
         let worker = self.clone();
@@ -748,7 +767,7 @@ impl CommandSupervisor {
             .spawn(move || command_supervisor_worker(worker))
         {
             *state = SupervisorWorkerState::Stopped;
-            return Err(source);
+            return Err(CommandError::SupervisorUnavailable(source));
         }
         Ok(())
     }
@@ -781,6 +800,35 @@ impl CommandSupervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(command);
         self.wake.notify_one();
+    }
+
+    fn record_processing_panic(&self, command: &mut SupervisedCommand) {
+        command.processing_panics = command.processing_panics.saturating_add(1);
+        let exponent = u32::from(command.processing_panics.saturating_sub(1).min(5));
+        let delay = INITIAL_PROCESSING_PANIC_BACKOFF
+            .saturating_mul(1u32 << exponent)
+            .min(MAX_PROCESSING_PANIC_BACKOFF);
+        command.next_action = Instant::now() + delay;
+        if command.processing_panics >= MAX_COMMAND_PROCESSING_PANICS {
+            *self
+                .worker_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                SupervisorWorkerState::Degraded;
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn inject_processing_panic(&self, command_id: u64) -> bool {
+        let target = self.processing_panic_command_id.load(Ordering::Relaxed);
+        if target != 0 && target != command_id {
+            return false;
+        }
+        self.processing_panics_to_inject
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
     }
 
     #[cfg(all(test, unix))]
@@ -822,6 +870,7 @@ impl CommandSupervisor {
 enum SupervisorWorkerState {
     Stopped,
     Running,
+    Degraded,
 }
 
 struct CommandSupervisionPermit {
@@ -839,6 +888,7 @@ struct SupervisedCommand {
     id: u64,
     child: GroupChild,
     _permit: CommandSupervisionPermit,
+    processing_panics: u8,
     termination_attempts_remaining: u8,
     retry_delay: Duration,
     next_action: Instant,
@@ -851,6 +901,7 @@ impl SupervisedCommand {
             id,
             child,
             _permit: permit,
+            processing_panics: 0,
             termination_attempts_remaining: 8,
             retry_delay: Duration::from_millis(10),
             next_action: Instant::now(),
@@ -862,6 +913,7 @@ impl SupervisedCommand {
         Self {
             child,
             _permit: permit,
+            processing_panics: 0,
             termination_attempts_remaining: 8,
             retry_delay: Duration::from_millis(10),
             next_action: Instant::now(),
@@ -926,7 +978,10 @@ impl InFlightCommand {
 
 impl Drop for InFlightCommand {
     fn drop(&mut self) {
-        if let Some(command) = self.command.take() {
+        if let Some(mut command) = self.command.take() {
+            if thread::panicking() {
+                self.supervisor.record_processing_panic(&mut command);
+            }
             self.supervisor.requeue(command);
         }
     }
@@ -942,11 +997,14 @@ struct SupervisorWorkerGuard(std::sync::Arc<CommandSupervisor>);
 
 impl Drop for SupervisorWorkerGuard {
     fn drop(&mut self) {
-        *self
+        let mut state = self
             .0
             .worker_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SupervisorWorkerState::Stopped;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state != SupervisorWorkerState::Degraded {
+            *state = SupervisorWorkerState::Stopped;
+        }
     }
 }
 
@@ -968,14 +1026,14 @@ fn command_supervisor_loop(supervisor: std::sync::Arc<CommandSupervisor>) {
         let command = take_next_due_command(&supervisor);
         let mut in_flight = InFlightCommand::new(supervisor.clone(), command);
         #[cfg(all(test, unix))]
-        if supervisor
-            .panic_next_processing
-            .swap(false, Ordering::Relaxed)
-        {
-            supervisor.processing_panics.fetch_add(1, Ordering::Relaxed);
+        if supervisor.inject_processing_panic(in_flight.id()) {
+            supervisor
+                .observed_processing_panics
+                .fetch_add(1, Ordering::Relaxed);
             panic!("injected supervisor processing panic");
         }
         if supervise_command_once(in_flight.command_mut(), Instant::now(), &supervisor) {
+            in_flight.command_mut().processing_panics = 0;
             drop(in_flight);
         } else {
             #[cfg(all(test, unix))]
@@ -1220,6 +1278,7 @@ impl CapturedStream {
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
     SupervisorUnavailable(std::io::Error),
+    SupervisorDegraded,
     SupervisorAtCapacity,
     WorkspaceChanged(std::io::Error),
     ConfigureOutput(std::io::Error),
@@ -1239,6 +1298,7 @@ impl CommandError {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
             Self::SupervisorUnavailable(_) => "command_supervisor_unavailable",
+            Self::SupervisorDegraded => "command_supervisor_degraded",
             Self::SupervisorAtCapacity => "command_supervisor_pressure",
             Self::WorkspaceChanged(_) => "workspace_changed",
             Self::ConfigureOutput(_) | Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) => {
@@ -1276,6 +1336,9 @@ impl fmt::Display for CommandError {
             Self::SupervisorUnavailable(source) => write!(
                 formatter,
                 "command supervisor is unavailable; no command was started: {source}"
+            ),
+            Self::SupervisorDegraded => formatter.write_str(
+                "command supervisor is degraded after repeated internal failures; no command was started",
             ),
             Self::SupervisorAtCapacity => formatter.write_str(
                 "command supervision capacity is exhausted; no command was started",
@@ -1330,8 +1393,8 @@ mod tests {
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
-        LIVE_COMMAND_SUPERVISOR_HANDOFFS, MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL,
-        TERMINAL_GROUP_SEAL_ROUNDS,
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS, MAX_COMMAND_PROCESSING_PANICS,
+        MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL, TERMINAL_GROUP_SEAL_ROUNDS,
     };
     use crate::workspace::CodingWorkspace;
 
@@ -1419,8 +1482,8 @@ mod tests {
         let supervisor = Arc::new(CommandSupervisor::new());
         let permit = prepare_command_supervision_with(&supervisor).expect("worker starts");
         supervisor
-            .panic_next_processing
-            .store(true, Ordering::Relaxed);
+            .processing_panics_to_inject
+            .store(1, Ordering::Relaxed);
         let mut process = shell_command("exit 0");
         let child = process
             .stdin(Stdio::null())
@@ -1431,7 +1494,70 @@ mod tests {
         let id = supervisor.enqueue(child, permit);
 
         assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
-        assert_eq!(supervisor.processing_panics.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            supervisor
+                .observed_processing_panics
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn repeated_processing_panics_back_off_degrade_and_do_not_starve_other_commands() {
+        let supervisor = Arc::new(CommandSupervisor::new());
+        let failing_permit = prepare_command_supervision_with(&supervisor).expect("worker starts");
+        let healthy_permit = supervisor.reserve_slot().expect("second slot is available");
+        supervisor.processing_panics_to_inject.store(
+            usize::from(MAX_COMMAND_PROCESSING_PANICS),
+            Ordering::Relaxed,
+        );
+        let mut failing_process = shell_command("exit 0");
+        let failing_child = failing_process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("failing test command group starts");
+        let mut healthy_process = shell_command("exit 0");
+        let healthy_child = healthy_process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("healthy test command group starts");
+        let first_deadline = Instant::now() + Duration::from_millis(20);
+        let failing_id = supervisor.enqueue_at(failing_child, failing_permit, first_deadline);
+        let healthy_id = supervisor.enqueue_at(
+            healthy_child,
+            healthy_permit,
+            first_deadline + Duration::from_millis(1),
+        );
+        supervisor
+            .processing_panic_command_id
+            .store(failing_id, Ordering::Relaxed);
+
+        assert!(supervisor.wait_for_completion(healthy_id, Duration::from_secs(2)));
+        assert!(supervisor.wait_for_completion(failing_id, Duration::from_secs(4)));
+        assert_eq!(
+            supervisor
+                .observed_processing_panics
+                .load(Ordering::Relaxed),
+            usize::from(MAX_COMMAND_PROCESSING_PANICS)
+        );
+        assert_eq!(
+            *supervisor
+                .worker_state
+                .lock()
+                .expect("worker state remains available"),
+            SupervisorWorkerState::Degraded
+        );
+        let error = match prepare_command_supervision_with(&supervisor) {
+            Err(error) => error,
+            Ok(_) => panic!("degraded supervisor must reject new commands"),
+        };
+        assert_eq!(error.code(), "command_supervisor_degraded");
+        assert!(!error.retryable());
         assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
     }
 

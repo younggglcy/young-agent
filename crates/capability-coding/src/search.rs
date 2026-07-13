@@ -303,8 +303,7 @@ fn search_file(
                     results,
                 );
             }
-            results.truncated = true;
-            results.limit_reached = true;
+            results.discard_incomplete_file(checkpoint);
             return Ok(());
         }
         let read_limit = buffer.len().min(remaining_bytes as usize);
@@ -339,7 +338,7 @@ fn search_file(
         {
             line.feed(&buffer[start..newline], pattern);
             finish_line(display_path, line_number, &line, results)?;
-            line = LineState::default();
+            line.reset_for_next_line();
             line_number += 1;
             start = newline + 1;
         }
@@ -474,6 +473,14 @@ impl SearchResults {
         self.limit_reached = checkpoint.limit_reached;
         self.binary_files_skipped = self.binary_files_skipped.saturating_add(1);
     }
+
+    fn discard_incomplete_file(&mut self, checkpoint: SearchCheckpoint) {
+        self.matches.truncate(checkpoint.matches_len);
+        self.serialized_bytes = checkpoint.serialized_bytes;
+        self.lines_truncated = checkpoint.lines_truncated;
+        self.truncated = true;
+        self.limit_reached = true;
+    }
 }
 
 #[derive(Default)]
@@ -502,6 +509,14 @@ impl LineState {
                 }
             }
         }
+    }
+
+    fn reset_for_next_line(&mut self) {
+        self.visible.clear();
+        self.bytes_seen = 0;
+        self.matcher_state = 0;
+        self.matched = false;
+        self.truncated = false;
     }
 }
 
@@ -709,8 +724,10 @@ mod tests {
     use std::cell::Cell;
 
     use super::{
-        largest_fitting_prefix, SearchResults, MAX_SEARCH_DIRECTORIES, MAX_SEARCH_ENTRIES,
+        largest_fitting_prefix, LineState, LiteralPattern, SearchResults, MAX_SEARCH_DIRECTORIES,
+        MAX_SEARCH_ENTRIES,
     };
+    use serde_json::json;
 
     #[test]
     fn fitting_prefix_uses_logarithmic_size_probes() {
@@ -722,6 +739,46 @@ mod tests {
 
         assert_eq!(result, Some(137));
         assert!(probes.get() <= 10, "used {} probes", probes.get());
+    }
+
+    #[test]
+    fn incomplete_file_rolls_back_provisional_matches_but_keeps_global_budgets() {
+        let mut results = SearchResults::default();
+        results.matches.push(json!({ "path": "complete.txt" }));
+        results.serialized_bytes = 10;
+        let checkpoint = results.checkpoint();
+        results.matches.push(json!({ "path": "incomplete.txt" }));
+        results.serialized_bytes = 30;
+        results.lines_truncated = 1;
+        results.bytes_searched = 256;
+        results.files_searched = 2;
+
+        results.discard_incomplete_file(checkpoint);
+
+        assert_eq!(results.matches, vec![json!({ "path": "complete.txt" })]);
+        assert_eq!(results.serialized_bytes, 10);
+        assert_eq!(results.lines_truncated, 0);
+        assert_eq!(results.bytes_searched, 256);
+        assert_eq!(results.files_searched, 2);
+        assert_eq!(results.binary_files_skipped, 0);
+        assert!(results.truncated);
+        assert!(results.limit_reached);
+    }
+
+    #[test]
+    fn line_state_reuses_its_visible_buffer_between_short_lines() {
+        let pattern = LiteralPattern::new(b"needle");
+        let mut line = LineState::default();
+        line.feed(b"first", &pattern);
+        let pointer = line.visible.as_ptr();
+        let capacity = line.visible.capacity();
+
+        line.reset_for_next_line();
+        line.feed(b"next", &pattern);
+
+        assert_eq!(line.visible.as_ptr(), pointer);
+        assert_eq!(line.visible.capacity(), capacity);
+        assert_eq!(line.visible, b"next");
     }
 
     #[test]
