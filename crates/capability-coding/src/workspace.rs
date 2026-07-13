@@ -193,9 +193,15 @@ impl CodingWorkspace {
         if metadata.snapshot != expected_snapshot {
             return Err(patch_target_changed());
         }
+        let recovery_directory = open_recovery_namespace(&directory)?;
         let staged = self.stage_content(&directory, content, Some(&metadata))?;
-        let recovery =
-            self.commit_existing_file(&directory, staged, Path::new(file_name), metadata)?;
+        let recovery = self.commit_existing_file(
+            &directory,
+            &recovery_directory,
+            staged,
+            Path::new(file_name),
+            metadata,
+        )?;
         Ok(Some(parent.join(recovery)))
     }
 
@@ -402,6 +408,7 @@ impl CodingWorkspace {
     fn commit_existing_file(
         &self,
         directory: &Dir,
+        recovery_directory: &Dir,
         mut staged: StagedFile,
         path: &Path,
         mut expected: ReplacementMetadata,
@@ -414,8 +421,44 @@ impl CodingWorkspace {
             {
                 return cleanup_owned_staging_after_error(directory, &staged, source);
             }
-            if let Err(source) = exchange_files(directory, &staged.path, path) {
-                return cleanup_owned_staging_after_error(directory, &staged, source);
+            let recovery_path = match move_to_recovery_namespace(
+                directory,
+                &staged.path,
+                recovery_directory,
+                "displaced",
+            ) {
+                Ok(path) => path,
+                Err(source) => {
+                    return cleanup_owned_staging_after_error(directory, &staged, source)
+                }
+            };
+            staged.path = recovery_path;
+            if let Err(source) = refresh_snapshot_after_rename(
+                &staged.file,
+                &mut staged.snapshot,
+                "patch staging file",
+            )
+            .and_then(|()| {
+                validate_installed_staging_slot(recovery_directory, &staged.path, &staged)
+            }) {
+                return Err(io::Error::new(
+                    source.kind(),
+                    format!(
+                        "patch staging data was preserved as recovery file '{RECOVERY_DIRECTORY}/{}' before publication ({source})",
+                        staged.path.display()
+                    ),
+                ));
+            }
+            if let Err(source) =
+                exchange_files_between(recovery_directory, &staged.path, directory, path)
+            {
+                return Err(io::Error::new(
+                    source.kind(),
+                    format!(
+                        "patch staging data was preserved as recovery file '{RECOVERY_DIRECTORY}/{}' because publication failed ({source})",
+                        staged.path.display()
+                    ),
+                ));
             }
             if let Err(source) = refresh_snapshot_after_rename(
                 &staged.file,
@@ -424,37 +467,23 @@ impl CodingWorkspace {
             )
             .and_then(|()| refresh_replacement_after_rename(&mut expected))
             {
-                return Err(published_target_changed(path, Some(&staged.path), source));
+                let recovery = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
+                return Err(published_target_changed(path, Some(&recovery), source));
             }
 
             let validation =
                 validate_installed_staging_slot(directory, path, &staged).and_then(|()| {
-                    validate_replacement_slot_identity(directory, &staged.path, &expected)
+                    validate_replacement_slot_identity(recovery_directory, &staged.path, &expected)
                 });
             if let Err(source) = validation {
-                return Err(published_target_changed(path, Some(&staged.path), source));
+                let recovery = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
+                return Err(published_target_changed(path, Some(&recovery), source));
             }
-
-            let recovery_path = match claim_path(directory, &staged.path, "displaced") {
-                Ok(path) => path,
-                Err(source) => {
-                    return Err(published_target_changed(path, Some(&staged.path), source));
-                }
-            };
-            if let Err(source) = refresh_replacement_after_rename(&mut expected) {
-                return Err(published_target_changed(path, Some(&recovery_path), source));
-            }
-            if let Err(source) =
-                validate_replacement_slot_identity(directory, &recovery_path, &expected)
-            {
-                return Err(published_target_changed(path, Some(&recovery_path), source));
-            }
-            move_claimed_to_recovery_namespace(directory, &recovery_path, "displaced")
-                .map_err(|source| published_target_changed(path, Some(&recovery_path), source))
+            Ok(PathBuf::from(RECOVERY_DIRECTORY).join(staged.path))
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            let _ = (directory, staged, path, expected);
+            let _ = (directory, recovery_directory, staged, path, expected);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic identity-bound patch commits are not supported on this platform",
@@ -847,16 +876,27 @@ fn move_claimed_to_recovery_namespace(
     kind: &str,
 ) -> io::Result<PathBuf> {
     let recovery = open_recovery_namespace(directory)?;
+    let destination = move_to_recovery_namespace(directory, claimed_path, &recovery, kind)?;
+    Ok(PathBuf::from(RECOVERY_DIRECTORY).join(destination))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn move_to_recovery_namespace(
+    directory: &Dir,
+    source_path: &Path,
+    recovery: &Dir,
+    kind: &str,
+) -> io::Result<PathBuf> {
     for _ in 0..100 {
         let destination = random_patch_path(kind)?;
         match rustix::fs::renameat_with(
             directory,
-            claimed_path,
-            &recovery,
+            source_path,
+            recovery,
             &destination,
             rustix::fs::RenameFlags::NOREPLACE,
         ) {
-            Ok(()) => return Ok(PathBuf::from(RECOVERY_DIRECTORY).join(destination)),
+            Ok(()) => return Ok(destination),
             Err(source) if io::Error::from(source).kind() == io::ErrorKind::AlreadyExists => {
                 continue
             }
@@ -898,6 +938,14 @@ fn open_recovery_namespace(directory: &Dir) -> io::Result<Dir> {
     let recovery = directory.open_dir(RECOVERY_DIRECTORY)?;
     ensure_recovery_gitignore(&recovery)?;
     Ok(recovery)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn open_recovery_namespace(_directory: &Dir) -> io::Result<Dir> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "namespaced patch recovery is not supported on this platform",
+    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1133,12 +1181,22 @@ fn require_regular_file(file: File) -> io::Result<(File, Metadata)> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn exchange_files(directory: &Dir, left: &Path, right: &Path) -> io::Result<()> {
+    exchange_files_between(directory, left, directory, right)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn exchange_files_between(
+    left_directory: &Dir,
+    left: &Path,
+    right_directory: &Dir,
+    right: &Path,
+) -> io::Result<()> {
     rustix::fs::renameat_with(
-        directory,
+        left_directory,
         left,
-        directory,
+        right_directory,
         right,
         rustix::fs::RenameFlags::EXCHANGE,
     )
@@ -1644,6 +1702,25 @@ mod tests {
 
     use super::{git_probe_command, CodingWorkspace};
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn assert_invalid_recovery_namespace_does_not_publish(root: &std::path::Path) {
+        std::fs::write(root.join("target.txt"), "original\n").expect("target is written");
+        let workspace = CodingWorkspace::resolve(root).expect("workspace resolves");
+        let (target, _) = workspace
+            .open_regular_file(std::path::Path::new("target.txt"))
+            .expect("target opens");
+        let snapshot = CodingWorkspace::file_snapshot(&target).expect("target snapshot reads");
+
+        workspace
+            .replace_existing_atomically(std::path::Path::new("target.txt"), b"patched\n", snapshot)
+            .expect_err("invalid recovery namespace must reject the patch");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "original\n"
+        );
+    }
+
     #[test]
     fn git_probe_clears_repository_environment_overrides() {
         let command = git_probe_command();
@@ -1662,6 +1739,70 @@ mod tests {
                 "{name} must be removed from the git probe environment"
             );
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn recovery_namespace_file_is_rejected_before_publication() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-file-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join(super::RECOVERY_DIRECTORY), "occupied\n")
+            .expect("namespace is occupied by a file");
+
+        assert_invalid_recovery_namespace_does_not_publish(&root);
+
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn recovery_namespace_symlink_is_rejected_before_publication() {
+        use std::os::unix::fs::symlink;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-symlink-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::create_dir(root.join("other")).expect("symlink target is created");
+        symlink("other", root.join(super::RECOVERY_DIRECTORY))
+            .expect("recovery namespace symlink is created");
+
+        assert_invalid_recovery_namespace_does_not_publish(&root);
+
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn unexpected_recovery_ignore_rule_is_rejected_before_publication() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-recovery-ignore-{}-{nonce}",
+            std::process::id()
+        ));
+        let recovery = root.join(super::RECOVERY_DIRECTORY);
+        std::fs::create_dir_all(&recovery).expect("recovery namespace is created");
+        std::fs::write(recovery.join(".gitignore"), "unexpected\n")
+            .expect("unexpected ignore rule is written");
+
+        assert_invalid_recovery_namespace_does_not_publish(&root);
+
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
     #[test]
@@ -1934,10 +2075,13 @@ mod tests {
             .expect("original target is moved");
         std::fs::write(root.join("target.txt"), "concurrent\n")
             .expect("concurrent target is written");
+        let recovery =
+            super::open_recovery_namespace(&directory).expect("recovery namespace opens");
 
         let error = workspace
             .commit_existing_file(
                 &directory,
+                &recovery,
                 staging,
                 std::path::Path::new("target.txt"),
                 metadata,
@@ -1998,10 +2142,13 @@ mod tests {
             .expect("equal-length concurrent rewrite succeeds");
         metadata.snapshot.stat =
             super::file_stat_snapshot(&metadata.file.metadata().expect("target metadata reads"));
+        let recovery =
+            super::open_recovery_namespace(&directory).expect("recovery namespace opens");
 
         let error = workspace
             .commit_existing_file(
                 &directory,
+                &recovery,
                 staging,
                 std::path::Path::new("target.txt"),
                 metadata,
@@ -2175,10 +2322,13 @@ mod tests {
             .expect("content is staged");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640))
             .expect("concurrent mode is set");
+        let recovery =
+            super::open_recovery_namespace(&directory).expect("recovery namespace opens");
 
         let error = workspace
             .commit_existing_file(
                 &directory,
+                &recovery,
                 staged,
                 std::path::Path::new("target.txt"),
                 expected,
