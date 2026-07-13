@@ -116,13 +116,12 @@ fn apply_unified_patch(
                 source,
             })?,
         FileChange::Write(content) => {
-            if let Err(source) = workspace.create_new(&resolved.relative_path, content.as_bytes()) {
-                let _ = workspace.remove_file(&resolved.relative_path);
-                return Err(PatchError::Io {
+            workspace
+                .create_new(&resolved.relative_path, content.as_bytes())
+                .map_err(|source| PatchError::Io {
                     path: resolved.relative_path.clone(),
                     source,
-                });
-            }
+                })?;
         }
         FileChange::Delete => workspace
             .remove_file(&resolved.relative_path)

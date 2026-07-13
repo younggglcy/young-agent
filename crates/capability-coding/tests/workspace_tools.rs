@@ -335,6 +335,28 @@ fn file_tools_remain_bound_to_the_open_workspace_when_its_path_is_replaced() {
         std::fs::read_to_string(outside.join("notes.txt")).unwrap(),
         "outside\n"
     );
+
+    let command_call = ToolCall {
+        id: ToolCallId::new("call-stable-root-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "printf command > command.txt" }),
+    };
+    let commanded = runtime.dispatch(
+        command_call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: command_call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Failure { error, .. } = commanded.output else {
+        panic!("command must reject a replaced ambient workspace root");
+    };
+    assert_eq!(error.code, "workspace_changed");
+    assert!(!moved.join("command.txt").exists());
+    assert!(
+        !outside.join("command.txt").exists(),
+        "command cwd must remain the opened workspace"
+    );
 }
 
 #[test]
@@ -536,6 +558,125 @@ fn search_files_observes_cancellation_while_scanning_a_large_line() {
     assert_eq!(error.code, "tool_cancelled");
 }
 
+#[test]
+fn search_files_skips_an_entire_file_when_late_bytes_are_not_utf8() {
+    let test_workspace = TestWorkspace::new("search-binary-file");
+    std::fs::write(
+        test_workspace.path().join("a-binary.txt"),
+        b"needle before invalid bytes\n\xff\n",
+    )
+    .expect("binary fixture is written");
+    std::fs::write(
+        test_workspace.path().join("b-valid.txt"),
+        "needle in valid file\n",
+    )
+    .expect("valid fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-binary-file"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "needle" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success {
+        content, metadata, ..
+    } = result.output
+    else {
+        panic!("search_files should succeed");
+    };
+    assert_eq!(
+        content,
+        vec![ToolContent::Json {
+            value: json!({
+                "matches": [
+                    { "path": "b-valid.txt", "line": 1, "text": "needle in valid file" }
+                ]
+            }),
+        }]
+    );
+    assert_eq!(metadata["binary_files_skipped"], json!(1));
+}
+
+#[test]
+fn search_files_returns_a_deterministic_subset_at_the_match_limit() {
+    let test_workspace = TestWorkspace::new("search-deterministic-limit");
+    let files = test_workspace.path().join("files");
+    std::fs::create_dir(&files).expect("fixture directory is created");
+    for index in (0..205).rev() {
+        std::fs::write(files.join(format!("{index:03}.txt")), "needle\n")
+            .expect("fixture is written");
+    }
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-deterministic-limit"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "needle", "path": "files" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success {
+        content, metadata, ..
+    } = result.output
+    else {
+        panic!("search_files should succeed");
+    };
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("search_files should return structured JSON");
+    };
+    let matches = value["matches"].as_array().expect("matches are an array");
+    assert_eq!(matches.len(), 200);
+    assert_eq!(matches.first().unwrap()["path"], json!("files/000.txt"));
+    assert_eq!(matches.last().unwrap()["path"], json!("files/199.txt"));
+    assert_eq!(metadata["truncated"], json!(true));
+}
+
+#[test]
+fn search_files_bounds_the_complete_serialized_output() {
+    let test_workspace = TestWorkspace::new("search-output-budget");
+    let query = "\0".repeat(8 * 1024);
+    std::fs::write(
+        test_workspace.path().join("control-bytes.txt"),
+        format!("{query}\n"),
+    )
+    .expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-output-budget"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": query }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let serialized_len = serde_json::to_vec(&result.output)
+        .expect("tool output serializes")
+        .len();
+    let ToolOutput::Success { metadata, .. } = result.output else {
+        panic!("search_files should succeed");
+    };
+    assert!(serialized_len <= 64 * 1024, "serialized output is bounded");
+    assert_eq!(metadata["query_truncated"], json!(true));
+    assert_eq!(metadata["query_bytes"], json!(8 * 1024));
+}
+
 #[cfg(unix)]
 #[test]
 fn search_files_rejects_an_explicit_symlink_escape() {
@@ -620,6 +761,39 @@ fn apply_patch_updates_a_workspace_file_after_approval() {
     );
     assert_eq!(metadata["files_changed"], json!(1));
     assert!(extensions.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_patch_preserves_private_permissions() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let test_workspace = TestWorkspace::new("patch-permissions");
+    let notes = test_workspace.path().join("private.txt");
+    std::fs::write(&notes, "old\n").expect("fixture is written");
+    std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o600))
+        .expect("fixture permissions are set");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-private-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- a/private.txt\n+++ b/private.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert_eq!(std::fs::metadata(notes).unwrap().mode() & 0o777, 0o600);
 }
 
 #[test]
@@ -1099,4 +1273,67 @@ fn run_command_cancellation_terminates_descendant_processes() {
         !test_workspace.path().join("descendant.txt").exists(),
         "cancelled descendants must not mutate the workspace later"
     );
+}
+
+#[test]
+fn run_command_bounds_background_process_pipe_lifetime() {
+    let test_workspace = TestWorkspace::new("command-background-pipe");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-background-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "sleep 60 &" }),
+    };
+    let started = std::time::Instant::now();
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let ToolOutput::Success { metadata, .. } = result.output else {
+        panic!("completed shell command should return");
+    };
+    assert_eq!(metadata["output_incomplete"], json!(true));
+}
+
+#[test]
+fn run_command_cancellation_still_terminates_after_the_shell_leader_exits() {
+    let test_workspace = TestWorkspace::new("command-cancel-after-leader");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-cancel-after-leader"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "tail -f /dev/null &" }),
+    };
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation_trigger = cancellation.clone();
+    let trigger = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        cancellation_trigger.store(true, Ordering::Relaxed);
+    });
+    let started = std::time::Instant::now();
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        cancellation,
+    );
+    trigger.join().expect("cancellation trigger finishes");
+
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("cancelled command must fail");
+    };
+    assert_eq!(error.code, "tool_cancelled");
 }

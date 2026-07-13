@@ -3,19 +3,20 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cap_std::fs::{Dir, File, ReadDir};
+use cap_std::fs::{Dir, DirEntry, File};
 use serde_json::{json, Value};
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
-    display_relative_path, failure, workspace_path_failure, ToolArguments,
-    MAX_TOOL_CONTENT_SERIALIZED_BYTES,
+    display_relative_path, failure, truncate_json_string, workspace_path_failure, ToolArguments,
+    MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
 
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
+const MAX_SEARCH_QUERY_METADATA_SERIALIZED_BYTES: usize = 4 * 1024;
 
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
@@ -84,33 +85,12 @@ pub(crate) fn execute(
         }
     }
 
-    ToolOutput::Success {
-        content: vec![ToolContent::Json {
-            value: json!({ "matches": results.matches }),
-        }],
-        metadata: BTreeMap::from([
-            ("path".to_string(), json!(path)),
-            ("query".to_string(), json!(query)),
-            ("matches".to_string(), json!(results.matches.len())),
-            ("bytes_searched".to_string(), json!(results.bytes_searched)),
-            (
-                "binary_files_skipped".to_string(),
-                json!(results.binary_files_skipped),
-            ),
-            (
-                "lines_truncated".to_string(),
-                json!(results.lines_truncated),
-            ),
-            ("truncated".to_string(), json!(results.truncated)),
-            ("workspace".to_string(), workspace.metadata()),
-        ]),
-        extensions: BTreeMap::new(),
-    }
+    bounded_search_output(workspace, path, query, results)
 }
 
 struct DirectoryFrame {
     relative_path: PathBuf,
-    entries: ReadDir,
+    entries: std::vec::IntoIter<DirEntry>,
 }
 
 fn search_directory(
@@ -120,13 +100,7 @@ fn search_directory(
     cancellation: &AtomicBool,
     results: &mut SearchResults,
 ) -> Result<(), ToolOutput> {
-    let entries = root.entries().map_err(|source| {
-        failure(
-            "workspace_io_error",
-            format!("failed to list '{}': {source}", relative_path.display()),
-            source.kind() == std::io::ErrorKind::Interrupted,
-        )
-    })?;
+    let entries = sorted_entries(&root, &relative_path, cancellation)?;
     let mut stack = vec![DirectoryFrame {
         relative_path,
         entries,
@@ -144,13 +118,6 @@ fn search_directory(
             stack.pop();
             continue;
         };
-        let entry = entry.map_err(|source| {
-            failure(
-                "workspace_io_error",
-                format!("failed to read a directory entry: {source}"),
-                source.kind() == std::io::ErrorKind::Interrupted,
-            )
-        })?;
         let file_type = entry.file_type().map_err(|source| {
             failure(
                 "workspace_io_error",
@@ -174,13 +141,7 @@ fn search_directory(
                     source.kind() == std::io::ErrorKind::Interrupted,
                 )
             })?;
-            let entries = directory.entries().map_err(|source| {
-                failure(
-                    "workspace_io_error",
-                    format!("failed to list '{}': {source}", entry_path.display()),
-                    source.kind() == std::io::ErrorKind::Interrupted,
-                )
-            })?;
+            let entries = sorted_entries(&directory, &entry_path, cancellation)?;
             stack.push(DirectoryFrame {
                 relative_path: entry_path,
                 entries,
@@ -203,6 +164,39 @@ fn search_directory(
     Ok(())
 }
 
+fn sorted_entries(
+    directory: &Dir,
+    relative_path: &Path,
+    cancellation: &AtomicBool,
+) -> Result<std::vec::IntoIter<DirEntry>, ToolOutput> {
+    let entries = directory.entries().map_err(|source| {
+        failure(
+            "workspace_io_error",
+            format!("failed to list '{}': {source}", relative_path.display()),
+            source.kind() == std::io::ErrorKind::Interrupted,
+        )
+    })?;
+    let mut sorted = Vec::new();
+    for entry in entries {
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(failure(
+                "tool_cancelled",
+                "search_files was cancelled",
+                false,
+            ));
+        }
+        sorted.push(entry.map_err(|source| {
+            failure(
+                "workspace_io_error",
+                format!("failed to read a directory entry: {source}"),
+                source.kind() == std::io::ErrorKind::Interrupted,
+            )
+        })?);
+    }
+    sorted.sort_by_key(DirEntry::file_name);
+    Ok(sorted.into_iter())
+}
+
 fn search_file(
     mut file: File,
     display_path: &str,
@@ -210,9 +204,11 @@ fn search_file(
     cancellation: &AtomicBool,
     results: &mut SearchResults,
 ) -> Result<(), ToolOutput> {
+    let checkpoint = results.checkpoint();
     let mut buffer = [0u8; 8 * 1024];
     let mut line = LineState::default();
     let mut line_number = 1u64;
+    let mut utf8 = Utf8Validator::default();
 
     loop {
         if cancellation.load(Ordering::Relaxed) {
@@ -230,12 +226,20 @@ fn search_file(
             )
         })?;
         if bytes_read == 0 {
+            if !utf8.finish() {
+                results.discard_binary_file(checkpoint);
+                return Ok(());
+            }
             if line.bytes_seen > 0 {
                 finish_line(display_path, line_number, &line, results)?;
             }
             return Ok(());
         }
         results.bytes_searched = results.bytes_searched.saturating_add(bytes_read as u64);
+        if !utf8.feed(&buffer[..bytes_read]) {
+            results.discard_binary_file(checkpoint);
+            return Ok(());
+        }
 
         let mut start = 0usize;
         for newline in buffer[..bytes_read]
@@ -245,9 +249,6 @@ fn search_file(
         {
             line.feed(&buffer[start..newline], pattern);
             finish_line(display_path, line_number, &line, results)?;
-            if results.limit_reached {
-                return Ok(());
-            }
             line = LineState::default();
             line_number += 1;
             start = newline + 1;
@@ -262,14 +263,17 @@ fn finish_line(
     line: &LineState,
     results: &mut SearchResults,
 ) -> Result<(), ToolOutput> {
-    if !line.matched {
+    if !line.matched || results.limit_reached {
         return Ok(());
     }
     let text = match visible_utf8_prefix(&line.visible) {
         Ok(text) => text.strip_suffix('\r').unwrap_or(text),
         Err(()) => {
-            results.binary_files_skipped += 1;
-            return Ok(());
+            return Err(failure(
+                "workspace_io_error",
+                "UTF-8 validation drifted",
+                false,
+            ))
         }
     };
     if line.truncated {
@@ -306,6 +310,36 @@ struct SearchResults {
     lines_truncated: u64,
     truncated: bool,
     limit_reached: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SearchCheckpoint {
+    matches_len: usize,
+    serialized_bytes: usize,
+    lines_truncated: u64,
+    truncated: bool,
+    limit_reached: bool,
+}
+
+impl SearchResults {
+    fn checkpoint(&self) -> SearchCheckpoint {
+        SearchCheckpoint {
+            matches_len: self.matches.len(),
+            serialized_bytes: self.serialized_bytes,
+            lines_truncated: self.lines_truncated,
+            truncated: self.truncated,
+            limit_reached: self.limit_reached,
+        }
+    }
+
+    fn discard_binary_file(&mut self, checkpoint: SearchCheckpoint) {
+        self.matches.truncate(checkpoint.matches_len);
+        self.serialized_bytes = checkpoint.serialized_bytes;
+        self.lines_truncated = checkpoint.lines_truncated;
+        self.truncated = checkpoint.truncated;
+        self.limit_reached = checkpoint.limit_reached;
+        self.binary_files_skipped = self.binary_files_skipped.saturating_add(1);
+    }
 }
 
 #[derive(Default)]
@@ -369,6 +403,86 @@ impl LiteralPattern {
             matched += 1;
         }
         matched
+    }
+}
+
+#[derive(Default)]
+struct Utf8Validator {
+    pending: Vec<u8>,
+    validation_buffer: Vec<u8>,
+}
+
+impl Utf8Validator {
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.validation_buffer.clear();
+        self.validation_buffer.extend_from_slice(&self.pending);
+        self.validation_buffer.extend_from_slice(bytes);
+        self.pending.clear();
+
+        match std::str::from_utf8(&self.validation_buffer) {
+            Ok(_) => true,
+            Err(error) if error.error_len().is_none() => {
+                self.pending
+                    .extend_from_slice(&self.validation_buffer[error.valid_up_to()..]);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn finish(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+fn bounded_search_output(
+    workspace: &CodingWorkspace,
+    path: &str,
+    query: &str,
+    mut results: SearchResults,
+) -> ToolOutput {
+    let (metadata_query, query_truncated) =
+        truncate_json_string(query, MAX_SEARCH_QUERY_METADATA_SERIALIZED_BYTES);
+    loop {
+        let output = ToolOutput::Success {
+            content: vec![ToolContent::Json {
+                value: json!({ "matches": &results.matches }),
+            }],
+            metadata: BTreeMap::from([
+                ("path".to_string(), json!(path)),
+                ("query".to_string(), json!(metadata_query)),
+                ("query_bytes".to_string(), json!(query.len())),
+                ("query_truncated".to_string(), json!(query_truncated)),
+                ("matches".to_string(), json!(results.matches.len())),
+                ("bytes_searched".to_string(), json!(results.bytes_searched)),
+                (
+                    "binary_files_skipped".to_string(),
+                    json!(results.binary_files_skipped),
+                ),
+                (
+                    "lines_truncated".to_string(),
+                    json!(results.lines_truncated),
+                ),
+                ("truncated".to_string(), json!(results.truncated)),
+                ("workspace".to_string(), workspace.metadata()),
+            ]),
+            extensions: BTreeMap::new(),
+        };
+        if serde_json::to_vec(&output)
+            .expect("search output JSON serializes")
+            .len()
+            <= MAX_OUTPUT_BYTES
+        {
+            return output;
+        }
+        if results.matches.pop().is_none() {
+            return failure(
+                "output_too_large",
+                "search metadata exceeds the tool output budget",
+                false,
+            );
+        }
+        results.truncated = true;
     }
 }
 

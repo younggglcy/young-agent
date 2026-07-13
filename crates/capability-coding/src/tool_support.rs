@@ -87,6 +87,7 @@ pub(crate) fn truncate_json_string(value: &str, max_serialized_bytes: usize) -> 
 }
 
 pub(crate) fn display_relative_path(path: &Path) -> String {
+    let path = path.strip_prefix(".").unwrap_or(path);
     if path.as_os_str().is_empty() {
         ".".to_string()
     } else {

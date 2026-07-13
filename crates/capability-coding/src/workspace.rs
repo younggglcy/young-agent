@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, File, OpenOptions};
+use cap_std::fs::{Dir, File, OpenOptions, Permissions};
 use serde_json::{json, Value};
 
 #[derive(Clone)]
@@ -105,50 +105,34 @@ impl CodingWorkspace {
         self.root_dir.open_dir(path)
     }
 
+    pub(crate) fn command_working_directory(&self) -> io::Result<PathBuf> {
+        let authority = self.root_dir.dir_metadata()?;
+        let ambient = std::fs::metadata(&self.context.root)?;
+
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt as _;
+            use std::os::unix::fs::MetadataExt as _;
+
+            if authority.dev() != ambient.dev() || authority.ino() != ambient.ino() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "workspace root identity changed after it was selected",
+                ));
+            }
+        }
+        Ok(self.context.root.clone())
+    }
+
     pub(crate) fn replace_existing_atomically(
         &self,
         path: &Path,
         content: &[u8],
     ) -> io::Result<()> {
-        use std::io::Write;
-
-        static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
-
         let permissions = self.root_dir.metadata(path)?.permissions();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp_path = None;
-        let mut temp_file = None;
-        for _ in 0..100 {
-            let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
-            let candidate = parent.join(format!(
-                ".young-agent-patch-{}-{nonce}.tmp",
-                std::process::id()
-            ));
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            match self.root_dir.open_with(&candidate, &options) {
-                Ok(file) => {
-                    temp_path = Some(candidate);
-                    temp_file = Some(file);
-                    break;
-                }
-                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(source),
-            }
-        }
-        let temp_path = temp_path.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "could not allocate a unique patch staging file",
-            )
-        })?;
-        let mut temp_file = temp_file.expect("temp path and file are set together");
-        let result = (|| {
-            temp_file.write_all(content)?;
-            temp_file.sync_all()?;
-            self.root_dir.set_permissions(&temp_path, permissions)?;
-            self.root_dir.rename(&temp_path, &self.root_dir, path)
-        })();
+        let temp_path = self.stage_content(parent, content, Some(permissions))?;
+        let result = self.root_dir.rename(&temp_path, &self.root_dir, path);
         if result.is_err() {
             let _ = self.root_dir.remove_file(&temp_path);
         }
@@ -156,12 +140,11 @@ impl CodingWorkspace {
     }
 
     pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
-        use std::io::Write;
-
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = self.root_dir.open_with(path, &options)?;
-        file.write_all(content)
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_path = self.stage_content(parent, content, None)?;
+        let result = self.root_dir.hard_link(&temp_path, &self.root_dir, path);
+        let _ = self.root_dir.remove_file(&temp_path);
+        result
     }
 
     pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -214,6 +197,49 @@ impl CodingWorkspace {
                 source,
             }
         }
+    }
+
+    fn stage_content(
+        &self,
+        parent: &Path,
+        content: &[u8],
+        permissions: Option<Permissions>,
+    ) -> io::Result<PathBuf> {
+        use std::io::Write;
+
+        static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
+
+        for _ in 0..100 {
+            let nonce = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+            let candidate = parent.join(format!(
+                ".young-agent-patch-{}-{nonce}.tmp",
+                std::process::id()
+            ));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            let mut file = match self.root_dir.open_with(&candidate, &options) {
+                Ok(file) => file,
+                Err(source) if source.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => return Err(source),
+            };
+            let result = (|| {
+                if let Some(permissions) = permissions {
+                    file.set_permissions(permissions)?;
+                }
+                file.write_all(content)?;
+                file.sync_all()
+            })();
+            drop(file);
+            if let Err(source) = result {
+                let _ = self.root_dir.remove_file(&candidate);
+                return Err(source);
+            }
+            return Ok(candidate);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique patch staging file",
+        ))
     }
 }
 
@@ -430,5 +456,51 @@ impl Error for CodingWorkspaceError {
             Self::GitOutputUtf8(source) => Some(source),
             Self::RootIsNotDirectory { .. } | Self::UnexpectedGitOutput { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::CodingWorkspace;
+
+    #[test]
+    fn create_new_never_removes_an_existing_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-create-new-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        std::fs::write(root.join("owned.txt"), "concurrent owner\n")
+            .expect("existing file is written");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+
+        let error = workspace
+            .create_new(std::path::Path::new("owned.txt"), b"patch content\n")
+            .expect_err("create-new commit must not replace an existing file");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(root.join("owned.txt")).unwrap(),
+            "concurrent owner\n"
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".young-agent-patch-")
+            }),
+            "failed no-replace commits must clean their staging file"
+        );
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 }

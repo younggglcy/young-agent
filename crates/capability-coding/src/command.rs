@@ -1,14 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
-use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use command_group::CommandGroup;
+use command_group::{CommandGroup, GroupChild};
 use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
@@ -37,12 +36,7 @@ pub(crate) fn execute(
         Ok(command) => command,
         Err(output) => return output,
     };
-    let outcome = match run_shell_command(
-        workspace.context().root(),
-        command,
-        cancellation,
-        MAX_OUTPUT_BYTES,
-    ) {
+    let outcome = match run_shell_command(workspace, command, cancellation, MAX_OUTPUT_BYTES) {
         Ok(outcome) => outcome,
         Err(error) => return failure(error.code(), error.to_string(), error.retryable()),
     };
@@ -95,7 +89,7 @@ pub(crate) struct CommandOutcome {
 }
 
 fn run_shell_command(
-    workspace_root: &Path,
+    workspace: &CodingWorkspace,
     command: &str,
     cancellation: &AtomicBool,
     max_output_bytes: usize,
@@ -105,8 +99,11 @@ fn run_shell_command(
     }
 
     let mut process = shell_command(command);
+    let working_directory = workspace
+        .command_working_directory()
+        .map_err(CommandError::WorkspaceChanged)?;
     let mut child = process
-        .current_dir(workspace_root)
+        .current_dir(working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -134,13 +131,17 @@ fn run_shell_command(
     let mut exited_at = None;
     let mut output_incomplete = false;
     let mut cancelled = false;
+    let mut forced_at = None;
 
     loop {
-        if cancellation.load(Ordering::Relaxed) && status.is_none() {
+        if cancellation.load(Ordering::Relaxed) && !cancelled {
             cancelled = true;
-            child.kill().map_err(CommandError::Kill)?;
-            status = Some(child.wait().map_err(CommandError::Wait)?);
+            terminate_command_group(&mut child)?;
+            if status.is_none() {
+                status = Some(child.wait().map_err(CommandError::Wait)?);
+            }
             exited_at = Some(Instant::now());
+            forced_at = Some(Instant::now());
         }
 
         receive_stream_message(
@@ -161,18 +162,30 @@ fn run_shell_command(
         if status.is_some() && streams_done == 2 {
             break;
         }
-        if exited_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
-            output_incomplete = true;
+        if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
             break;
+        }
+        if forced_at.is_none()
+            && exited_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE)
+        {
+            output_incomplete = true;
+            terminate_command_group(&mut child)?;
+            forced_at = Some(Instant::now());
         }
     }
 
-    stdout_reader
-        .join()
-        .map_err(|_| CommandError::ReaderPanicked)?;
-    stderr_reader
-        .join()
-        .map_err(|_| CommandError::ReaderPanicked)?;
+    if streams_done == 2 {
+        stdout_reader
+            .join()
+            .map_err(|_| CommandError::ReaderPanicked)?;
+        stderr_reader
+            .join()
+            .map_err(|_| CommandError::ReaderPanicked)?;
+    } else {
+        drop(receiver);
+        drop(stdout_reader);
+        drop(stderr_reader);
+    }
     if let Some(source) = stream_error {
         return Err(CommandError::ReadOutput(source));
     }
@@ -190,6 +203,21 @@ fn run_shell_command(
         stderr_truncated: stderr_capture.truncated || output_incomplete,
         output_incomplete,
     })
+}
+
+fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
+    match child.kill() {
+        Ok(()) => Ok(()),
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(CommandError::Kill(source)),
+    }
 }
 
 #[cfg(unix)]
@@ -310,6 +338,7 @@ impl CapturedStream {
 #[derive(Debug)]
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
+    WorkspaceChanged(std::io::Error),
     Kill(std::io::Error),
     Wait(std::io::Error),
     ReadOutput(std::io::Error),
@@ -321,6 +350,7 @@ impl CommandError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
+            Self::WorkspaceChanged(_) => "workspace_changed",
             Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) | Self::ReaderPanicked => {
                 "command_io_error"
             }
@@ -341,6 +371,12 @@ impl fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(source) => write!(formatter, "failed to start command: {source}"),
+            Self::WorkspaceChanged(source) => {
+                write!(
+                    formatter,
+                    "selected workspace is no longer available: {source}"
+                )
+            }
             Self::Kill(source) => write!(formatter, "failed to terminate command group: {source}"),
             Self::Wait(source) => write!(formatter, "failed to wait for command: {source}"),
             Self::ReadOutput(source) => {
