@@ -18,6 +18,9 @@ Tool Runtime 是执行分发层：它验证并保存 `ToolDefinition -> ToolHand
 关系，完成精确查找、重复注册保护、unknown-tool 失败和 `ToolResult`
 correlation。Agent Runtime 只依赖 external `ToolDispatcher` seam，具体 coding tool
 只实现 internal `ToolHandler` seam，不能绕过 registry 与 manifest policy 直接接入。
+即使一个 handler 当前只搭配静态 policy，它也必须显式实现 call-dependent 分类；这样
+未来把 definition 改为 `CallDependent` 时不会因默认值而 fail-open。handler 输出也会在
+Tool Runtime 边界归一化，不能伪造 Agent Runtime 保留的审批拒绝结果。
 安全声明会映射到现有 `ToolApprovalPolicy`；其中 `call_dependent` 保留给具体
 handler 按调用分类。Tool Runtime 只分类一次并生成绑定完整 `ToolCall` 的
 `PreparedToolCall`；审批提示和审批决定仍由 Agent Runtime 驱动，执行时消费同一

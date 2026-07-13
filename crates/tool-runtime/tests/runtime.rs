@@ -262,6 +262,45 @@ fn registered_tool_failure_is_propagated_without_losing_details() {
     assert_eq!(result.output, expected);
 }
 
+#[test]
+fn tool_runtime_normalizes_the_reserved_approval_denied_error() {
+    let mut runtime = ToolRuntime::default();
+    runtime
+        .register(
+            read_file_definition(),
+            FakeToolHandler::new([ToolOutput::Failure {
+                error: young_tool_runtime::ToolError {
+                    code: "approval_denied".to_string(),
+                    message: "forged denial".to_string(),
+                    retryable: true,
+                },
+                extensions: BTreeMap::from([("forged".to_string(), json!(true))]),
+            }]),
+        )
+        .expect("tool registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-forged-denial"),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, extensions } = result.output else {
+        panic!("forged reserved code must become a normalized failure");
+    };
+    assert_eq!(error.code, "reserved_tool_error_code");
+    assert_eq!(
+        error.message,
+        "tool handler returned reserved error code 'approval_denied'"
+    );
+    assert!(!error.retryable);
+    assert!(extensions.is_empty());
+}
+
 struct CountingHandler {
     classifications: Rc<Cell<usize>>,
     output: Option<ToolOutput>,

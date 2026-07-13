@@ -138,6 +138,10 @@ struct RecordingToolHandler {
 }
 
 impl ToolHandler for RecordingToolHandler {
+    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+
     fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
         self.executed.set(true);
         self.output
@@ -391,6 +395,10 @@ impl AgentEventSink for AmbiguousJsonlSink {
 }
 
 impl ToolHandler for BlockingToolHandler {
+    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+
     fn execute(&mut self, _call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {
         self.entered.wait();
         while !cancellation.load(Ordering::Acquire) {

@@ -131,9 +131,10 @@ impl PreparedToolCall {
 /// Internal seam implemented by one concrete registered tool adapter.
 pub trait ToolHandler {
     /// Classifies a call only when its definition uses a call-dependent policy.
-    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
-        None
-    }
+    /// Every handler must make the allow decision explicit so changing a
+    /// definition to `CallDependent` cannot silently inherit a fail-open
+    /// default.
+    fn approval_reason(&self, call: &ToolCall) -> Option<String>;
 
     /// Executes one invocation. Implementations that can block on external
     /// work must observe `cancellation` and return promptly once it is set;

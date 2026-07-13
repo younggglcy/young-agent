@@ -45,6 +45,12 @@ struct UnimplementedCodingTool {
 }
 
 impl ToolHandler for UnimplementedCodingTool {
+    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+        // Phase-one stubs cannot perform side effects. Real call-dependent
+        // handlers must replace this explicit classification in their issue.
+        None
+    }
+
     fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
         ToolOutput::Failure {
             error: ToolError {

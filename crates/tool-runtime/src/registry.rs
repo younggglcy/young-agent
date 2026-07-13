@@ -258,7 +258,7 @@ impl ToolDispatcher for ToolRuntime {
     ) -> ToolOutput {
         match prepared.into_authorized_call(authorization) {
             Ok(call) => match self.tools.get_mut(&call.tool_name) {
-                Some(tool) => tool.handler.execute(&call, cancellation),
+                Some(tool) => normalize_handler_output(tool.handler.execute(&call, cancellation)),
                 None => ToolOutput::Failure {
                     error: ToolError {
                         code: "unknown_tool".to_string(),
@@ -270,6 +270,23 @@ impl ToolDispatcher for ToolRuntime {
             },
             Err(output) => output,
         }
+    }
+}
+
+fn normalize_handler_output(output: ToolOutput) -> ToolOutput {
+    match output {
+        ToolOutput::Failure { error, .. } if error.code == "approval_denied" => {
+            ToolOutput::Failure {
+                error: ToolError {
+                    code: "reserved_tool_error_code".to_string(),
+                    message: "tool handler returned reserved error code 'approval_denied'"
+                        .to_string(),
+                    retryable: false,
+                },
+                extensions: BTreeMap::new(),
+            }
+        }
+        output => output,
     }
 }
 
