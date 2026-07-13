@@ -307,7 +307,9 @@ impl JsonlEventStore {
         let last_event = if state.fully_validated {
             self.read_last_event(&mut state.file, file_length, state.line_count.max(1))?
         } else {
-            let records = self.read_all_records()?;
+            // The append path already owns the exclusive file lock. Re-locking
+            // it through the public read path can deadlock on some platforms.
+            let records = self.read_all_records_unlocked()?;
             state.line_count = records.len();
             state.fully_validated = true;
             records
@@ -504,6 +506,37 @@ impl JsonlEventStore {
             path: self.path.clone(),
             source,
         })?;
+        file.lock_shared()
+            .map_err(|source| EventStoreError::LockForRead {
+                path: self.path.clone(),
+                source,
+            })?;
+        let read_result = self.read_all_records_from(&file);
+        let unlock_result = file
+            .unlock()
+            .map_err(|source| EventStoreError::LockForRead {
+                path: self.path.clone(),
+                source,
+            });
+        match (read_result, unlock_result) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(records), Ok(())) => Ok(records),
+        }
+    }
+
+    fn read_all_records_unlocked(&self) -> Result<Vec<PersistedAgentEvent>, EventStoreError> {
+        let file = File::open(&self.path).map_err(|source| EventStoreError::OpenForRead {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.read_all_records_from(&file)
+    }
+
+    fn read_all_records_from(
+        &self,
+        file: &File,
+    ) -> Result<Vec<PersistedAgentEvent>, EventStoreError> {
         let mut reader = BufReader::new(file);
         let mut events = Vec::new();
         let mut line_number = 0;
@@ -724,6 +757,10 @@ pub enum EventStoreError {
         path: PathBuf,
         source: io::Error,
     },
+    LockForRead {
+        path: PathBuf,
+        source: io::Error,
+    },
     ReadRecord {
         path: PathBuf,
         line: usize,
@@ -799,6 +836,11 @@ impl fmt::Display for EventStoreError {
                 "failed to open Event Log '{}' for reading: {source}",
                 path.display()
             ),
+            Self::LockForRead { path, source } => write!(
+                formatter,
+                "failed to lock Event Log '{}' for reading: {source}",
+                path.display()
+            ),
             Self::ReadRecord { path, line, source } => write!(
                 formatter,
                 "failed to read Event Log '{}' at line {line}: {source}",
@@ -854,6 +896,7 @@ impl Error for EventStoreError {
             | Self::RepairTail { source, .. }
             | Self::Append { source, .. }
             | Self::OpenForRead { source, .. }
+            | Self::LockForRead { source, .. }
             | Self::ReadRecord { source, .. } => Some(source),
             Self::UnterminatedLog { .. }
             | Self::TruncatedRecord { .. }

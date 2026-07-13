@@ -1,7 +1,9 @@
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use young_agent_runtime::{
@@ -261,6 +263,73 @@ fn independent_store_instances_atomically_reject_the_same_sequence() {
             .expect("winning event should remain canonical")
             .len(),
         1
+    );
+}
+
+#[test]
+fn reader_waits_for_a_locked_partial_record_to_commit() {
+    let log = TestLog::new("reader-waits-for-record-commit");
+    let mut store = JsonlEventStore::new(log.path());
+    let first = agent_event(json!({ "type": "run_started", "run_id": "run-001" }));
+    <JsonlEventStore as AgentEventSink>::append(&mut store, EventSequence::new(1), &first)
+        .expect("first event should append");
+    let second = turn_started_event().with_event_sequence(EventSequence::new(2));
+    let mut record = serde_json::to_vec(&second).expect("second event should encode");
+    record.push(b'\n');
+    let split = record.len() / 2;
+
+    let (partial_tx, partial_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let writer_path = log.path().to_path_buf();
+    let writer = thread::spawn(move || {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(writer_path)
+            .expect("writer should open Event Log");
+        file.lock().expect("writer should lock Event Log");
+        file.write_all(&record[..split])
+            .and_then(|()| file.flush())
+            .expect("partial record should reach the file");
+        partial_tx
+            .send(())
+            .expect("writer should signal partial write");
+        continue_rx
+            .recv()
+            .expect("writer should await reader check");
+        file.write_all(&record[split..])
+            .and_then(|()| file.flush())
+            .expect("record should finish");
+        file.unlock().expect("writer should unlock Event Log");
+    });
+    partial_rx.recv().expect("partial record should be visible");
+
+    let (reader_started_tx, reader_started_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let reader_path = log.path().to_path_buf();
+    let reader = thread::spawn(move || {
+        reader_started_tx
+            .send(())
+            .expect("reader should signal start");
+        result_tx
+            .send(JsonlEventStore::new(reader_path).read_all())
+            .expect("reader should send result");
+    });
+    reader_started_rx.recv().expect("reader should start");
+    assert!(
+        result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "reader must block instead of observing the partial record"
+    );
+
+    continue_tx.send(()).expect("writer should finish record");
+    writer.join().expect("writer should finish cleanly");
+    let events = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reader should finish after commit")
+        .expect("reader should observe a canonical snapshot");
+    reader.join().expect("reader should finish cleanly");
+    assert_eq!(
+        events,
+        [first.with_event_sequence(EventSequence::new(1)), second]
     );
 }
 
@@ -534,6 +603,63 @@ fn strict_replay_requires_approval_resolution_before_a_tool_result() {
     )
     .expect("legacy compatibility must be explicit");
     assert_eq!(legacy.status(), &RunStatus::Running);
+}
+
+#[test]
+fn sequenced_logs_cannot_opt_into_legacy_approval_compatibility() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            }
+        })),
+        agent_event(json!({
+            "type": "approval_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "request": {
+                "id": "approval-001",
+                "call": {
+                    "id": "tool-call-001",
+                    "tool_name": "run_command",
+                    "arguments": { "command": "cargo test" }
+                },
+                "reason": "command requires approval"
+            }
+        })),
+        agent_event(json!({
+            "type": "tool_result",
+            "run_id": "run-001",
+            "turn_id": "turn-001",
+            "result": {
+                "call_id": "tool-call-001",
+                "output": { "status": "success", "content": [] }
+            }
+        })),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, event)| event.with_event_sequence(EventSequence::new(index as u64 + 1)))
+    .collect();
+
+    let error = young_event_store::replay_events_with_compatibility(
+        events,
+        ReplayCompatibility::LegacyApprovalWithoutResolution,
+    )
+    .expect_err("sequenced logs must use modern approval semantics");
+
+    assert!(matches!(
+        error,
+        ReplayError::LegacyCompatibilityForSequencedLog { event_number: 1 }
+    ));
 }
 
 #[test]

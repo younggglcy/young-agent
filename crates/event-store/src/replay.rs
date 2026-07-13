@@ -184,6 +184,17 @@ fn replay_events_with_mode(
         Some(_) => return Err(ReplayError::FirstEventIsNotRunStarted),
         None => return Err(ReplayError::EmptyLog),
     };
+    if compatibility == ReplayCompatibility::LegacyApprovalWithoutResolution {
+        if let Some((index, _)) = events
+            .iter()
+            .enumerate()
+            .find(|(_, event)| event.event_sequence().is_some())
+        {
+            return Err(ReplayError::LegacyCompatibilityForSequencedLog {
+                event_number: index + 1,
+            });
+        }
+    }
 
     let mut status = RunStatus::Running;
     let mut tool_calls = Vec::<ReplayedToolCallIndex>::new();
@@ -648,6 +659,9 @@ pub enum ReplayError {
     MixedApprovalLogFormats {
         event_number: usize,
     },
+    LegacyCompatibilityForSequencedLog {
+        event_number: usize,
+    },
     TerminalWithUnresolvedToolCalls {
         event_number: usize,
         call_ids: Vec<ToolCallId>,
@@ -826,6 +840,10 @@ impl fmt::Display for ReplayError {
             Self::MixedApprovalLogFormats { event_number } => write!(
                 formatter,
                 "Event Log event {event_number} mixes legacy approvals without resolutions and modern ApprovalResolved events"
+            ),
+            Self::LegacyCompatibilityForSequencedLog { event_number } => write!(
+                formatter,
+                "Event Log event {event_number} is sequenced and cannot use pre-ApprovalResolved compatibility"
             ),
             Self::TerminalWithUnresolvedToolCalls {
                 event_number,
