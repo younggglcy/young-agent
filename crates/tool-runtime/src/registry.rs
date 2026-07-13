@@ -34,28 +34,44 @@ pub struct ToolDefinition {
 
 impl ToolDefinition {
     pub fn validate(&self) -> Result<(), ToolDefinitionError> {
-        require_non_empty("name", &self.name)?;
-        require_non_empty("description", &self.description)?;
-        require_non_empty("capability.id", &self.capability.id)?;
-        require_non_empty("capability.version", &self.capability.version)?;
-        if !self.input_schema.is_object() {
+        Self::validate_fields(
+            &self.name,
+            &self.description,
+            &self.input_schema,
+            self.output_schema.as_ref(),
+            &self.capability,
+            &self.approval_policy,
+            self.mcp.as_ref(),
+        )
+    }
+
+    pub(crate) fn validate_fields(
+        name: &str,
+        description: &str,
+        input_schema: &Value,
+        output_schema: Option<&Value>,
+        capability: &CapabilityRef,
+        approval_policy: &ToolApprovalPolicy,
+        mcp: Option<&McpCompatibility>,
+    ) -> Result<(), ToolDefinitionError> {
+        require_non_empty("name", name)?;
+        require_non_empty("description", description)?;
+        require_non_empty("capability.id", &capability.id)?;
+        require_non_empty("capability.version", &capability.version)?;
+        if !input_schema.is_object() {
             return Err(ToolDefinitionError::new("input_schema must be an object"));
         }
-        if self
-            .output_schema
-            .as_ref()
-            .is_some_and(|schema| !schema.is_object())
-        {
+        if output_schema.is_some_and(|schema| !schema.is_object()) {
             return Err(ToolDefinitionError::new("output_schema must be an object"));
         }
-        match &self.approval_policy {
+        match approval_policy {
             ToolApprovalPolicy::RequiresApproval { reason }
             | ToolApprovalPolicy::AlwaysReject { reason } => {
                 require_non_empty("approval policy reason", reason)?;
             }
             ToolApprovalPolicy::AlwaysAllow | ToolApprovalPolicy::CallDependent => {}
         }
-        if let Some(mcp) = &self.mcp {
+        if let Some(mcp) = mcp {
             require_non_empty("mcp.server", &mcp.server)?;
             require_non_empty("mcp.tool_name", &mcp.tool_name)?;
             require_non_empty("mcp.protocol_version", &mcp.protocol_version)?;

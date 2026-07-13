@@ -28,17 +28,18 @@ impl CapabilityManifest {
         manifest.validate_schema_version()?;
         manifest.validate_required_metadata()?;
         manifest.validate_unique_tool_names()?;
-        manifest.tool_definitions()?;
+        manifest.validate_tool_definitions()?;
         Ok(manifest)
     }
 
     pub fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, CapabilityManifestError> {
+        self.validate_tool_definitions()?;
         let capability = CapabilityRef {
             id: self.capability.id.clone(),
             version: self.capability.version.clone(),
         };
 
-        let definitions = self
+        Ok(self
             .tools
             .iter()
             .map(|tool| ToolDefinition {
@@ -50,15 +51,24 @@ impl CapabilityManifest {
                 approval_policy: tool.approval_policy(),
                 mcp: tool.mcp.clone(),
             })
-            .collect::<Vec<_>>();
-        for definition in &definitions {
-            definition
-                .validate()
-                .map_err(|error| CapabilityManifestError::Invalid {
-                    message: format!("tool '{}': {error}", definition.name),
-                })?;
-        }
-        Ok(definitions)
+            .collect())
+    }
+
+    /// Converts a validated manifest into runtime definitions without cloning
+    /// schema documents or metadata. Built-in registration should prefer this
+    /// consuming path because it no longer needs the manifest afterwards.
+    pub fn into_tool_definitions(self) -> Result<Vec<ToolDefinition>, CapabilityManifestError> {
+        self.validate_tool_definitions()?;
+        let capability = CapabilityRef {
+            id: self.capability.id,
+            version: self.capability.version,
+        };
+
+        Ok(self
+            .tools
+            .into_iter()
+            .map(|tool| tool.into_definition(capability.clone()))
+            .collect())
     }
 
     fn validate_schema_version(&self) -> Result<(), CapabilityManifestError> {
@@ -93,6 +103,30 @@ impl CapabilityManifest {
                     message: format!("duplicate tool name '{}'", tool.name),
                 });
             }
+        }
+        Ok(())
+    }
+
+    fn validate_tool_definitions(&self) -> Result<(), CapabilityManifestError> {
+        let capability = CapabilityRef {
+            id: self.capability.id.clone(),
+            version: self.capability.version.clone(),
+        };
+
+        for tool in &self.tools {
+            let approval_policy = tool.approval_policy();
+            ToolDefinition::validate_fields(
+                &tool.name,
+                &tool.description,
+                &tool.input_schema,
+                tool.output_schema.as_ref(),
+                &capability,
+                &approval_policy,
+                tool.mcp.as_ref(),
+            )
+            .map_err(|error| CapabilityManifestError::Invalid {
+                message: format!("tool '{}': {error}", tool.name),
+            })?;
         }
         Ok(())
     }
@@ -142,6 +176,29 @@ impl ManifestTool {
             ToolSafetyClass::AlwaysReject => ToolApprovalPolicy::AlwaysReject {
                 reason: self.safety_reason.clone().unwrap_or_default(),
             },
+        }
+    }
+
+    fn into_definition(self, capability: CapabilityRef) -> ToolDefinition {
+        let approval_policy = match self.safety_class {
+            ToolSafetyClass::AlwaysAllow => ToolApprovalPolicy::AlwaysAllow,
+            ToolSafetyClass::RequiresApproval => ToolApprovalPolicy::RequiresApproval {
+                reason: self.safety_reason.unwrap_or_default(),
+            },
+            ToolSafetyClass::CallDependent => ToolApprovalPolicy::CallDependent,
+            ToolSafetyClass::AlwaysReject => ToolApprovalPolicy::AlwaysReject {
+                reason: self.safety_reason.unwrap_or_default(),
+            },
+        };
+
+        ToolDefinition {
+            name: self.name,
+            description: self.description,
+            input_schema: self.input_schema,
+            output_schema: self.output_schema,
+            capability,
+            approval_policy,
+            mcp: self.mcp,
         }
     }
 }

@@ -16,7 +16,7 @@ pub fn register_builtin_coding_capability(
 ) -> Result<(), CodingCapabilityRegistrationError> {
     let manifest = coding_manifest().map_err(CodingCapabilityRegistrationError::Manifest)?;
     let definitions = manifest
-        .tool_definitions()
+        .into_tool_definitions()
         .map_err(CodingCapabilityRegistrationError::Manifest)?;
 
     // Preflight the complete built-in pack so a duplicate cannot leave a
