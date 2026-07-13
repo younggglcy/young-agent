@@ -637,6 +637,40 @@ fn search_files_marks_a_truncated_matching_line() {
 }
 
 #[test]
+fn search_files_does_not_reserve_patch_staging_prefixes_globally() {
+    let test_workspace = TestWorkspace::new("search-patch-prefix");
+    std::fs::write(
+        test_workspace.path().join(".young-agent-patch-notes.md"),
+        "visible needle\n",
+    )
+    .expect("prefixed file is written");
+    let directory = test_workspace.path().join(".young-agent-patch-notes");
+    std::fs::create_dir(&directory).expect("prefixed directory is created");
+    std::fs::write(directory.join("real.rs"), "visible needle\n").expect("nested file is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-patch-prefix"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "visible needle" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success { content, .. } = result.output else {
+        panic!("prefixed workspace paths should remain searchable");
+    };
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("search should return structured JSON");
+    };
+    assert_eq!(value["matches"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn search_files_finds_a_match_beyond_its_bounded_line_preview() {
     let test_workspace = TestWorkspace::new("search-long-line");
     let mut long_line = "x".repeat(2 * 1024 * 1024);
@@ -1657,6 +1691,38 @@ fn run_command_waits_for_an_approved_background_process_with_open_pipes() {
         panic!("approved background command should run to completion");
     };
     assert_eq!(metadata["output_incomplete"], json!(false));
+}
+
+#[test]
+fn run_command_waits_for_a_same_group_background_process_with_closed_pipes() {
+    let test_workspace = TestWorkspace::new("command-background-closed-pipes");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-background-closed-pipes"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "(sleep 0.15; printf complete > same-group-finished) >/dev/null 2>&1 &"
+        }),
+    };
+    let started = std::time::Instant::now();
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(result.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("same-group-finished")).unwrap(),
+        "complete"
+    );
 }
 
 #[test]

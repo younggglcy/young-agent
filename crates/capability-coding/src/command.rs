@@ -187,14 +187,15 @@ fn run_shell_command(
             if status.is_none() {
                 status = try_wait_for_command_group(&mut child)?;
             }
+            let group_running = status.is_some() && process_group_exists(&child)?;
 
-            if status.is_some() && streams_done == 2 {
+            if status.is_some() && streams_done == 2 && !group_running {
                 return Ok(());
             }
             if forced_at.is_some_and(|instant| instant.elapsed() >= OUTPUT_DRAIN_GRACE) {
                 return Ok(());
             }
-            if forced_at.is_none() && status.is_some() {
+            if forced_at.is_none() && status.is_some() && !group_running {
                 let started = drain_started_at.get_or_insert_with(Instant::now);
                 if started.elapsed() >= OUTPUT_DRAIN_GRACE {
                     output_incomplete = true;
@@ -291,6 +292,41 @@ fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
             wrapper_result.expect_err("wrapper failure was checked above"),
         ))
     }
+}
+
+#[cfg(unix)]
+fn process_group_id(child: &GroupChild) -> Result<rustix::process::Pid, CommandError> {
+    let raw = i32::try_from(child.id()).map_err(|_| {
+        CommandError::Kill(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id does not fit in i32",
+        ))
+    })?;
+    rustix::process::Pid::from_raw(raw).ok_or_else(|| {
+        CommandError::Kill(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id was zero",
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn process_group_exists(child: &GroupChild) -> Result<bool, CommandError> {
+    let pid = process_group_id(child)?;
+    loop {
+        match rustix::process::test_kill_process_group(pid) {
+            Ok(()) => return Ok(true),
+            Err(source) if source == rustix::io::Errno::INTR => continue,
+            Err(source) if source == rustix::io::Errno::SRCH => return Ok(false),
+            Err(source) if source == rustix::io::Errno::PERM => return Ok(true),
+            Err(source) => return Err(CommandError::Kill(std::io::Error::from(source))),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(_child: &GroupChild) -> Result<bool, CommandError> {
+    Ok(false)
 }
 
 #[cfg(unix)]

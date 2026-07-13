@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use cap_std::fs::File;
 use serde_json::json;
-use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
+use young_tool_runtime::{ToolCall, ToolContent, ToolError, ToolOutput};
 
 use crate::tool_support::{
-    display_relative_path, failure, finalize_output, truncate_utf8, ToolArguments,
+    display_relative_path, failure, finalize_output, truncate_json_string, truncate_utf8,
+    ToolArguments,
 };
-use crate::workspace::{CodingWorkspace, WorkspacePathError, MAX_FILE_SNAPSHOT_BYTES};
+use crate::workspace::{
+    AtomicReplaceError, CodingWorkspace, WorkspacePathError, MAX_FILE_SNAPSHOT_BYTES,
+};
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PATCH_LINES: usize = 200_000;
@@ -41,7 +44,7 @@ pub(crate) fn execute(
     };
     let result = match apply_unified_patch(workspace, patch, cancellation) {
         Ok(result) => result,
-        Err(error) => return failure(error.code(), error.to_string(), error.retryable()),
+        Err(error) => return error.into_output(),
     };
     finalize_output(ToolOutput::Success {
         content: vec![ToolContent::Json {
@@ -136,9 +139,22 @@ fn apply_unified_patch(
                 content.as_bytes(),
                 original_snapshot.expect("existing patch targets have a snapshot"),
             )
-            .map_err(|source| PatchError::Io {
-                path: resolved.relative_path.clone(),
-                source,
+            .map_err(|error| match error {
+                AtomicReplaceError::BeforePublication(source) => PatchError::Io {
+                    path: resolved.relative_path.clone(),
+                    source,
+                },
+                AtomicReplaceError::Published {
+                    source,
+                    target,
+                    recovery,
+                    recovery_policy_verified,
+                } => PatchError::Published {
+                    source,
+                    target,
+                    recovery,
+                    recovery_policy_verified,
+                },
             })?
             .into_iter()
             .map(|path| display_relative_path(&path))
@@ -603,10 +619,62 @@ pub(crate) enum PatchError {
         path: PathBuf,
         source: std::io::Error,
     },
+    Published {
+        target: PathBuf,
+        recovery: Option<PathBuf>,
+        recovery_policy_verified: bool,
+        source: std::io::Error,
+    },
     Cancelled,
 }
 
 impl PatchError {
+    fn into_output(self) -> ToolOutput {
+        match self {
+            Self::Published {
+                target,
+                recovery,
+                recovery_policy_verified,
+                source,
+            } => {
+                let changed = display_relative_path(&target);
+                let recoveries = recovery
+                    .as_deref()
+                    .map(display_relative_path)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let message = format!(
+                    "patch was published at '{changed}', but commit validation failed: {source}"
+                );
+                let (message, _) = truncate_json_string(&message, 8 * 1024);
+                ToolOutput::Failure {
+                    error: ToolError {
+                        code: "patch_published_with_recovery".to_string(),
+                        message: message.to_string(),
+                        retryable: false,
+                    },
+                    extensions: BTreeMap::from([
+                        (
+                            "publication_state".to_string(),
+                            json!("published_with_recovery"),
+                        ),
+                        ("changed_files".to_string(), json!([changed])),
+                        ("recovery_files".to_string(), json!(recoveries)),
+                        (
+                            "recovery_policy".to_string(),
+                            json!(if recovery_policy_verified {
+                                "verified_search_and_git_ignored"
+                            } else {
+                                "unverified"
+                            }),
+                        ),
+                    ]),
+                }
+            }
+            error => failure(error.code(), error.to_string(), error.retryable()),
+        }
+    }
+
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::InvalidPatch(_) => "invalid_patch",
@@ -623,6 +691,7 @@ impl PatchError {
                 "patch_conflict"
             }
             Self::Io { .. } => "workspace_io_error",
+            Self::Published { .. } => "patch_published_with_recovery",
             Self::Cancelled => "tool_cancelled",
         }
     }
@@ -631,7 +700,11 @@ impl PatchError {
         match self {
             Self::Workspace(error) => error.retryable(),
             Self::Io { source, .. } => source.kind() == std::io::ErrorKind::Interrupted,
-            Self::InvalidPatch(_) | Self::Limit(_) | Self::Conflict(_) | Self::Cancelled => false,
+            Self::InvalidPatch(_)
+            | Self::Limit(_)
+            | Self::Conflict(_)
+            | Self::Published { .. }
+            | Self::Cancelled => false,
         }
     }
 }
@@ -646,7 +719,51 @@ impl fmt::Display for PatchError {
             Self::Io { path, source } => {
                 write!(formatter, "failed to update '{}': {source}", path.display())
             }
+            Self::Published { target, source, .. } => write!(
+                formatter,
+                "patch was published at '{}', but commit validation failed: {source}",
+                target.display()
+            ),
             Self::Cancelled => formatter.write_str("apply_patch was cancelled"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use young_tool_runtime::ToolOutput;
+
+    use super::PatchError;
+
+    #[test]
+    fn published_failure_exposes_nested_recovery_state_as_extensions() {
+        let output = PatchError::Published {
+            target: "src/target.txt".into(),
+            recovery: Some(
+                "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp"
+                    .into(),
+            ),
+            recovery_policy_verified: false,
+            source: std::io::Error::other("injected policy drift"),
+        }
+        .into_output();
+
+        let ToolOutput::Failure { error, extensions } = output else {
+            panic!("published patch validation must fail structurally");
+        };
+        assert_eq!(error.code, "patch_published_with_recovery");
+        assert_eq!(
+            extensions["publication_state"],
+            json!("published_with_recovery")
+        );
+        assert_eq!(extensions["changed_files"], json!(["src/target.txt"]));
+        assert_eq!(
+            extensions["recovery_files"],
+            json!([
+                "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp"
+            ])
+        );
+        assert_eq!(extensions["recovery_policy"], json!("unverified"));
     }
 }
