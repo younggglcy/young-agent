@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -22,6 +24,7 @@ use crate::tool_support::{
 use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FOREGROUND_EXIT_SETTLE: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 #[cfg(all(test, unix))]
@@ -85,10 +88,21 @@ pub(crate) fn execute(
                 json!(outcome.output_incomplete),
             ),
             ("process_scope".to_string(), json!("process_group")),
-            ("direct_shell_jobs_waited".to_string(), json!(true)),
             (
                 "residual_process_group_policy".to_string(),
-                json!("terminated_before_leader_reap"),
+                json!("kill_requested_before_leader_reap"),
+            ),
+            (
+                "background_process_policy".to_string(),
+                json!("kill_requested_at_foreground_exit"),
+            ),
+            (
+                "process_security_policy".to_string(),
+                json!(process_security_policy()),
+            ),
+            (
+                "credential_changes_blocked".to_string(),
+                json!(credential_changes_blocked()),
             ),
             ("detached_processes_tracked".to_string(), json!(false)),
             ("workspace".to_string(), workspace.metadata()),
@@ -97,6 +111,7 @@ pub(crate) fn execute(
     })
 }
 
+#[derive(Debug)]
 pub(crate) struct CommandOutcome {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: String,
@@ -122,12 +137,23 @@ fn run_shell_command(
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
     ensure_process_tracking_supported()?;
+    configure_command_security(&mut process);
     let child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .group_spawn();
     let mut child = child.map_err(CommandError::Spawn)?;
+    let mut sentinel = match spawn_process_group_sentinel(child.id()) {
+        Ok(sentinel) => sentinel,
+        Err(source) => {
+            let cleanup = cleanup_process_group(&mut child, false, true);
+            return match cleanup {
+                Ok(()) => Err(CommandError::SpawnSentinel(source)),
+                Err(cleanup) => Err(cleanup),
+            };
+        }
+    };
     let stdout = child
         .inner()
         .stdout
@@ -151,9 +177,10 @@ fn run_shell_command(
     let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
     if let Err(source) = configure_result {
         let cleanup = cleanup_process_group(&mut child, false, true);
-        return match cleanup {
-            Ok(()) => Err(CommandError::ConfigureOutput(source)),
-            Err(cleanup) => Err(cleanup),
+        let sentinel_cleanup = wait_for_sentinel(&mut sentinel);
+        return match (cleanup, sentinel_cleanup) {
+            (Err(cleanup), _) | (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Ok(()), Ok(())) => Err(CommandError::ConfigureOutput(source)),
         };
     }
     let (sender, receiver) = mpsc::sync_channel(16);
@@ -197,6 +224,9 @@ fn run_shell_command(
                 leader_terminal = command_leader_terminal(&child)?;
             }
             if status.is_none() && leader_terminal {
+                // Keep the terminal leader unreaped while already-started descendant
+                // forks settle, then terminate the still-reserved process group once.
+                thread::sleep(FOREGROUND_EXIT_SETTLE);
                 terminate_command_group(&mut child)?;
                 termination_sent = true;
                 status = Some(wait_for_command_group(&mut child)?);
@@ -222,6 +252,7 @@ fn run_shell_command(
 
     let cleanup_result = cleanup_command_resources(
         &mut child,
+        &mut sentinel,
         status.is_some(),
         control_result.is_err() && status.is_none() && !termination_sent,
         OutputReaderResources {
@@ -264,9 +295,106 @@ fn ensure_process_tracking_supported() -> Result<(), CommandError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn process_security_policy() -> &'static str {
+    "no_new_privs_and_group_termination"
+}
+
+#[cfg(target_os = "macos")]
+fn process_security_policy() -> &'static str {
+    "group_termination_without_credential_lock"
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_security_policy() -> &'static str {
+    "unsupported"
+}
+
+fn credential_changes_blocked() -> bool {
+    cfg!(target_os = "linux")
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn ensure_process_tracking_supported() -> Result<(), CommandError> {
     Err(CommandError::UnsupportedProcessTracking)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn configure_command_security(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: rustix issues the single `prctl(PR_SET_NO_NEW_PRIVS)` syscall and
+    // does not allocate or touch shared process state in the post-fork child.
+    unsafe {
+        command.pre_exec(|| rustix::thread::set_no_new_privs(true).map_err(std::io::Error::from));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_command_security(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn spawn_process_group_sentinel(group_id: u32) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt as _;
+
+    let group_id = i32::try_from(group_id).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command process-group id does not fit in i32",
+        )
+    })?;
+    let mut sentinel = Command::new("/bin/sleep");
+    sentinel
+        .arg("2147483647")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    sentinel.process_group(group_id);
+    sentinel.spawn()
+}
+
+#[cfg(not(unix))]
+fn spawn_process_group_sentinel(_group_id: u32) -> std::io::Result<Child> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "command process-group sentinels are not supported on this platform",
+    ))
+}
+
+fn wait_for_sentinel(sentinel: &mut Child) -> Result<(), CommandError> {
+    loop {
+        match sentinel.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => break,
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) if child_already_reaped(&source) => return Ok(()),
+            Err(source) => return Err(CommandError::WaitSentinel(source)),
+        }
+    }
+    if let Err(source) = sentinel.kill() {
+        if !group_already_exited(&source) {
+            return Err(CommandError::KillSentinel(source));
+        }
+    }
+    loop {
+        match sentinel.wait() {
+            Ok(_) => return Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) if child_already_reaped(&source) => return Ok(()),
+            Err(source) => return Err(CommandError::WaitSentinel(source)),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_already_reaped(source: &std::io::Error) -> bool {
+    source.raw_os_error() == Some(rustix::io::Errno::CHILD.raw_os_error())
+}
+
+#[cfg(not(unix))]
+fn child_already_reaped(_source: &std::io::Error) -> bool {
+    false
 }
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
@@ -381,6 +509,20 @@ fn kill_process_group_by_id(id: u32) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandError> {
+    let pid = process_group_id(child)?;
+    loop {
+        match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty()) {
+            Ok(Some((_pid, status))) => return Ok(ExitStatus::from_raw(status.as_raw())),
+            Ok(None) => continue,
+            Err(source) if source == rustix::io::Errno::INTR => continue,
+            Err(source) => return Err(CommandError::Wait(std::io::Error::from(source))),
+        }
+    }
+}
+
+#[cfg(not(unix))]
 fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandError> {
     loop {
         match child.wait() {
@@ -391,6 +533,20 @@ fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandE
     }
 }
 
+#[cfg(unix)]
+fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatus>, CommandError> {
+    let pid = process_group_id(child)?;
+    loop {
+        match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG) {
+            Ok(Some((_pid, status))) => return Ok(Some(ExitStatus::from_raw(status.as_raw()))),
+            Ok(None) => return Ok(None),
+            Err(source) if source == rustix::io::Errno::INTR => continue,
+            Err(source) => return Err(CommandError::Wait(std::io::Error::from(source))),
+        }
+    }
+}
+
+#[cfg(not(unix))]
 fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatus>, CommandError> {
     loop {
         match child.try_wait() {
@@ -403,6 +559,7 @@ fn try_wait_for_command_group(child: &mut GroupChild) -> Result<Option<ExitStatu
 
 fn cleanup_command_resources(
     child: &mut GroupChild,
+    sentinel: &mut Child,
     process_exited: bool,
     terminate_group: bool,
     output: OutputReaderResources,
@@ -416,6 +573,11 @@ fn cleanup_command_resources(
     }
     if output.stderr.join().is_err() && first_error.is_none() {
         first_error = Some(CommandError::ReaderPanicked);
+    }
+    if let Err(source) = wait_for_sentinel(sentinel) {
+        if first_error.is_none() {
+            first_error = Some(source);
+        }
     }
     match first_error {
         Some(source) => Err(source),
@@ -489,15 +651,8 @@ fn make_nonblocking<F>(_file: &F) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn shell_command(command: &str) -> Command {
-    const SUPERVISOR: &str = "/bin/sh -c \"$1\" /bin/sh\n__young_agent_supervisor_status=$?\n(sleep 2147483647) >/dev/null 2>&1 &\nexit \"$__young_agent_supervisor_status\"\n";
-
-    let mut inner = String::with_capacity(command.len() + 96);
-    inner.push_str(command);
-    inner.push_str(
-        "\n__young_agent_foreground_status=$?\nwait\nexit \"$__young_agent_foreground_status\"\n",
-    );
     let mut process = Command::new("/bin/sh");
-    process.args(["-c", SUPERVISOR, "/bin/sh", &inner]);
+    process.args(["-c", command]);
     process
 }
 
@@ -619,10 +774,13 @@ impl CapturedStream {
 #[derive(Debug)]
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
+    SpawnSentinel(std::io::Error),
     WorkspaceChanged(std::io::Error),
     ConfigureOutput(std::io::Error),
     Kill(std::io::Error),
+    KillSentinel(std::io::Error),
     Wait(std::io::Error),
+    WaitSentinel(std::io::Error),
     ReadOutput(std::io::Error),
     ReaderPanicked,
     Cancelled,
@@ -635,11 +793,13 @@ pub(crate) enum CommandError {
 impl CommandError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::Spawn(_) => "command_spawn_failed",
+            Self::Spawn(_) | Self::SpawnSentinel(_) => "command_spawn_failed",
             Self::WorkspaceChanged(_) => "workspace_changed",
             Self::ConfigureOutput(_)
             | Self::Kill(_)
+            | Self::KillSentinel(_)
             | Self::Wait(_)
+            | Self::WaitSentinel(_)
             | Self::ReadOutput(_)
             | Self::ReaderPanicked => "command_io_error",
             Self::Cancelled => "tool_cancelled",
@@ -655,7 +815,9 @@ impl CommandError {
             self,
             Self::ConfigureOutput(source)
             | Self::Kill(source)
+            | Self::KillSentinel(source)
             | Self::Wait(source)
+            | Self::WaitSentinel(source)
             | Self::ReadOutput(source)
                 if source.kind() == std::io::ErrorKind::Interrupted
         )
@@ -666,6 +828,9 @@ impl fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(source) => write!(formatter, "failed to start command: {source}"),
+            Self::SpawnSentinel(source) => {
+                write!(formatter, "failed to start command-group sentinel: {source}")
+            }
             Self::WorkspaceChanged(source) => {
                 write!(
                     formatter,
@@ -679,7 +844,13 @@ impl fmt::Display for CommandError {
                 )
             }
             Self::Kill(source) => write!(formatter, "failed to terminate command group: {source}"),
+            Self::KillSentinel(source) => {
+                write!(formatter, "failed to terminate command-group sentinel: {source}")
+            }
             Self::Wait(source) => write!(formatter, "failed to wait for command: {source}"),
+            Self::WaitSentinel(source) => {
+                write!(formatter, "failed to reap command-group sentinel: {source}")
+            }
             Self::ReadOutput(source) => {
                 write!(formatter, "failed to capture command output: {source}")
             }
@@ -741,7 +912,10 @@ mod tests {
         );
 
         trigger.join().expect("cancellation trigger finishes");
-        assert!(matches!(result, Err(CommandError::TerminationUnverified)));
+        assert!(
+            matches!(result, Err(CommandError::TerminationUnverified)),
+            "unexpected result: {result:?}"
+        );
         assert_eq!(
             COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.get()),
             1,
@@ -777,7 +951,10 @@ mod tests {
             1024,
         );
 
-        assert!(matches!(result, Err(CommandError::ConfigureOutput(_))));
+        assert!(
+            matches!(result, Err(CommandError::ConfigureOutput(_))),
+            "unexpected result: {result:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
         assert!(!root.join("delayed.txt").exists());

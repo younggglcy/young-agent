@@ -1485,11 +1485,16 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
     assert_eq!(metadata["stdout_truncated"], json!(false));
     assert_eq!(metadata["stderr_truncated"], json!(false));
     assert_eq!(metadata["process_scope"], json!("process_group"));
-    assert_eq!(metadata["direct_shell_jobs_waited"], json!(true));
     assert_eq!(
         metadata["residual_process_group_policy"],
-        json!("terminated_before_leader_reap")
+        json!("kill_requested_before_leader_reap")
     );
+    assert_eq!(
+        metadata["background_process_policy"],
+        json!("kill_requested_at_foreground_exit")
+    );
+    assert!(metadata["process_security_policy"].is_string());
+    assert!(metadata["credential_changes_blocked"].is_boolean());
     assert_eq!(metadata["detached_processes_tracked"], json!(false));
     assert!(extensions.is_empty());
 }
@@ -1670,7 +1675,7 @@ fn run_command_cancellation_terminates_descendant_processes() {
 }
 
 #[test]
-fn run_command_waits_for_an_approved_background_process_with_open_pipes() {
+fn run_command_terminates_a_background_process_when_the_foreground_shell_exits() {
     let test_workspace = TestWorkspace::new("command-background-pipe");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1690,16 +1695,16 @@ fn run_command_waits_for_an_approved_background_process_with_open_pipes() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() >= Duration::from_millis(75));
+    assert!(started.elapsed() < Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(2));
     let ToolOutput::Success { metadata, .. } = result.output else {
-        panic!("approved background command should run to completion");
+        panic!("foreground shell status should be reported after background termination");
     };
     assert_eq!(metadata["output_incomplete"], json!(false));
 }
 
 #[test]
-fn run_command_waits_for_a_same_group_background_process_with_closed_pipes() {
+fn run_command_seals_a_background_process_with_closed_pipes() {
     let test_workspace = TestWorkspace::new("command-background-closed-pipes");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1721,65 +1726,15 @@ fn run_command_waits_for_a_same_group_background_process_with_closed_pipes() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(started.elapsed() < Duration::from_millis(100));
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(
         matches!(result.output, ToolOutput::Success { .. }),
         "unexpected command result: {:?}",
         result.output
     );
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("same-group-finished")).unwrap(),
-        "complete"
-    );
-}
-
-#[test]
-fn run_command_cancels_a_direct_background_job_waited_by_the_supervisor() {
-    let test_workspace = TestWorkspace::new("command-background-cancel-supervised");
-    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
-    let mut runtime = ToolRuntime::default();
-    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
-    let call = ToolCall {
-        id: ToolCallId::new("call-background-cancel-supervised"),
-        tool_name: "run_command".to_string(),
-        arguments: json!({
-            "command": "(printf ready > background-ready; sleep 10; printf leaked > background-leaked) >/dev/null 2>&1 &"
-        }),
-    };
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let cancellation_trigger = cancellation.clone();
-    let ready = test_workspace.path().join("background-ready");
-    let trigger = std::thread::spawn(move || {
-        let started = std::time::Instant::now();
-        while !ready.exists() && started.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            ready.exists(),
-            "background process must start before cancellation"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-        cancellation_trigger.store(true, Ordering::Relaxed);
-    });
-    let started = std::time::Instant::now();
-
-    let result = runtime.dispatch(
-        call.clone(),
-        ToolExecutionAuthorization::ApprovalGranted {
-            call_id: call.id.clone(),
-        },
-        cancellation,
-    );
-
-    trigger.join().expect("cancellation trigger finishes");
-    assert!(started.elapsed() < Duration::from_secs(2));
-    let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("cancellation while a supervised background job runs must fail closed");
-    };
-    assert_eq!(error.code, "command_termination_unverified");
     std::thread::sleep(Duration::from_millis(250));
-    assert!(!test_workspace.path().join("background-leaked").exists());
+    assert!(!test_workspace.path().join("same-group-finished").exists());
 }
 
 #[test]
@@ -1825,19 +1780,18 @@ fn run_command_seals_residual_group_members_across_repeated_early_exit_races() {
 }
 
 #[test]
-fn run_command_reports_success_only_after_background_work_finishes() {
-    let test_workspace = TestWorkspace::new("command-background-completion");
+fn run_command_does_not_inject_shell_variables_or_source_text() {
+    let test_workspace = TestWorkspace::new("command-shell-source-fidelity");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
     register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
     let call = ToolCall {
-        id: ToolCallId::new("call-background-completion"),
+        id: ToolCallId::new("call-shell-source-fidelity"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "(sleep 0.1; printf complete > completed-background.txt) &"
+            "command": "readonly __young_agent_foreground_status=0; printf x \\"
         }),
     };
-    let started = std::time::Instant::now();
 
     let result = runtime.dispatch(
         call.clone(),
@@ -1847,12 +1801,48 @@ fn run_command_reports_success_only_after_background_work_finishes() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(matches!(result.output, ToolOutput::Success { .. }));
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("completed-background.txt")).unwrap(),
-        "complete"
+    let ToolOutput::Success { content, .. } = result.output else {
+        panic!(
+            "unmodified shell source should succeed: {:?}",
+            result.output
+        );
+    };
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("command should return structured JSON");
+    };
+    assert_eq!(value["success"], json!(true));
+    assert_eq!(value["exit_code"], json!(0));
+    assert_eq!(value["stdout"], json!("x"));
+}
+
+#[test]
+fn run_command_preserves_signal_termination_status() {
+    let test_workspace = TestWorkspace::new("command-signal-status");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-signal-status"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "kill -KILL $$" }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
     );
+
+    let ToolOutput::Success { content, .. } = result.output else {
+        panic!("signal termination should remain a command outcome");
+    };
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("command should return structured JSON");
+    };
+    assert_eq!(value["success"], json!(false));
+    assert_eq!(value["exit_code"], serde_json::Value::Null);
 }
 
 #[cfg(unix)]

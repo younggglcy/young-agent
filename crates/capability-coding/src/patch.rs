@@ -13,7 +13,7 @@ use crate::tool_support::{
     ToolArguments,
 };
 use crate::workspace::{
-    AtomicReplaceError, CodingWorkspace, PublishedRecovery, WorkspacePathError,
+    AtomicCreateError, AtomicReplaceError, CodingWorkspace, PublishedRecovery, WorkspacePathError,
     MAX_FILE_SNAPSHOT_BYTES,
 };
 
@@ -141,7 +141,18 @@ fn apply_unified_patch(
                 original_snapshot.expect("existing patch targets have a snapshot"),
             )
             .map_err(|error| match error {
-                AtomicReplaceError::BeforePublication(source) => PatchError::Io {
+                AtomicReplaceError::BeforePublication {
+                    source,
+                    recovery: Some(recovery),
+                } => PatchError::Preserved {
+                    target: resolved.relative_path.clone(),
+                    recovery,
+                    source,
+                },
+                AtomicReplaceError::BeforePublication {
+                    source,
+                    recovery: None,
+                } => PatchError::Io {
                     path: resolved.relative_path.clone(),
                     source,
                 },
@@ -161,9 +172,27 @@ fn apply_unified_patch(
         FileChange::Write(content) => {
             workspace
                 .create_new(&resolved.relative_path, content.as_bytes())
-                .map_err(|source| PatchError::Io {
-                    path: resolved.relative_path.clone(),
-                    source,
+                .map_err(|error| match error {
+                    AtomicCreateError::BeforePublication {
+                        source,
+                        recovery: Some(recovery),
+                    } => PatchError::Preserved {
+                        target: resolved.relative_path.clone(),
+                        recovery,
+                        source,
+                    },
+                    AtomicCreateError::BeforePublication {
+                        source,
+                        recovery: None,
+                    } => PatchError::Io {
+                        path: resolved.relative_path.clone(),
+                        source,
+                    },
+                    AtomicCreateError::Published { source, target } => PatchError::Published {
+                        target,
+                        recovery: PublishedRecovery::NotApplicableNewFile,
+                        source,
+                    },
                 })?;
             Vec::new()
         }
@@ -618,6 +647,11 @@ pub(crate) enum PatchError {
         path: PathBuf,
         source: std::io::Error,
     },
+    Preserved {
+        target: PathBuf,
+        recovery: PublishedRecovery,
+        source: std::io::Error,
+    },
     Published {
         target: PathBuf,
         recovery: PublishedRecovery,
@@ -629,6 +663,63 @@ pub(crate) enum PatchError {
 impl PatchError {
     fn into_output(self) -> ToolOutput {
         match self {
+            Self::Preserved {
+                target,
+                recovery,
+                source,
+            } => {
+                let target = display_relative_path(&target);
+                let (code, recoveries, recovery_state, recovery_policy) = match recovery {
+                    PublishedRecovery::LocatedVerified(path) => (
+                        "patch_not_published_with_recovery",
+                        vec![display_relative_path(&path)],
+                        "located_verified",
+                        "verified_search_and_git_ignored",
+                    ),
+                    PublishedRecovery::LocatedContentUnverified(path) => (
+                        "patch_not_published_with_recovery",
+                        vec![display_relative_path(&path)],
+                        "located_content_unverified",
+                        "verified_search_and_git_ignored",
+                    ),
+                    PublishedRecovery::LocatedPolicyUnverified(path) => (
+                        "patch_not_published_with_recovery",
+                        vec![display_relative_path(&path)],
+                        "located_policy_unverified",
+                        "unverified",
+                    ),
+                    PublishedRecovery::Unlocated => (
+                        "patch_not_published_recovery_unlocated",
+                        Vec::new(),
+                        "unlocated",
+                        "unverified",
+                    ),
+                    PublishedRecovery::NotApplicableNewFile => (
+                        "patch_not_published_without_recovery",
+                        Vec::new(),
+                        "not_applicable_new_file",
+                        "not_applicable",
+                    ),
+                };
+                let message = format!(
+                    "patch was not published at '{target}', and staged data was preserved: {source}"
+                );
+                let (message, _) = truncate_json_string(&message, 8 * 1024);
+                ToolOutput::Failure {
+                    error: ToolError {
+                        code: code.to_string(),
+                        message: message.to_string(),
+                        retryable: false,
+                    },
+                    extensions: BTreeMap::from([
+                        ("publication_state".to_string(), json!("not_published")),
+                        ("changed_files".to_string(), json!([])),
+                        ("recovery_files".to_string(), json!(recoveries)),
+                        ("recovery_state".to_string(), json!(recovery_state)),
+                        ("recovery_policy".to_string(), json!(recovery_policy)),
+                    ]),
+                }
+            }
             Self::Published {
                 target,
                 recovery,
@@ -644,12 +735,26 @@ impl PatchError {
                             "located_verified",
                             "verified_search_and_git_ignored",
                         ),
+                        PublishedRecovery::LocatedContentUnverified(path) => (
+                            "patch_published_with_recovery",
+                            "published_with_recovery",
+                            vec![display_relative_path(&path)],
+                            "located_content_unverified",
+                            "verified_search_and_git_ignored",
+                        ),
                         PublishedRecovery::LocatedPolicyUnverified(path) => (
                             "patch_published_with_recovery",
                             "published_with_recovery",
                             vec![display_relative_path(&path)],
                             "located_policy_unverified",
                             "unverified",
+                        ),
+                        PublishedRecovery::NotApplicableNewFile => (
+                            "patch_published_without_recovery",
+                            "published_without_recovery",
+                            Vec::new(),
+                            "not_applicable_new_file",
+                            "not_applicable",
                         ),
                         PublishedRecovery::Unlocated => (
                             "patch_published_recovery_unlocated",
@@ -698,10 +803,23 @@ impl PatchError {
                 "patch_conflict"
             }
             Self::Io { .. } => "workspace_io_error",
+            Self::Preserved {
+                recovery: PublishedRecovery::Unlocated,
+                ..
+            } => "patch_not_published_recovery_unlocated",
+            Self::Preserved {
+                recovery: PublishedRecovery::NotApplicableNewFile,
+                ..
+            } => "patch_not_published_without_recovery",
+            Self::Preserved { .. } => "patch_not_published_with_recovery",
             Self::Published {
                 recovery: PublishedRecovery::Unlocated,
                 ..
             } => "patch_published_recovery_unlocated",
+            Self::Published {
+                recovery: PublishedRecovery::NotApplicableNewFile,
+                ..
+            } => "patch_published_without_recovery",
             Self::Published { .. } => "patch_published_with_recovery",
             Self::Cancelled => "tool_cancelled",
         }
@@ -714,6 +832,7 @@ impl PatchError {
             Self::InvalidPatch(_)
             | Self::Limit(_)
             | Self::Conflict(_)
+            | Self::Preserved { .. }
             | Self::Published { .. }
             | Self::Cancelled => false,
         }
@@ -730,6 +849,11 @@ impl fmt::Display for PatchError {
             Self::Io { path, source } => {
                 write!(formatter, "failed to update '{}': {source}", path.display())
             }
+            Self::Preserved { target, source, .. } => write!(
+                formatter,
+                "patch was not published at '{}', and staged data was preserved: {source}",
+                target.display()
+            ),
             Self::Published { target, source, .. } => write!(
                 formatter,
                 "patch was published at '{}', but commit validation failed: {source}",
@@ -782,6 +906,37 @@ mod tests {
     }
 
     #[test]
+    fn pre_publication_failure_exposes_preserved_recovery_as_extensions() {
+        let output = PatchError::Preserved {
+            target: "src/target.txt".into(),
+            recovery: PublishedRecovery::LocatedVerified(
+                "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp"
+                    .into(),
+            ),
+            source: std::io::Error::other("injected exchange failure"),
+        }
+        .into_output();
+
+        let ToolOutput::Failure { error, extensions } = output else {
+            panic!("pre-publication preservation must fail structurally");
+        };
+        assert_eq!(error.code, "patch_not_published_with_recovery");
+        assert_eq!(extensions["publication_state"], json!("not_published"));
+        assert_eq!(extensions["changed_files"], json!([]));
+        assert_eq!(
+            extensions["recovery_files"],
+            json!([
+                "src/.young-agent-recovery/.young-agent-patch-displaced-00000000000000000000000000000000.tmp"
+            ])
+        );
+        assert_eq!(extensions["recovery_state"], json!("located_verified"));
+        assert_eq!(
+            extensions["recovery_policy"],
+            json!("verified_search_and_git_ignored")
+        );
+    }
+
+    #[test]
     fn published_failure_distinguishes_an_unlocated_recovery() {
         let output = PatchError::Published {
             target: "src/target.txt".into(),
@@ -801,5 +956,31 @@ mod tests {
         assert_eq!(extensions["recovery_files"], json!([]));
         assert_eq!(extensions["recovery_state"], json!("unlocated"));
         assert_eq!(extensions["recovery_policy"], json!("unverified"));
+    }
+
+    #[test]
+    fn published_new_file_failure_reports_that_recovery_is_not_applicable() {
+        let output = PatchError::Published {
+            target: "src/created.txt".into(),
+            recovery: PublishedRecovery::NotApplicableNewFile,
+            source: std::io::Error::other("injected post-publication validation failure"),
+        }
+        .into_output();
+
+        let ToolOutput::Failure { error, extensions } = output else {
+            panic!("published new-file validation must fail structurally");
+        };
+        assert_eq!(error.code, "patch_published_without_recovery");
+        assert_eq!(
+            extensions["publication_state"],
+            json!("published_without_recovery")
+        );
+        assert_eq!(extensions["changed_files"], json!(["src/created.txt"]));
+        assert_eq!(extensions["recovery_files"], json!([]));
+        assert_eq!(
+            extensions["recovery_state"],
+            json!("not_applicable_new_file")
+        );
+        assert_eq!(extensions["recovery_policy"], json!("not_applicable"));
     }
 }

@@ -17,6 +17,7 @@ use std::cell::Cell;
 #[cfg(test)]
 thread_local! {
     static INJECT_RECOVERY_POLICY_FAILURE_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
+    static INJECT_NEW_FILE_VALIDATION_FAILURE_AFTER_RENAME: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
@@ -198,22 +199,22 @@ impl CodingWorkspace {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
             })
-            .map_err(AtomicReplaceError::BeforePublication)?;
+            .map_err(AtomicReplaceError::before)?;
         let directory = self
             .root_dir
             .open_dir(parent)
-            .map_err(AtomicReplaceError::BeforePublication)?;
+            .map_err(AtomicReplaceError::before)?;
         let metadata = self
             .replacement_metadata(&directory, Path::new(file_name))
-            .map_err(AtomicReplaceError::BeforePublication)?;
+            .map_err(AtomicReplaceError::before)?;
         if metadata.snapshot != expected_snapshot {
-            return Err(AtomicReplaceError::BeforePublication(patch_target_changed()));
+            return Err(AtomicReplaceError::before(patch_target_changed()));
         }
         let recovery_directory =
-            open_recovery_namespace(&directory).map_err(AtomicReplaceError::BeforePublication)?;
+            open_recovery_namespace(&directory).map_err(AtomicReplaceError::before)?;
         let staged = self
             .stage_content(&directory, content, Some(&metadata))
-            .map_err(AtomicReplaceError::BeforePublication)?;
+            .map_err(AtomicReplaceError::before)?;
         let recovery = self
             .commit_existing_file(
                 &directory,
@@ -223,8 +224,11 @@ impl CodingWorkspace {
                 metadata,
             )
             .map_err(|error| match error {
-                CommitError::BeforePublication(source) => {
-                    AtomicReplaceError::BeforePublication(source)
+                CommitError::BeforePublication { source, recovery } => {
+                    AtomicReplaceError::BeforePublication {
+                        source,
+                        recovery: recovery.map(|recovery| recovery.within_parent(parent)),
+                    }
                 }
                 CommitError::Published { source, recovery } => AtomicReplaceError::Published {
                     source,
@@ -236,25 +240,44 @@ impl CodingWorkspace {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+    pub(crate) fn create_new(&self, path: &Path, content: &[u8]) -> Result<(), AtomicCreateError> {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let file_name = path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
-        })?;
-        let directory = self.root_dir.open_dir(parent)?;
-        let staged = self.stage_content(&directory, content, None)?;
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "patch target has no file name")
+            })
+            .map_err(AtomicCreateError::before)?;
+        let directory = self
+            .root_dir
+            .open_dir(parent)
+            .map_err(AtomicCreateError::before)?;
+        let staged = self
+            .stage_content(&directory, content, None)
+            .map_err(AtomicCreateError::before)?;
         self.commit_new_file(&directory, staged, Path::new(file_name))
+            .map_err(|error| match error {
+                CommitNewError::BeforePublication(source) => AtomicCreateError::before(source),
+                CommitNewError::Published(source) => AtomicCreateError::Published {
+                    source,
+                    target: path.to_path_buf(),
+                },
+            })
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub(crate) fn create_new(&self, _path: &Path, _content: &[u8]) -> io::Result<()> {
-        Err(io::Error::new(
+    pub(crate) fn create_new(
+        &self,
+        _path: &Path,
+        _content: &[u8],
+    ) -> Result<(), AtomicCreateError> {
+        Err(AtomicCreateError::before(io::Error::new(
             io::ErrorKind::Unsupported,
             "atomic no-replace patch commits are not supported on this platform",
-        ))
+        )))
     }
 
     pub(crate) fn metadata(&self) -> Value {
@@ -396,11 +419,12 @@ impl CodingWorkspace {
         directory: &Dir,
         mut staged: StagedFile,
         path: &Path,
-    ) -> io::Result<()> {
+    ) -> Result<(), CommitNewError> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             if let Err(source) = self.validate_staging_slot(directory, &staged) {
-                return cleanup_owned_staging_after_error(directory, &staged, source);
+                return cleanup_owned_staging_after_error(directory, &staged, source)
+                    .map_err(CommitNewError::BeforePublication);
             }
             let result = rustix::fs::renameat_with(
                 directory,
@@ -411,27 +435,40 @@ impl CodingWorkspace {
             )
             .map_err(io::Error::from);
             if let Err(source) = result {
-                return cleanup_owned_staging_after_error(directory, &staged, source);
+                return cleanup_owned_staging_after_error(directory, &staged, source)
+                    .map_err(CommitNewError::BeforePublication);
+            }
+            #[cfg(test)]
+            if INJECT_NEW_FILE_VALIDATION_FAILURE_AFTER_RENAME
+                .with(|injected| injected.replace(false))
+            {
+                return Err(CommitNewError::Published(io::Error::other(
+                    "injected new-file validation failure after publication",
+                )));
             }
             if let Err(source) = refresh_snapshot_after_rename(
                 &staged.file,
                 &mut staged.snapshot,
                 "patch staging file",
             ) {
-                return Err(published_target_changed(path, None, source));
+                return Err(CommitNewError::Published(published_target_changed(
+                    path, None, source,
+                )));
             }
             if let Err(source) = validate_installed_staging_slot(directory, path, &staged) {
-                return Err(published_target_changed(path, None, source));
+                return Err(CommitNewError::Published(published_target_changed(
+                    path, None, source,
+                )));
             }
             Ok(())
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (directory, staged, path);
-            Err(io::Error::new(
+            Err(CommitNewError::BeforePublication(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic no-replace patch commits are not supported on this platform",
-            ))
+            )))
         }
     }
 
@@ -450,7 +487,7 @@ impl CodingWorkspace {
                 .and_then(|()| validate_replacement_slot(directory, path, &expected))
             {
                 return cleanup_owned_staging_after_error(directory, &staged, source)
-                    .map_err(CommitError::BeforePublication);
+                    .map_err(CommitError::before);
             }
             let recovery_path = match move_to_recovery_namespace(
                 directory,
@@ -461,7 +498,7 @@ impl CodingWorkspace {
                 Ok(path) => path,
                 Err(source) => {
                     return cleanup_owned_staging_after_error(directory, &staged, source)
-                        .map_err(CommitError::BeforePublication)
+                        .map_err(CommitError::before)
                 }
             };
             staged.path = recovery_path;
@@ -473,34 +510,19 @@ impl CodingWorkspace {
             .and_then(|()| {
                 validate_installed_staging_slot(&recovery.directory, &staged.path, &staged)
             }) {
-                return Err(CommitError::BeforePublication(io::Error::new(
-                    source.kind(),
-                    format!(
-                        "patch staging data was preserved as recovery file '{RECOVERY_DIRECTORY}/{}' before publication ({source})",
-                        staged.path.display()
-                    ),
-                )));
+                return Err(preserved_content_failure(
+                    directory, recovery, &staged, source,
+                ));
             }
             if let Err(error) = validate_recovery_namespace_slot(directory, recovery) {
-                let source = error.into_io();
-                return Err(CommitError::BeforePublication(io::Error::new(
-                    source.kind(),
-                    format!(
-                        "patch publication was refused because the recovery namespace drifted; staged data remains bound to recovery identity {}:{} ({source})",
-                        recovery.device, recovery.inode
-                    ),
-                )));
+                return Err(preserved_namespace_failure(&staged, error));
             }
             if let Err(source) =
                 exchange_files_between(&recovery.directory, &staged.path, directory, path)
             {
-                return Err(CommitError::BeforePublication(io::Error::new(
-                    source.kind(),
-                    format!(
-                        "patch staging data was preserved as recovery file '{RECOVERY_DIRECTORY}/{}' because publication failed ({source})",
-                        staged.path.display()
-                    ),
-                )));
+                return Err(preserved_commit_failure(
+                    directory, recovery, &staged, source,
+                ));
             }
             #[cfg(test)]
             if INJECT_RECOVERY_POLICY_FAILURE_AFTER_EXCHANGE
@@ -541,7 +563,7 @@ impl CodingWorkspace {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (directory, recovery, staged, path, expected);
-            Err(CommitError::BeforePublication(io::Error::new(
+            Err(CommitError::before(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "atomic identity-bound patch commits are not supported on this platform",
             )))
@@ -636,7 +658,10 @@ struct RecoveryNamespace {
 }
 
 pub(crate) enum AtomicReplaceError {
-    BeforePublication(io::Error),
+    BeforePublication {
+        source: io::Error,
+        recovery: Option<PublishedRecovery>,
+    },
     Published {
         source: io::Error,
         target: PathBuf,
@@ -644,10 +669,50 @@ pub(crate) enum AtomicReplaceError {
     },
 }
 
+impl AtomicReplaceError {
+    fn before(source: io::Error) -> Self {
+        let recovery =
+            preserved_recovery_from_io_error(&source).map(PublishedRecovery::LocatedVerified);
+        Self::BeforePublication { source, recovery }
+    }
+}
+
+pub(crate) enum AtomicCreateError {
+    BeforePublication {
+        source: io::Error,
+        recovery: Option<PublishedRecovery>,
+    },
+    Published {
+        source: io::Error,
+        target: PathBuf,
+    },
+}
+
+impl AtomicCreateError {
+    fn before(source: io::Error) -> Self {
+        let recovery =
+            preserved_recovery_from_io_error(&source).map(PublishedRecovery::LocatedVerified);
+        Self::BeforePublication { source, recovery }
+    }
+}
+
+#[cfg(test)]
+impl AtomicCreateError {
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::BeforePublication { source, .. } | Self::Published { source, .. } => {
+                source.kind()
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum PublishedRecovery {
     LocatedVerified(PathBuf),
+    LocatedContentUnverified(PathBuf),
     LocatedPolicyUnverified(PathBuf),
+    NotApplicableNewFile,
     Unlocated,
 }
 
@@ -655,25 +720,56 @@ impl PublishedRecovery {
     fn within_parent(self, parent: &Path) -> Self {
         match self {
             Self::LocatedVerified(path) => Self::LocatedVerified(parent.join(path)),
+            Self::LocatedContentUnverified(path) => {
+                Self::LocatedContentUnverified(parent.join(path))
+            }
             Self::LocatedPolicyUnverified(path) => Self::LocatedPolicyUnverified(parent.join(path)),
+            Self::NotApplicableNewFile => Self::NotApplicableNewFile,
             Self::Unlocated => Self::Unlocated,
         }
     }
 }
 
-enum CommitError {
+enum CommitNewError {
     BeforePublication(io::Error),
+    Published(io::Error),
+}
+
+#[cfg(test)]
+impl CommitNewError {
+    fn kind(&self) -> io::ErrorKind {
+        match self {
+            Self::BeforePublication(source) | Self::Published(source) => source.kind(),
+        }
+    }
+}
+
+enum CommitError {
+    BeforePublication {
+        source: io::Error,
+        recovery: Option<PublishedRecovery>,
+    },
     Published {
         source: io::Error,
         recovery: PublishedRecovery,
     },
 }
 
+impl CommitError {
+    fn before(source: io::Error) -> Self {
+        let recovery =
+            preserved_recovery_from_io_error(&source).map(PublishedRecovery::LocatedVerified);
+        Self::BeforePublication { source, recovery }
+    }
+}
+
 #[cfg(test)]
 impl CommitError {
     fn kind(&self) -> io::ErrorKind {
         match self {
-            Self::BeforePublication(source) | Self::Published { source, .. } => source.kind(),
+            Self::BeforePublication { source, .. } | Self::Published { source, .. } => {
+                source.kind()
+            }
         }
     }
 }
@@ -681,14 +777,6 @@ impl CommitError {
 enum RecoveryNamespaceError {
     Identity(io::Error),
     Policy(io::Error),
-}
-
-impl RecoveryNamespaceError {
-    fn into_io(self) -> io::Error {
-        match self {
-            Self::Identity(source) | Self::Policy(source) => source,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1109,6 +1197,76 @@ fn validate_recovery_namespace_slot(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preserved_content_failure(
+    parent: &Dir,
+    recovery: &RecoveryNamespace,
+    staged: &StagedFile,
+    source: io::Error,
+) -> CommitError {
+    let path = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
+    match validate_recovery_namespace_slot(parent, recovery) {
+        Ok(()) => CommitError::BeforePublication {
+            source,
+            recovery: Some(PublishedRecovery::LocatedContentUnverified(path)),
+        },
+        Err(error) => preserved_namespace_failure_with_source(staged, error, source),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preserved_commit_failure(
+    parent: &Dir,
+    recovery: &RecoveryNamespace,
+    staged: &StagedFile,
+    source: io::Error,
+) -> CommitError {
+    let path = PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path);
+    match validate_recovery_namespace_slot(parent, recovery) {
+        Ok(()) => CommitError::BeforePublication {
+            source,
+            recovery: Some(PublishedRecovery::LocatedVerified(path)),
+        },
+        Err(error) => preserved_namespace_failure_with_source(staged, error, source),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preserved_namespace_failure(staged: &StagedFile, error: RecoveryNamespaceError) -> CommitError {
+    let source = match &error {
+        RecoveryNamespaceError::Identity(source) | RecoveryNamespaceError::Policy(source) => {
+            io::Error::new(source.kind(), source.to_string())
+        }
+    };
+    preserved_namespace_failure_with_source(staged, error, source)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn preserved_namespace_failure_with_source(
+    staged: &StagedFile,
+    error: RecoveryNamespaceError,
+    source: io::Error,
+) -> CommitError {
+    match error {
+        RecoveryNamespaceError::Policy(policy) => CommitError::BeforePublication {
+            source: io::Error::new(
+                source.kind(),
+                format!("{source}; recovery policy validation failed ({policy})"),
+            ),
+            recovery: Some(PublishedRecovery::LocatedPolicyUnverified(
+                PathBuf::from(RECOVERY_DIRECTORY).join(&staged.path),
+            )),
+        },
+        RecoveryNamespaceError::Identity(identity) => CommitError::BeforePublication {
+            source: io::Error::new(
+                source.kind(),
+                format!("{source}; recovery namespace identity was lost ({identity})"),
+            ),
+            recovery: Some(PublishedRecovery::Unlocated),
+        },
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn published_commit_failure(
     parent: &Dir,
     recovery: &RecoveryNamespace,
@@ -1376,11 +1534,38 @@ fn cleanup_expected_staging_after_error<T>(
         })?;
     Err(io::Error::new(
         source.kind(),
-        format!(
-            "patch operation failed ({source}); owned staging data was preserved as recovery file '{}'",
-            recovery.display()
-        ),
+        PreservedStagingError { source, recovery },
     ))
+}
+
+#[derive(Debug)]
+struct PreservedStagingError {
+    source: io::Error,
+    recovery: PathBuf,
+}
+
+impl fmt::Display for PreservedStagingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "patch operation failed ({}); owned staging data was preserved as recovery file '{}'",
+            self.source,
+            self.recovery.display()
+        )
+    }
+}
+
+impl Error for PreservedStagingError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn preserved_recovery_from_io_error(source: &io::Error) -> Option<PathBuf> {
+    source
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<PreservedStagingError>())
+        .map(|source| source.recovery.clone())
 }
 
 fn cleanup_owned_staging_after_error<T>(
@@ -2076,7 +2261,7 @@ mod tests {
             .create_dir(super::RECOVERY_DIRECTORY)
             .expect("replacement namespace is created");
 
-        workspace
+        let error = workspace
             .commit_existing_file(
                 &directory,
                 &recovery,
@@ -2085,6 +2270,14 @@ mod tests {
                 metadata,
             )
             .expect_err("namespace identity drift must reject publication");
+
+        let super::CommitError::BeforePublication {
+            recovery: Some(super::PublishedRecovery::Unlocated),
+            ..
+        } = error
+        else {
+            panic!("pre-publication namespace drift must retain an unlocated recovery state");
+        };
 
         assert_eq!(
             std::fs::read_to_string(root.join("target.txt")).unwrap(),
@@ -2175,6 +2368,13 @@ mod tests {
             .expect_err("create-new commit must not replace an existing file");
 
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        let super::AtomicCreateError::BeforePublication {
+            recovery: Some(super::PublishedRecovery::LocatedVerified(recovery)),
+            ..
+        } = error
+        else {
+            panic!("preserved create-new staging data must have a structured recovery path");
+        };
         assert_eq!(
             std::fs::read_to_string(root.join("owned.txt")).unwrap(),
             "concurrent owner\n"
@@ -2190,9 +2390,42 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(recoveries.len(), 1);
+        assert_eq!(recoveries[0].path(), root.join(&recovery));
         assert_eq!(
             std::fs::read_to_string(recoveries[0].path()).unwrap(),
             "patch content\n"
+        );
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn new_file_post_publication_failure_retains_published_state() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-workspace-create-published-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        super::INJECT_NEW_FILE_VALIDATION_FAILURE_AFTER_RENAME.with(|injected| injected.set(true));
+
+        let error = workspace
+            .create_new(std::path::Path::new("created.txt"), b"published\n")
+            .expect_err("post-publication validation failure must remain structured");
+
+        let super::AtomicCreateError::Published { target, .. } = error else {
+            panic!("failure must retain new-file publication state");
+        };
+        assert_eq!(target, std::path::Path::new("created.txt"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("created.txt")).unwrap(),
+            "published\n"
         );
 
         drop(workspace);

@@ -30,9 +30,13 @@ async-signal-safe 的 `fchdir`，直接绑定已打开的 workspace handle；无
 平台应安全拒绝。Issue #7 还限制完整序列化输出、把取消传播到整个进程组，并让 pipe
 reader 可停止回收。进程组 leader 退出后不能先 reap 再继续用它的 PID 作为 PGID：
 该数值可能被复用，后续探测或取消会等待、甚至终止无关进程。macOS/Linux 实现应先用
-`waitid(..., WNOWAIT)` 观察终态。外层 shell supervisor 显式等待自己启动的 background
-job；leader 终态后仍保留其身份，先终止同组残余成员，再完成 reap。成功提交不应依赖
+`waitid(..., WNOWAIT)` 观察终态，并为该组保留一个由父进程直接持有的 sentinel。
+用户 shell 源码保持原样；leader 终态后仍保留其身份，先终止 background 与同组残余成员，
+再完成 leader/sentinel reap。成功提交不应依赖
 `/proc` 或 `libproc` 的非原子成员快照；无法提供非回收终态观察的平台应在 spawn 前拒绝。
+Linux 额外用 `no_new_privs` 阻止后代通过 exec 获得新的 signal 权限；macOS 没有等价的
+portable primitive，因此 manifest 与 output 只能承诺向仍可 signal 的同组成员请求终止，
+不能把 credential-changing descendant 描述为已验证回收。
 read-only 与 mutating command 的细粒度分类属于 Issue #8。
 
 ## 下次怎么做

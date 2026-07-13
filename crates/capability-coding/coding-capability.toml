@@ -66,7 +66,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "run_command"
-description = "Run a shell command in a workspace-bound foreground process group; wait for direct shell jobs, seal same-group residuals before return, and leave detached descendants untracked."
+description = "Run an unmodified shell command in a workspace-bound foreground process group; request termination of signal-compatible background and same-group residuals when the foreground shell exits, while leaving detached or credential-changing descendants outside the portable tracking contract."
 safety_class = "call_dependent"
 
 [tools.input_schema]
