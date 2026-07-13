@@ -65,10 +65,22 @@ pub(crate) struct ToolDispatcherIdentity(u64);
 impl ToolDispatcherIdentity {
     pub(crate) fn fresh() -> Self {
         static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
-        let identity = NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(identity, 0, "tool dispatcher identity space exhausted");
+        let identity = next_dispatcher_identity(&NEXT_IDENTITY)
+            .expect("tool dispatcher identity space exhausted");
         Self(identity)
     }
+}
+
+fn next_dispatcher_identity(identities: &AtomicU64) -> Option<u64> {
+    identities
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            if identity == 0 {
+                None
+            } else {
+                identity.checked_add(1)
+            }
+        })
+        .ok()
 }
 
 #[derive(Debug, PartialEq)]
@@ -263,4 +275,22 @@ pub struct ToolError {
     pub message: String,
     /// Whether retrying the same low-level tool call is expected to help.
     pub retryable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::next_dispatcher_identity;
+
+    #[test]
+    fn dispatcher_identity_exhaustion_never_wraps_or_reuses_an_id() {
+        let identities = AtomicU64::new(u64::MAX - 1);
+
+        assert_eq!(next_dispatcher_identity(&identities), Some(u64::MAX - 1));
+        assert_eq!(identities.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(next_dispatcher_identity(&identities), None);
+        assert_eq!(next_dispatcher_identity(&identities), None);
+        assert_eq!(identities.load(Ordering::Relaxed), u64::MAX);
+    }
 }
