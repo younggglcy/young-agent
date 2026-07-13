@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use young_agent_runtime::{
     AgentEvent, AgentEventSink, AgentRuntime, AgentRuntimeError, ApprovalDecision, ApprovalRequest,
-    EventDurability, RunControl, RunControlFlow, RunId, RunRequest, RunStatus, RunStopToken,
-    TerminalRunStatus,
+    EventDurability, EventSequence, RunControl, RunControlFlow, RunId, RunRequest, RunStatus,
+    RunStopToken, TerminalRunStatus,
 };
 use young_event_store::JsonlEventStore;
 use young_model_runtime::{
@@ -196,6 +196,24 @@ struct AmbiguousNonCloneSink {
     failed: bool,
 }
 
+struct AmbiguousJsonlSink {
+    store: JsonlEventStore,
+    timing: AmbiguousFailureTiming,
+    model_outputs_seen: usize,
+    failed: bool,
+}
+
+impl AmbiguousJsonlSink {
+    fn new(store: JsonlEventStore, timing: AmbiguousFailureTiming) -> Self {
+        Self {
+            store,
+            timing,
+            model_outputs_seen: 0,
+            failed: false,
+        }
+    }
+}
+
 impl AmbiguousNonCloneSink {
     fn new(timing: AmbiguousFailureTiming, target: AmbiguousFailureTarget) -> Self {
         Self {
@@ -243,12 +261,16 @@ struct DurabilitySpySink {
 impl AgentEventSink for DurabilitySpySink {
     type Error = TestSinkError;
 
-    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append(&mut self, _sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error> {
         self.events.borrow_mut().push((event.clone(), false));
         Ok(())
     }
 
-    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append_durable(
+        &mut self,
+        _sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error> {
         self.events.borrow_mut().push((event.clone(), true));
         Ok(())
     }
@@ -266,7 +288,7 @@ impl FailOnceOnToolResultSink {
 impl AgentEventSink for FailOnceOnToolResultSink {
     type Error = TestSinkError;
 
-    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append(&mut self, _sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error> {
         if matches!(event, AgentEvent::ToolResult { .. }) && self.should_fail.replace(false) {
             return Err(TestSinkError);
         }
@@ -274,20 +296,28 @@ impl AgentEventSink for FailOnceOnToolResultSink {
         Ok(())
     }
 
-    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
-        self.append(event)
+    fn append_durable(
+        &mut self,
+        sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error> {
+        self.append(sequence, event)
     }
 }
 
 impl AgentEventSink for FailOnRunFinishedSink {
     type Error = TestSinkError;
 
-    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append(&mut self, _sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error> {
         self.events.borrow_mut().push(event.clone());
         Ok(())
     }
 
-    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append_durable(
+        &mut self,
+        _sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error> {
         if matches!(event, AgentEvent::RunFinished { .. }) {
             return Err(TestSinkError);
         }
@@ -299,12 +329,49 @@ impl AgentEventSink for FailOnRunFinishedSink {
 impl AgentEventSink for AmbiguousNonCloneSink {
     type Error = TestSinkError;
 
-    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append(&mut self, _sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error> {
         self.append_ambiguously(event)
     }
 
-    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
+    fn append_durable(
+        &mut self,
+        _sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error> {
         self.append_ambiguously(event)
+    }
+}
+
+impl AgentEventSink for AmbiguousJsonlSink {
+    type Error = TestSinkError;
+
+    fn append(&mut self, sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error> {
+        if matches!(event, AgentEvent::ModelOutput { .. }) {
+            self.model_outputs_seen += 1;
+        }
+        if !self.failed
+            && self.model_outputs_seen == 2
+            && matches!(event, AgentEvent::ModelOutput { .. })
+        {
+            self.failed = true;
+            if matches!(self.timing, AmbiguousFailureTiming::AfterCommit) {
+                <JsonlEventStore as AgentEventSink>::append(&mut self.store, sequence, event)
+                    .expect("fault injection should fail only after JSONL append commits");
+            }
+            return Err(TestSinkError);
+        }
+
+        <JsonlEventStore as AgentEventSink>::append(&mut self.store, sequence, event)
+            .map_err(|_| TestSinkError)
+    }
+
+    fn append_durable(
+        &mut self,
+        sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error> {
+        <JsonlEventStore as AgentEventSink>::append_durable(&mut self.store, sequence, event)
+            .map_err(|_| TestSinkError)
     }
 }
 
@@ -1355,6 +1422,104 @@ fn buffered_error_persistence_failure_carries_the_attempted_event_for_reconcilia
                 .count(),
             1
         );
+    }
+}
+
+#[test]
+fn repeated_buffered_events_reconcile_by_sequence_on_the_real_jsonl_store() {
+    for (name, timing) in [
+        (
+            "buffered-reconcile-before-commit",
+            AmbiguousFailureTiming::BeforeCommit,
+        ),
+        (
+            "buffered-reconcile-after-commit",
+            AmbiguousFailureTiming::AfterCommit,
+        ),
+    ] {
+        let log = TestLog::new(name);
+        let sink = AmbiguousJsonlSink::new(JsonlEventStore::new(log.path()), timing);
+        let model = FakeModelClient::new([ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "same".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::TextDelta {
+                delta: "same".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ])]);
+        let mut runtime = AgentRuntime::new(model, FakeToolExecutor::default(), sink);
+
+        let error = runtime
+            .run(run_request("run-buffered-reconciliation"))
+            .expect_err("the second identical ModelOutput append should be ambiguous");
+
+        let (sequence, event, durability) = match error {
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                sequence,
+                event,
+                durability,
+                ..
+            } => (sequence, *event, durability),
+            other => panic!("expected event persistence recovery error, got {other:?}"),
+        };
+        assert_eq!(sequence, EventSequence::new(4));
+        assert_eq!(durability, EventDurability::Buffered);
+        assert!(matches!(
+            &event,
+            AgentEvent::ModelOutput {
+                event: ModelStreamEvent::TextDelta { delta, .. },
+                ..
+            } if delta == "same"
+        ));
+
+        runtime
+            .event_sink()
+            .store
+            .reconcile(sequence, &event, durability)
+            .expect("ambiguous buffered append should reconcile by sequence");
+        runtime
+            .event_sink()
+            .store
+            .reconcile(sequence, &event, durability)
+            .expect("repeated sequence reconciliation should be idempotent");
+
+        let events = runtime
+            .event_sink()
+            .store
+            .read_all()
+            .expect("reconciled Event Log should read");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|candidate| {
+                    matches!(
+                        candidate,
+                        AgentEvent::ModelOutput {
+                            event: ModelStreamEvent::TextDelta { delta, .. },
+                            ..
+                        } if delta == "same"
+                    )
+                })
+                .count(),
+            2
+        );
+        let sequences = std::fs::read_to_string(log.path())
+            .expect("reconciled log bytes should read")
+            .lines()
+            .filter_map(|line| {
+                let record: serde_json::Value =
+                    serde_json::from_str(line).expect("record should be valid JSON");
+                matches!(record.get("type"), Some(serde_json::Value::String(kind)) if kind == "model_output")
+                    .then(|| record["event_sequence"].as_u64().expect("runtime records are sequenced"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, [3, 4]);
     }
 }
 

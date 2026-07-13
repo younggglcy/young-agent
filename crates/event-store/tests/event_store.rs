@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use young_agent_runtime::{AgentEvent, RunStatus, TerminalRunStatus};
+use young_agent_runtime::{
+    AgentEvent, AgentEventSink, EventDurability, EventSequence, RunStatus, TerminalRunStatus,
+};
 use young_event_store::{EventStoreError, JsonlEventStore, ReplayCompatibility, ReplayError};
 
 struct TestLog {
@@ -37,9 +39,22 @@ fn agent_event(value: Value) -> AgentEvent {
     serde_json::from_value(value).expect("fixture should be a valid AgentEvent")
 }
 
+fn turn_started_event() -> AgentEvent {
+    agent_event(json!({
+        "type": "turn_started",
+        "run_id": "run-001",
+        "turn_id": "turn-001"
+    }))
+}
+
 fn approval_result_events(decision: Value, output: Value) -> Vec<AgentEvent> {
     vec![
         agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "turn_started",
+            "run_id": "run-001",
+            "turn_id": "turn-001"
+        })),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -150,6 +165,51 @@ fn append_writes_one_canonical_agent_event_per_jsonl_line() {
         (contents.ends_with('\n'), actual_records),
         (true, expected_records)
     );
+}
+
+#[test]
+fn sequenced_event_logs_reject_gaps_duplicates_and_mixed_legacy_records() {
+    for (name, first_sequence, second_sequence, expected, found) in [
+        ("sequence-gap", Some(1), Some(3), Some(2), Some(3)),
+        ("sequence-duplicate", Some(1), Some(1), Some(2), Some(1)),
+        ("sequence-mixed", None, Some(2), None, Some(2)),
+    ] {
+        let log = TestLog::new(name);
+        let mut store = JsonlEventStore::new(log.path());
+        let first = agent_event(json!({ "type": "run_started", "run_id": "run-001" }));
+        let second = turn_started_event();
+        if let Some(sequence) = first_sequence {
+            <JsonlEventStore as AgentEventSink>::append(
+                &mut store,
+                EventSequence::new(sequence),
+                &first,
+            )
+            .expect("first physical record should append");
+        } else {
+            store.append(&first).expect("legacy fixture should append");
+        }
+        <JsonlEventStore as AgentEventSink>::append(
+            &mut store,
+            EventSequence::new(second_sequence.expect("second record is sequenced")),
+            &second,
+        )
+        .expect("invalid physical sequence fixture should append");
+
+        let error = store
+            .read_all()
+            .expect_err("non-canonical event sequence must fail decoding");
+
+        assert!(matches!(
+            error,
+            EventStoreError::InvalidEventSequence {
+                line: 2,
+                expected: actual_expected,
+                found: actual_found,
+                ..
+            } if actual_expected.map(EventSequence::as_u64) == expected
+                && actual_found.map(EventSequence::as_u64) == found
+        ));
+    }
 }
 
 #[test]
@@ -316,6 +376,7 @@ fn replay_reconstructs_a_run_waiting_for_tool_approval() {
             "type": "run_started",
             "run_id": "run-001"
         })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -368,6 +429,7 @@ fn replay_reconstructs_a_run_waiting_for_tool_approval() {
 fn strict_replay_requires_approval_resolution_before_a_tool_result() {
     let events = vec![
         agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -409,7 +471,7 @@ fn strict_replay_requires_approval_resolution_before_a_tool_result() {
     assert!(matches!(
         error,
         ReplayError::ToolResultBeforeApprovalResolution {
-            event_number: 4,
+            event_number: 5,
             ref call_id,
         } if call_id.as_str() == "tool-call-001"
     ));
@@ -426,6 +488,7 @@ fn strict_replay_requires_approval_resolution_before_a_tool_result() {
 fn legacy_replay_rejects_mixed_approval_event_formats() {
     let events = vec![
         agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -486,7 +549,7 @@ fn legacy_replay_rejects_mixed_approval_event_formats() {
 
     assert!(matches!(
         error,
-        ReplayError::MixedApprovalLogFormats { event_number: 7 }
+        ReplayError::MixedApprovalLogFormats { event_number: 8 }
     ));
 }
 
@@ -494,6 +557,7 @@ fn legacy_replay_rejects_mixed_approval_event_formats() {
 fn legacy_replay_still_validates_the_reserved_denial_shape() {
     let events = vec![
         agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -538,7 +602,7 @@ fn legacy_replay_still_validates_the_reserved_denial_shape() {
     assert!(matches!(
         error,
         ReplayError::InvalidApprovalDenialResult {
-            event_number: 4,
+            event_number: 5,
             ref call_id,
         } if call_id.as_str() == "tool-call-001"
     ));
@@ -548,6 +612,7 @@ fn legacy_replay_still_validates_the_reserved_denial_shape() {
 fn replay_rejects_successful_completion_with_an_unresolved_tool_call() {
     let events = vec![
         agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -571,7 +636,7 @@ fn replay_rejects_successful_completion_with_an_unresolved_tool_call() {
     assert!(matches!(
         error,
         ReplayError::TerminalWithUnresolvedToolCalls {
-            event_number: 3,
+            event_number: 4,
             ref call_ids,
         } if call_ids == &[young_tool_runtime::ToolCallId::new("tool-call-001")]
     ));
@@ -625,12 +690,152 @@ fn replay_rejects_an_event_from_a_different_run() {
 }
 
 #[test]
+fn replay_rejects_tool_events_for_a_turn_that_never_started() {
+    let events = vec![
+        agent_event(json!({ "type": "run_started", "run_id": "run-001" })),
+        agent_event(json!({
+            "type": "tool_call_requested",
+            "run_id": "run-001",
+            "turn_id": "turn-missing",
+            "model_tool_call_id": "model-call-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "read_file",
+                "arguments": { "path": "README.md" }
+            }
+        })),
+    ];
+
+    let error = young_event_store::replay_events(events)
+        .expect_err("turn-scoped events require a preceding TurnStarted");
+
+    assert!(matches!(
+        error,
+        ReplayError::EventForUnknownTurn {
+            event_number: 2,
+            ref turn_id,
+        } if turn_id.as_str() == "turn-missing"
+    ));
+}
+
+#[test]
+fn replay_rejects_every_cross_turn_tool_lifecycle_edge() {
+    let run_started = agent_event(json!({ "type": "run_started", "run_id": "run-001" }));
+    let turn_one = agent_event(json!({
+        "type": "turn_started",
+        "run_id": "run-001",
+        "turn_id": "turn-001"
+    }));
+    let turn_two = agent_event(json!({
+        "type": "turn_started",
+        "run_id": "run-001",
+        "turn_id": "turn-002"
+    }));
+    let requested = agent_event(json!({
+        "type": "tool_call_requested",
+        "run_id": "run-001",
+        "turn_id": "turn-001",
+        "model_tool_call_id": "model-call-001",
+        "call": {
+            "id": "tool-call-001",
+            "tool_name": "run_command",
+            "arguments": { "command": "cargo test" }
+        }
+    }));
+    let approval_on_turn_one = agent_event(json!({
+        "type": "approval_requested",
+        "run_id": "run-001",
+        "turn_id": "turn-001",
+        "request": {
+            "id": "approval-001",
+            "call": {
+                "id": "tool-call-001",
+                "tool_name": "run_command",
+                "arguments": { "command": "cargo test" }
+            },
+            "reason": "command requires approval"
+        }
+    }));
+    let cases = [
+        (
+            vec![agent_event(json!({
+                "type": "approval_requested",
+                "run_id": "run-001",
+                "turn_id": "turn-002",
+                "request": {
+                    "id": "approval-001",
+                    "call": {
+                        "id": "tool-call-001",
+                        "tool_name": "run_command",
+                        "arguments": { "command": "cargo test" }
+                    },
+                    "reason": "command requires approval"
+                }
+            }))],
+            5,
+        ),
+        (
+            vec![
+                approval_on_turn_one,
+                agent_event(json!({
+                    "type": "approval_resolved",
+                    "run_id": "run-001",
+                    "turn_id": "turn-002",
+                    "approval_id": "approval-001",
+                    "decision": { "decision": "approve" }
+                })),
+            ],
+            6,
+        ),
+        (
+            vec![agent_event(json!({
+                "type": "tool_result",
+                "run_id": "run-001",
+                "turn_id": "turn-002",
+                "result": {
+                    "call_id": "tool-call-001",
+                    "output": { "status": "success", "content": [] }
+                }
+            }))],
+            5,
+        ),
+    ];
+
+    for (suffix, expected_event_number) in cases {
+        let mut events = vec![
+            run_started.clone(),
+            turn_one.clone(),
+            turn_two.clone(),
+            requested.clone(),
+        ];
+        events.extend(suffix);
+
+        let error = young_event_store::replay_events(events)
+            .expect_err("a tool lifecycle cannot cross turn boundaries");
+
+        assert!(matches!(
+            error,
+            ReplayError::MismatchedToolLifecycleTurn {
+                event_number,
+                ref call_id,
+                ref expected,
+                ref found,
+            } if event_number == expected_event_number
+                && call_id.as_str() == "tool-call-001"
+                && expected.as_str() == "turn-001"
+                && found.as_str() == "turn-002"
+        ));
+    }
+}
+
+#[test]
 fn replay_rejects_approval_after_the_tool_call_has_a_result() {
     let events = vec![
         agent_event(json!({
             "type": "run_started",
             "run_id": "run-001"
         })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -684,7 +889,7 @@ fn replay_rejects_approval_after_the_tool_call_has_a_result() {
                 call_id.as_str(),
                 message.contains("already has a result"),
             ),
-            (4, "tool-call-001", true)
+            (5, "tool-call-001", true)
         ),
         other => panic!("expected approval-after-result error, got {other:?}"),
     }
@@ -697,6 +902,7 @@ fn replay_rejects_approval_resolution_after_a_tool_result() {
             "type": "run_started",
             "run_id": "run-001"
         })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -749,7 +955,7 @@ fn replay_rejects_approval_resolution_after_a_tool_result() {
     assert!(matches!(
         error,
         ReplayError::ApprovalResolutionAfterToolResult {
-            event_number: 5,
+            event_number: 6,
             ref approval_id,
         } if approval_id == "approval-001"
     ));
@@ -762,6 +968,7 @@ fn replay_rejects_a_tool_result_after_approval_was_denied() {
             "type": "run_started",
             "run_id": "run-001"
         })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -811,7 +1018,7 @@ fn replay_rejects_a_tool_result_after_approval_was_denied() {
     assert!(matches!(
         error,
         ReplayError::InvalidApprovalDenialResult {
-            event_number: 5,
+            event_number: 6,
             ref call_id,
         } if call_id.as_str() == "tool-call-001"
     ));
@@ -837,7 +1044,7 @@ fn replay_requires_the_exact_canonical_result_for_a_denied_approval() {
     assert!(matches!(
         error,
         ReplayError::InvalidApprovalDenialResult {
-            event_number: 5,
+            event_number: 6,
             ref call_id,
         } if call_id.as_str() == "tool-call-001"
     ));
@@ -863,7 +1070,7 @@ fn replay_rejects_the_reserved_denial_result_after_approval() {
     assert!(matches!(
         error,
         ReplayError::InvalidApprovalDenialResult {
-            event_number: 5,
+            event_number: 6,
             ref call_id,
         } if call_id.as_str() == "tool-call-001"
     ));
@@ -957,6 +1164,7 @@ fn explicit_tail_repair_discards_only_the_uncommitted_final_record() {
             "type": "run_started",
             "run_id": "run-001"
         })),
+        turn_started_event(),
         agent_event(json!({
             "type": "tool_call_requested",
             "run_id": "run-001",
@@ -1028,7 +1236,8 @@ fn durable_event_reconciliation_is_idempotent_before_and_after_commit() {
         ("reconcile-after-commit", true),
     ] {
         let log = TestLog::new(name);
-        let store = JsonlEventStore::new(log.path());
+        let mut store = JsonlEventStore::new(log.path());
+        let sequence = EventSequence::new(1);
         let event = agent_event(json!({
             "type": "approval_resolved",
             "run_id": "run-001",
@@ -1040,16 +1249,15 @@ fn durable_event_reconciliation_is_idempotent_before_and_after_commit() {
             }
         }));
         if already_committed {
-            store
-                .append_durable(&event)
+            <JsonlEventStore as AgentEventSink>::append_durable(&mut store, sequence, &event)
                 .expect("fixture event should commit durably");
         }
 
         store
-            .reconcile_durable(&event)
+            .reconcile(sequence, &event, EventDurability::Durable)
             .expect("first reconciliation should establish one durable event");
         store
-            .reconcile_durable(&event)
+            .reconcile(sequence, &event, EventDurability::Durable)
             .expect("repeated reconciliation should be idempotent");
 
         assert_eq!(
@@ -1060,9 +1268,9 @@ fn durable_event_reconciliation_is_idempotent_before_and_after_commit() {
 }
 
 #[test]
-fn durable_event_reconciliation_rejects_conflicting_identity() {
+fn durable_event_reconciliation_rejects_a_later_conflicting_identity() {
     let log = TestLog::new("reconcile-conflict");
-    let store = JsonlEventStore::new(log.path());
+    let mut store = JsonlEventStore::new(log.path());
     let committed = agent_event(json!({
         "type": "approval_resolved",
         "run_id": "run-001",
@@ -1077,44 +1285,61 @@ fn durable_event_reconciliation_rejects_conflicting_identity() {
         "approval_id": "approval-001",
         "decision": { "decision": "deny", "reason": "late policy result" }
     }));
-    store
-        .append_durable(&committed)
-        .expect("fixture event should commit");
+    <JsonlEventStore as AgentEventSink>::append_durable(
+        &mut store,
+        EventSequence::new(1),
+        &committed,
+    )
+    .expect("fixture event should commit");
+    <JsonlEventStore as AgentEventSink>::append_durable(
+        &mut store,
+        EventSequence::new(2),
+        &conflicting,
+    )
+    .expect("fixture event should commit");
 
     let error = store
-        .reconcile_durable(&conflicting)
-        .expect_err("one durable identity cannot resolve to two payloads");
+        .reconcile(EventSequence::new(1), &committed, EventDurability::Durable)
+        .expect_err("a later conflicting durable identity must remain visible");
 
     assert!(matches!(
         error,
         EventStoreError::ReconciliationConflict { .. }
     ));
     assert_eq!(
-        store.read_all().expect("original log should read"),
-        [committed]
+        store.read_all().expect("conflicting log should read"),
+        [committed, conflicting]
     );
 }
 
 #[test]
-fn durable_event_reconciliation_rejects_events_without_stable_identity() {
-    let log = TestLog::new("reconcile-unsupported-event");
-    let store = JsonlEventStore::new(log.path());
-    let model_output = agent_event(json!({
-        "type": "model_output",
+fn durable_event_reconciliation_rejects_a_later_exact_duplicate() {
+    let log = TestLog::new("reconcile-duplicate");
+    let mut store = JsonlEventStore::new(log.path());
+    let event = agent_event(json!({
+        "type": "approval_resolved",
         "run_id": "run-001",
         "turn_id": "turn-001",
-        "event": { "type": "text_delta", "delta": "same" }
+        "approval_id": "approval-001",
+        "decision": { "decision": "approve" }
     }));
+    for sequence in [EventSequence::new(1), EventSequence::new(2)] {
+        <JsonlEventStore as AgentEventSink>::append_durable(&mut store, sequence, &event)
+            .expect("duplicate fixture should append physically");
+    }
 
     let error = store
-        .reconcile_durable(&model_output)
-        .expect_err("repeatable stream events have no idempotent durable identity");
+        .reconcile(EventSequence::new(1), &event, EventDurability::Durable)
+        .expect_err("duplicate durable identity must remain visible");
 
     assert!(matches!(
         error,
-        EventStoreError::UnsupportedReconciliationEvent { .. }
+        EventStoreError::ReconciliationConflict { .. }
     ));
-    assert!(!log.path().exists());
+    assert_eq!(
+        store.read_all().expect("duplicate log should read"),
+        [event.clone(), event]
+    );
 }
 
 #[test]

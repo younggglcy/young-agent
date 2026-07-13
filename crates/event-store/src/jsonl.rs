@@ -7,7 +7,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use young_agent_runtime::{AgentEvent, AgentEventSink};
+use young_agent_runtime::{AgentEvent, AgentEventSink, EventDurability, EventSequence};
 
 use crate::replay::{
     replay_events, replay_events_for_recovery, replay_events_with_compatibility,
@@ -24,6 +24,11 @@ pub struct JsonlEventStore {
 struct AppendFile {
     file: File,
     parent_directory_needs_sync: bool,
+}
+
+struct PersistedAgentEvent {
+    sequence: Option<EventSequence>,
+    event: AgentEvent,
 }
 
 impl fmt::Debug for JsonlEventStore {
@@ -57,68 +62,114 @@ impl JsonlEventStore {
 
     /// Appends one complete JSON record and flushes it to the operating system.
     pub fn append(&self, event: &AgentEvent) -> Result<(), EventStoreError> {
-        self.append_with_durability(event, false)
+        self.append_with_durability(None, event, false)
     }
 
     /// Appends one complete JSON record and synchronizes its bytes and newline
     /// commit marker to stable storage before returning.
     pub fn append_durable(&self, event: &AgentEvent) -> Result<(), EventStoreError> {
-        self.append_with_durability(event, true)
+        self.append_with_durability(None, event, true)
     }
 
-    /// Idempotently establishes one exact canonical event at the durable
-    /// boundary after an ambiguous append failure.
+    /// Idempotently establishes one sequenced canonical event after an
+    /// ambiguous append failure.
     ///
     /// The caller must ensure no live runtime or other recovery worker can
     /// append to this log. A committed matching record is synchronized again;
     /// an uncommitted tail is repaired before a missing record is appended.
-    pub fn reconcile_durable(&self, event: &AgentEvent) -> Result<(), EventStoreError> {
-        if !has_durable_identity(event) {
-            return Err(EventStoreError::UnsupportedReconciliationEvent {
+    pub fn reconcile(
+        &self,
+        sequence: EventSequence,
+        event: &AgentEvent,
+        durability: EventDurability,
+    ) -> Result<(), EventStoreError> {
+        let records = if self.path.exists() {
+            self.repair_truncated_tail()?;
+            self.read_all_records()?
+        } else {
+            Vec::new()
+        };
+        if records.iter().any(|record| record.sequence.is_none()) {
+            return Err(EventStoreError::ReconciliationConflict {
                 path: self.path.clone(),
-                event: Box::new(event.clone()),
+                sequence,
+                persisted: records.into_iter().map(|record| record.event).collect(),
+                attempted: Box::new(event.clone()),
             });
         }
-        if self.path.exists() {
-            self.repair_truncated_tail()?;
-            if let Some(persisted) = self
-                .read_all()?
-                .into_iter()
-                .find(|persisted| has_same_durable_identity(persisted, event))
-            {
-                if persisted != *event {
-                    return Err(EventStoreError::ReconciliationConflict {
-                        path: self.path.clone(),
-                        persisted: Box::new(persisted),
-                        attempted: Box::new(event.clone()),
-                    });
-                }
-                let file = OpenOptions::new()
-                    .read(true)
-                    .open(&self.path)
-                    .map_err(|source| EventStoreError::OpenForAppend {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                file.sync_data()
-                    .and_then(|()| self.sync_parent_directory())
-                    .map_err(|source| EventStoreError::Append {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                return Ok(());
+
+        let persisted = records
+            .iter()
+            .filter(|record| {
+                record.sequence == Some(sequence)
+                    || (durability == EventDurability::Durable
+                        && has_same_durable_identity(&record.event, event))
+            })
+            .collect::<Vec<_>>();
+        if persisted.len() == 1
+            && persisted[0].sequence == Some(sequence)
+            && persisted[0].event == *event
+        {
+            if durability == EventDurability::Durable {
+                self.sync_existing_log()?;
             }
+            return Ok(());
+        }
+        if !persisted.is_empty() {
+            return Err(EventStoreError::ReconciliationConflict {
+                path: self.path.clone(),
+                sequence,
+                persisted: persisted
+                    .into_iter()
+                    .map(|record| record.event.clone())
+                    .collect(),
+                attempted: Box::new(event.clone()),
+            });
+        }
+        let next_sequence = EventSequence::new(records.len() as u64 + 1);
+        if sequence != next_sequence {
+            return Err(EventStoreError::ReconciliationConflict {
+                path: self.path.clone(),
+                sequence,
+                persisted: records
+                    .last()
+                    .map(|record| vec![record.event.clone()])
+                    .unwrap_or_default(),
+                attempted: Box::new(event.clone()),
+            });
         }
 
-        self.append_durable(event)
+        self.append_with_durability(
+            Some(sequence),
+            event,
+            durability == EventDurability::Durable,
+        )
     }
 
     fn append_with_durability(
         &self,
+        sequence: Option<EventSequence>,
         event: &AgentEvent,
         durable: bool,
     ) -> Result<(), EventStoreError> {
-        let mut record = serde_json::to_vec(event).map_err(|source| EventStoreError::Encode {
+        let mut record = if let Some(sequence) = sequence {
+            let mut value =
+                serde_json::to_value(event).map_err(|source| EventStoreError::Encode {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            value
+                .as_object_mut()
+                .expect("AgentEvent serializes as a JSON object")
+                .insert(
+                    "event_sequence".to_string(),
+                    serde_json::Value::from(sequence.as_u64()),
+                );
+            serde_json::to_vec(&value)
+        } else {
+            serde_json::to_vec(event)
+        }
+        .map_err(|source| EventStoreError::Encode {
             path: self.path.clone(),
             source,
         })?;
@@ -155,6 +206,22 @@ impl JsonlEventStore {
             });
         }
         Ok(())
+    }
+
+    fn sync_existing_log(&self) -> Result<(), EventStoreError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .map_err(|source| EventStoreError::OpenForAppend {
+                path: self.path.clone(),
+                source,
+            })?;
+        file.sync_data()
+            .and_then(|()| self.sync_parent_directory())
+            .map_err(|source| EventStoreError::Append {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     fn sync_parent_directory(&self) -> io::Result<()> {
@@ -279,6 +346,14 @@ impl JsonlEventStore {
 
     /// Reads and decodes every record in physical line order.
     pub fn read_all(&self) -> Result<Vec<AgentEvent>, EventStoreError> {
+        Ok(self
+            .read_all_records()?
+            .into_iter()
+            .map(|record| record.event)
+            .collect())
+    }
+
+    fn read_all_records(&self) -> Result<Vec<PersistedAgentEvent>, EventStoreError> {
         let file = File::open(&self.path).map_err(|source| EventStoreError::OpenForRead {
             path: self.path.clone(),
             source,
@@ -286,6 +361,7 @@ impl JsonlEventStore {
         let mut reader = BufReader::new(file);
         let mut events = Vec::new();
         let mut line_number = 0;
+        let mut expected_sequence = None::<Option<EventSequence>>;
 
         loop {
             let mut record = Vec::new();
@@ -306,20 +382,67 @@ impl JsonlEventStore {
                 record.pop();
             }
 
-            let event = serde_json::from_slice(&record).map_err(|source| {
-                EventStoreError::DecodeRecord {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&record).map_err(|source| {
+                    EventStoreError::DecodeRecord {
+                        path: self.path.clone(),
+                        line: line_number,
+                        source,
+                    }
+                })?;
+            let sequence = value
+                .as_object_mut()
+                .and_then(|object| object.remove("event_sequence"))
+                .map(|value| {
+                    serde_json::from_value::<u64>(value)
+                        .map(EventSequence::new)
+                        .map_err(|source| EventStoreError::DecodeRecord {
+                            path: self.path.clone(),
+                            line: line_number,
+                            source,
+                        })
+                })
+                .transpose()?;
+            match expected_sequence {
+                None => {
+                    if let Some(found) = sequence {
+                        let expected = EventSequence::new(1);
+                        if found != expected {
+                            return Err(EventStoreError::InvalidEventSequence {
+                                path: self.path.clone(),
+                                line: line_number,
+                                expected: Some(expected),
+                                found: Some(found),
+                            });
+                        }
+                    }
+                }
+                Some(expected) if sequence != expected => {
+                    return Err(EventStoreError::InvalidEventSequence {
+                        path: self.path.clone(),
+                        line: line_number,
+                        expected,
+                        found: sequence,
+                    });
+                }
+                Some(_) => {}
+            }
+            expected_sequence = Some(
+                sequence.map(|sequence| EventSequence::new(sequence.as_u64().saturating_add(1))),
+            );
+            let event =
+                serde_json::from_value(value).map_err(|source| EventStoreError::DecodeRecord {
                     path: self.path.clone(),
                     line: line_number,
                     source,
-                }
-            })?;
+                })?;
             if !is_terminated {
                 return Err(EventStoreError::TruncatedRecord {
                     path: self.path.clone(),
                     line: line_number,
                 });
             }
-            events.push(event);
+            events.push(PersistedAgentEvent { sequence, event });
         }
 
         Ok(events)
@@ -358,17 +481,6 @@ impl JsonlEventStore {
             source,
         })
     }
-}
-
-fn has_durable_identity(event: &AgentEvent) -> bool {
-    matches!(
-        event,
-        AgentEvent::ToolCallRequested { .. }
-            | AgentEvent::ApprovalRequested { .. }
-            | AgentEvent::ApprovalResolved { .. }
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::RunFinished { .. }
-    )
 }
 
 fn has_same_durable_identity(left: &AgentEvent, right: &AgentEvent) -> bool {
@@ -436,12 +548,16 @@ fn has_same_durable_identity(left: &AgentEvent, right: &AgentEvent) -> bool {
 impl AgentEventSink for JsonlEventStore {
     type Error = EventStoreError;
 
-    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
-        JsonlEventStore::append(self, event)
+    fn append(&mut self, sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error> {
+        self.append_with_durability(Some(sequence), event, false)
     }
 
-    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error> {
-        JsonlEventStore::append_durable(self, event)
+    fn append_durable(
+        &mut self,
+        sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error> {
+        self.append_with_durability(Some(sequence), event, true)
     }
 }
 
@@ -495,17 +611,20 @@ pub enum EventStoreError {
         path: PathBuf,
         line: usize,
     },
+    InvalidEventSequence {
+        path: PathBuf,
+        line: usize,
+        expected: Option<EventSequence>,
+        found: Option<EventSequence>,
+    },
     Replay {
         path: PathBuf,
         source: ReplayError,
     },
-    UnsupportedReconciliationEvent {
-        path: PathBuf,
-        event: Box<AgentEvent>,
-    },
     ReconciliationConflict {
         path: PathBuf,
-        persisted: Box<AgentEvent>,
+        sequence: EventSequence,
+        persisted: Vec<AgentEvent>,
         attempted: Box<AgentEvent>,
     },
 }
@@ -568,23 +687,30 @@ impl fmt::Display for EventStoreError {
                 "truncated Agent Event in '{}' at line {line}: record is not terminated by a newline",
                 path.display()
             ),
+            Self::InvalidEventSequence {
+                path,
+                line,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "invalid Agent Event sequence in '{}' at line {line}: expected {expected:?}, found {found:?}",
+                path.display()
+            ),
             Self::Replay { path, source } => write!(
                 formatter,
                 "failed to replay Event Log '{}': {source}",
                 path.display()
             ),
-            Self::UnsupportedReconciliationEvent { path, event } => write!(
-                formatter,
-                "cannot idempotently reconcile Agent Event without a durable identity in '{}': {event:?}",
-                path.display()
-            ),
             Self::ReconciliationConflict {
                 path,
+                sequence,
                 persisted,
                 attempted,
             } => write!(
                 formatter,
-                "durable Agent Event identity has conflicting payloads in '{}'; persisted {persisted:?}, attempted {attempted:?}",
+                "Agent Event sequence {} or its durable lifecycle identity has conflicting records in '{}'; persisted {persisted:?}, attempted {attempted:?}",
+                sequence.as_u64(),
                 path.display()
             ),
         }
@@ -604,7 +730,7 @@ impl Error for EventStoreError {
             | Self::ReadRecord { source, .. } => Some(source),
             Self::UnterminatedLog { .. }
             | Self::TruncatedRecord { .. }
-            | Self::UnsupportedReconciliationEvent { .. }
+            | Self::InvalidEventSequence { .. }
             | Self::ReconciliationConflict { .. } => None,
             Self::Replay { source, .. } => Some(source),
         }

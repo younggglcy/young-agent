@@ -6,6 +6,7 @@ use std::fmt;
 
 use young_agent_runtime::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
+    TurnId,
 };
 use young_model_runtime::ModelToolCallId;
 use young_tool_runtime::execution::{ToolCall, ToolCallId, ToolOutput, ToolResult};
@@ -26,6 +27,13 @@ pub struct ReplayedToolCall<'a> {
 }
 
 impl<'a> ReplayedToolCall<'a> {
+    pub fn turn_id(&self) -> &TurnId {
+        match &self.events[self.index.requested_event] {
+            AgentEvent::ToolCallRequested { turn_id, .. } => turn_id,
+            _ => unreachable!("requested_event indexes ToolCallRequested"),
+        }
+    }
+
     pub fn model_tool_call_id(&self) -> &ModelToolCallId {
         match &self.events[self.index.requested_event] {
             AgentEvent::ToolCallRequested {
@@ -186,6 +194,7 @@ fn replay_events_with_mode(
     let mut errors = Vec::new();
     let mut run_finished = false;
     let mut approval_log_format = ApprovalLogFormat::Undetermined;
+    let mut started_turns = HashSet::<TurnId>::new();
 
     for (index, event) in events.iter().enumerate().skip(1) {
         let event_number = index + 1;
@@ -201,6 +210,36 @@ fn replay_events_with_mode(
                 expected: run_id.clone(),
                 found: found_run_id.clone(),
             });
+        }
+
+        match event {
+            AgentEvent::TurnStarted { turn_id, .. } => {
+                if !started_turns.insert(turn_id.clone()) {
+                    return Err(ReplayError::DuplicateTurnStarted {
+                        event_number,
+                        turn_id: turn_id.clone(),
+                    });
+                }
+            }
+            AgentEvent::ModelOutput { turn_id, .. }
+            | AgentEvent::ToolCallRequested { turn_id, .. }
+            | AgentEvent::ApprovalRequested { turn_id, .. }
+            | AgentEvent::ApprovalResolved { turn_id, .. }
+            | AgentEvent::ToolResult { turn_id, .. }
+            | AgentEvent::Error {
+                turn_id: Some(turn_id),
+                ..
+            } => {
+                if !started_turns.contains(turn_id) {
+                    return Err(ReplayError::EventForUnknownTurn {
+                        event_number,
+                        turn_id: turn_id.clone(),
+                    });
+                }
+            }
+            AgentEvent::RunStarted { .. }
+            | AgentEvent::Error { turn_id: None, .. }
+            | AgentEvent::RunFinished { .. } => {}
         }
 
         match event {
@@ -224,7 +263,9 @@ fn replay_events_with_mode(
                     result_event: None,
                 });
             }
-            AgentEvent::ApprovalRequested { request, .. } => {
+            AgentEvent::ApprovalRequested {
+                turn_id, request, ..
+            } => {
                 let Some(&tool_call_index) = tool_call_indexes.get(&request.call.id) else {
                     return Err(ReplayError::ApprovalForUnknownToolCall {
                         event_number,
@@ -235,6 +276,15 @@ fn replay_events_with_mode(
                     events: &events,
                     index: &tool_calls[tool_call_index],
                 };
+
+                if replayed_call.turn_id() != turn_id {
+                    return Err(ReplayError::MismatchedToolLifecycleTurn {
+                        event_number,
+                        call_id: request.call.id.clone(),
+                        expected: replayed_call.turn_id().clone(),
+                        found: turn_id.clone(),
+                    });
+                }
 
                 if replayed_call.call() != &request.call {
                     return Err(ReplayError::ApprovalCallMismatch {
@@ -267,7 +317,11 @@ fn replay_events_with_mode(
                 pending_approvals.insert(tool_call_index);
                 status = RunStatus::AwaitingApproval;
             }
-            AgentEvent::ApprovalResolved { approval_id, .. } => {
+            AgentEvent::ApprovalResolved {
+                turn_id,
+                approval_id,
+                ..
+            } => {
                 let Some(&tool_call_index) = approval_indexes.get(approval_id) else {
                     return Err(ReplayError::ResolutionForUnknownApproval {
                         event_number,
@@ -278,6 +332,14 @@ fn replay_events_with_mode(
                     events: &events,
                     index: &tool_calls[tool_call_index],
                 };
+                if replayed_call.turn_id() != turn_id {
+                    return Err(ReplayError::MismatchedToolLifecycleTurn {
+                        event_number,
+                        call_id: replayed_call.call().id.clone(),
+                        expected: replayed_call.turn_id().clone(),
+                        found: turn_id.clone(),
+                    });
+                }
                 if replayed_call.approval_decision().is_some() {
                     return Err(ReplayError::DuplicateApprovalResolution {
                         event_number,
@@ -303,7 +365,9 @@ fn replay_events_with_mode(
                     status = RunStatus::Running;
                 }
             }
-            AgentEvent::ToolResult { result, .. } => {
+            AgentEvent::ToolResult {
+                turn_id, result, ..
+            } => {
                 let Some(&tool_call_index) = tool_call_indexes.get(&result.call_id) else {
                     return Err(ReplayError::ResultForUnknownToolCall {
                         event_number,
@@ -314,6 +378,15 @@ fn replay_events_with_mode(
                     events: &events,
                     index: &tool_calls[tool_call_index],
                 };
+
+                if replayed_call.turn_id() != turn_id {
+                    return Err(ReplayError::MismatchedToolLifecycleTurn {
+                        event_number,
+                        call_id: result.call_id.clone(),
+                        expected: replayed_call.turn_id().clone(),
+                        found: turn_id.clone(),
+                    });
+                }
 
                 if replayed_call.result().is_some() {
                     return Err(ReplayError::DuplicateToolResult {
@@ -466,6 +539,20 @@ pub enum ReplayError {
         expected: RunId,
         found: RunId,
     },
+    DuplicateTurnStarted {
+        event_number: usize,
+        turn_id: TurnId,
+    },
+    EventForUnknownTurn {
+        event_number: usize,
+        turn_id: TurnId,
+    },
+    MismatchedToolLifecycleTurn {
+        event_number: usize,
+        call_id: ToolCallId,
+        expected: TurnId,
+        found: TurnId,
+    },
     EventAfterRunFinished {
         event_number: usize,
     },
@@ -548,6 +635,34 @@ impl fmt::Display for ReplayError {
             } => write!(
                 formatter,
                 "Event Log event {event_number} belongs to run '{}' instead of '{}'",
+                found.as_str(),
+                expected.as_str()
+            ),
+            Self::DuplicateTurnStarted {
+                event_number,
+                turn_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} repeats turn_started for turn '{}'",
+                turn_id.as_str()
+            ),
+            Self::EventForUnknownTurn {
+                event_number,
+                turn_id,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} belongs to turn '{}' before that turn started",
+                turn_id.as_str()
+            ),
+            Self::MismatchedToolLifecycleTurn {
+                event_number,
+                call_id,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "Event Log event {event_number} places tool call '{}' on turn '{}' instead of its originating turn '{}'",
+                call_id.as_str(),
                 found.as_str(),
                 expected.as_str()
             ),

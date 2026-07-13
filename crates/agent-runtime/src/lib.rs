@@ -8,8 +8,8 @@ pub use run::{
     AgentError, AgentEvent, ApprovalDecision, ApprovalRequest, RunId, RunStatus, TerminalRunStatus,
 };
 pub use runtime::{
-    AgentEventSink, AgentRuntime, AgentRuntimeError, EventDurability, RunControl, RunControlFlow,
-    RunOutcome, RunRequest, RunStopToken,
+    AgentEventSink, AgentRuntime, AgentRuntimeError, EventDurability, EventSequence, RunControl,
+    RunControlFlow, RunOutcome, RunRequest, RunStopToken,
 };
 pub use turn::TurnId;
 

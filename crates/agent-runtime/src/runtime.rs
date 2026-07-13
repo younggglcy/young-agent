@@ -22,13 +22,34 @@ pub trait AgentEventSink {
 
     /// Attempts to append one event. An error may be ambiguous for durable
     /// sinks (for example, a flush can fail after bytes were written), so
-    /// callers must inspect the Canonical Event Log before retrying.
-    fn append(&mut self, event: &AgentEvent) -> Result<(), Self::Error>;
+    /// callers must inspect the Canonical Event Log before retrying. Persistent
+    /// sinks must commit `sequence` with the event so equal adjacent payloads
+    /// remain distinguishable during reconciliation.
+    fn append(&mut self, sequence: EventSequence, event: &AgentEvent) -> Result<(), Self::Error>;
 
     /// Appends an event and makes its commit marker durable before returning.
     /// In-memory sinks may implement this identically to [`Self::append`], but
     /// persistent sinks must not return until the commit marker is stable.
-    fn append_durable(&mut self, event: &AgentEvent) -> Result<(), Self::Error>;
+    fn append_durable(
+        &mut self,
+        sequence: EventSequence,
+        event: &AgentEvent,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Monotonic identity assigned to each append attempt within one Event Log.
+/// It lets recovery distinguish equal adjacent event payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventSequence(u64);
+
+impl EventSequence {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 /// The persistence guarantee requested for an Agent Event append.
@@ -212,6 +233,7 @@ pub struct AgentRuntime<M, T, S> {
     model_client: M,
     tool_executor: T,
     event_sink: S,
+    next_event_sequence: u64,
 }
 
 impl<M, T, S> AgentRuntime<M, T, S> {
@@ -220,6 +242,7 @@ impl<M, T, S> AgentRuntime<M, T, S> {
             model_client,
             tool_executor,
             event_sink,
+            next_event_sequence: 1,
         }
     }
 
@@ -639,23 +662,38 @@ where
     }
 
     fn emit(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink.append(event).map_err(|source| {
+        let sequence = EventSequence::new(self.next_event_sequence);
+        self.event_sink.append(sequence, event).map_err(|source| {
             AgentRuntimeError::EventPersistenceIndeterminate {
+                sequence,
                 event: Box::new(event.clone()),
                 durability: EventDurability::Buffered,
                 source,
             }
-        })
+        })?;
+        self.advance_event_sequence();
+        Ok(())
     }
 
     fn emit_durable(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
-        self.event_sink.append_durable(event).map_err(|source| {
-            AgentRuntimeError::EventPersistenceIndeterminate {
+        let sequence = EventSequence::new(self.next_event_sequence);
+        self.event_sink
+            .append_durable(sequence, event)
+            .map_err(|source| AgentRuntimeError::EventPersistenceIndeterminate {
+                sequence,
                 event: Box::new(event.clone()),
                 durability: EventDurability::Durable,
                 source,
-            }
-        })
+            })?;
+        self.advance_event_sequence();
+        Ok(())
+    }
+
+    fn advance_event_sequence(&mut self) {
+        self.next_event_sequence = self
+            .next_event_sequence
+            .checked_add(1)
+            .expect("an Agent Run cannot emit u64::MAX events");
     }
 
     fn emit_tool_result(&mut self, event: &AgentEvent) -> Result<(), AgentRuntimeError<S::Error>> {
@@ -760,9 +798,10 @@ pub enum AgentRuntimeError<E> {
     /// A stop token is a one-run terminal latch and cannot be reused.
     StopTokenAlreadyBound { run_id: RunId },
     /// The sink returned an error from an append whose commit state may be
-    /// ambiguous. The caller must reconcile the exact `event` at the requested
-    /// durability without resuming or repeating the failed runtime step.
+    /// ambiguous. The caller must reconcile the exact `sequence` and `event` at
+    /// the requested durability without resuming or repeating the failed step.
     EventPersistenceIndeterminate {
+        sequence: EventSequence,
         event: Box<AgentEvent>,
         durability: EventDurability,
         source: E,
@@ -778,21 +817,22 @@ impl<E: fmt::Display> fmt::Display for AgentRuntimeError<E> {
                 run_id.as_str()
             ),
             Self::EventPersistenceIndeterminate {
+                sequence,
                 event,
                 durability,
                 source,
             } => match event.as_ref() {
                 AgentEvent::ToolResult { .. } => write!(
                     formatter,
-                    "tool execution completed but persistence of its result Agent Event is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without re-executing the tool: {event:?}: {source}"
+                    "tool execution completed but persistence of Agent Event sequence {} containing its result is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without re-executing the tool: {event:?}: {source}", sequence.as_u64()
                 ),
                 AgentEvent::RunFinished { .. } => write!(
                     formatter,
-                    "terminal status was chosen but persistence of its RunFinished event is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without rerunning the Agent Run: {event:?}: {source}"
+                    "terminal status was chosen but persistence of Agent Event sequence {} containing RunFinished is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without rerunning the Agent Run: {event:?}: {source}", sequence.as_u64()
                 ),
                 _ => write!(
                     formatter,
-                    "persistence of an Agent Event is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without resuming the failed runtime step: {event:?}: {source}"
+                    "persistence of Agent Event sequence {} is indeterminate at the {durability:?} boundary; inspect and reconcile the Event Log without resuming the failed runtime step: {event:?}: {source}", sequence.as_u64()
                 ),
             },
         }
