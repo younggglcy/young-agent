@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -8,13 +9,15 @@ use std::process::Command;
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, DirEntry, File, Metadata, OpenOptions, Permissions};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use cap_std::fs::Permissions;
+use cap_std::fs::{Dir, DirEntry, File, Metadata, OpenOptions};
 use serde_json::{json, Value};
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 use std::cell::Cell;
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 thread_local! {
     static INJECT_RECOVERY_POLICY_FAILURE_AFTER_EXCHANGE: Cell<bool> = const { Cell::new(false) };
     static INJECT_NEW_FILE_VALIDATION_FAILURE_AFTER_RENAME: Cell<bool> = const { Cell::new(false) };
@@ -138,6 +141,7 @@ impl CodingWorkspace {
         require_regular_file(file)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn file_snapshot(file: &File) -> io::Result<FileSnapshot> {
         #[cfg(unix)]
         {
@@ -230,6 +234,7 @@ impl CodingWorkspace {
         bind_process_working_directory(command, &self.root_dir)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn replace_existing_atomically(
         &self,
         path: &Path,
@@ -286,6 +291,26 @@ impl CodingWorkspace {
                 },
             })?;
         Ok(Some(parent.join(recovery)))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(crate) fn replace_existing_atomically(
+        &self,
+        path: &Path,
+        _content: &[u8],
+        _expected_snapshot: FileSnapshot,
+    ) -> Result<Option<PathBuf>, AtomicReplaceError> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Err(AtomicReplaceError::before_within(
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "safe atomic replacement is not supported on this platform",
+            ),
+            parent,
+        ))
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -382,6 +407,7 @@ impl CodingWorkspace {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn stage_content(
         &self,
         directory: &Dir,
@@ -408,7 +434,6 @@ impl CodingWorkspace {
             };
             let result = (|| {
                 if let Some(replacement) = replacement {
-                    #[cfg(unix)]
                     {
                         use cap_std::fs::MetadataExt as _;
 
@@ -470,6 +495,7 @@ impl CodingWorkspace {
         ))
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn commit_new_file(
         &self,
         directory: &Dir,
@@ -528,6 +554,7 @@ impl CodingWorkspace {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn commit_existing_file(
         &self,
         directory: &Dir,
@@ -685,6 +712,7 @@ impl CodingWorkspace {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn validate_staging_slot(&self, directory: &Dir, staged: &StagedFile) -> io::Result<()> {
         validate_security_metadata(&staged.file, "patch staging file")?;
         validate_retained_snapshot_metadata(
@@ -701,6 +729,7 @@ impl CodingWorkspace {
         )
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn replacement_metadata(
         &self,
         directory: &Dir,
@@ -751,6 +780,7 @@ impl CodingWorkspace {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct ReplacementMetadata {
     permissions: Permissions,
     snapshot: FileSnapshot,
@@ -763,12 +793,14 @@ struct ReplacementMetadata {
     mode: u32,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct StagedFile {
     path: PathBuf,
     file: File,
     snapshot: FileSnapshot,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct RecoveryNamespace {
     directory: Dir,
     #[cfg(unix)]
@@ -782,6 +814,13 @@ pub(crate) enum AtomicReplaceError {
         source: io::Error,
         recovery: Option<PublishedRecovery>,
     },
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        expect(
+            dead_code,
+            reason = "shared patch error contract; unsupported targets fail before publication"
+        )
+    )]
     Published {
         source: io::Error,
         target: PathBuf,
@@ -802,10 +841,14 @@ pub(crate) enum AtomicCreateError {
         source: io::Error,
         recovery: Option<PublishedRecovery>,
     },
-    Published {
-        source: io::Error,
-        target: PathBuf,
-    },
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        expect(
+            dead_code,
+            reason = "shared patch error contract; unsupported targets fail before publication"
+        )
+    )]
+    Published { source: io::Error, target: PathBuf },
 }
 
 impl AtomicCreateError {
@@ -816,7 +859,7 @@ impl AtomicCreateError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 impl AtomicCreateError {
     fn kind(&self) -> io::ErrorKind {
         match self {
@@ -854,12 +897,13 @@ impl PublishedRecovery {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 enum CommitNewError {
     BeforePublication(io::Error),
     Published(io::Error),
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 impl CommitNewError {
     fn kind(&self) -> io::ErrorKind {
         match self {
@@ -868,6 +912,7 @@ impl CommitNewError {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 enum CommitError {
     BeforePublication {
         source: io::Error,
@@ -879,6 +924,7 @@ enum CommitError {
     },
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl CommitError {
     fn before(source: io::Error) -> Self {
         let recovery = preserved_recovery_from_io_error(&source);
@@ -886,7 +932,7 @@ impl CommitError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 impl CommitError {
     fn kind(&self) -> io::ErrorKind {
         match self {
@@ -897,6 +943,7 @@ impl CommitError {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 enum RecoveryNamespaceError {
     Identity(io::Error),
     Policy(io::Error),
@@ -1006,17 +1053,7 @@ impl FileSnapshot {
     }
 }
 
-#[cfg(not(unix))]
-impl FileSnapshot {
-    fn same_payload_and_metadata(&self, _other: &Self) -> bool {
-        false
-    }
-
-    fn matches_metadata(&self, _metadata: &Metadata) -> bool {
-        false
-    }
-}
-
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_security_metadata(file: &File, subject: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1044,6 +1081,7 @@ fn validate_security_metadata(file: &File, subject: &str) -> io::Result<()> {
     }
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn validate_staging_content_size(size: usize) -> io::Result<()> {
     if size as u64 > MAX_FILE_SNAPSHOT_BYTES {
         Err(io::Error::new(
@@ -1055,6 +1093,7 @@ fn validate_staging_content_size(size: usize) -> io::Result<()> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn refresh_snapshot_after_rename(
     file: &File,
     snapshot: &mut FileSnapshot,
@@ -1072,6 +1111,7 @@ fn refresh_snapshot_after_rename(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn refresh_replacement_after_rename(expected: &mut ReplacementMetadata) -> io::Result<()> {
     refresh_snapshot_after_rename(
         &expected.file,
@@ -1080,6 +1120,7 @@ fn refresh_replacement_after_rename(expected: &mut ReplacementMetadata) -> io::R
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_replacement_slot_identity(
     directory: &Dir,
     path: &Path,
@@ -1094,6 +1135,7 @@ fn validate_replacement_slot_identity(
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_replacement_slot(
     directory: &Dir,
     path: &Path,
@@ -1106,6 +1148,7 @@ fn validate_replacement_slot(
     validate_replacement_slot_identity(directory, path, expected)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_retained_snapshot_metadata(
     file: &File,
     expected: &FileSnapshot,
@@ -1129,6 +1172,7 @@ fn validate_retained_snapshot_metadata(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_installed_staging_slot(
     directory: &Dir,
     path: &Path,
@@ -1143,6 +1187,7 @@ fn validate_installed_staging_slot(
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn validate_snapshot_slot(
     directory: &Dir,
     path: &Path,
@@ -1211,14 +1256,6 @@ fn random_patch_path(kind: &str) -> io::Result<PathBuf> {
     Ok(PathBuf::from(name))
 }
 
-#[cfg(not(unix))]
-fn random_patch_path(_kind: &str) -> io::Result<PathBuf> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "secure patch staging names are not supported on this platform",
-    ))
-}
-
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn claim_path(directory: &Dir, path: &Path, kind: &str) -> io::Result<PathBuf> {
     for _ in 0..100 {
@@ -1284,18 +1321,6 @@ fn move_to_recovery_namespace(
     ))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn move_claimed_to_recovery_namespace(
-    _directory: &Dir,
-    _claimed_path: &Path,
-    _kind: &str,
-) -> io::Result<(RecoveryNamespace, PathBuf)> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "namespaced patch recovery is not supported on this platform",
-    ))
-}
-
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn open_recovery_namespace(directory: &Dir) -> io::Result<RecoveryNamespace> {
     use cap_std::fs::MetadataExt as _;
@@ -1313,14 +1338,6 @@ fn open_recovery_namespace(directory: &Dir) -> io::Result<RecoveryNamespace> {
         device: metadata.dev(),
         inode: metadata.ino(),
     })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn open_recovery_namespace(_directory: &Dir) -> io::Result<RecoveryNamespace> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "namespaced patch recovery is not supported on this platform",
-    ))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1400,18 +1417,6 @@ fn preserved_recovery_evidence(
             unreachable!("content mismatches return before path publication")
         }
     }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn preserved_recovery_evidence(
-    parent: &Dir,
-    recovery: &RecoveryNamespace,
-    path: &Path,
-    file: &File,
-    expected: FileSnapshot,
-) -> PublishedRecovery {
-    let _ = (parent, recovery, path, file, expected);
-    PublishedRecovery::Unlocated
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1582,7 +1587,7 @@ fn ensure_recovery_gitignore(recovery: &Dir) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn inject_invalid_recovery_policy(recovery: &Dir) -> io::Result<()> {
     use std::io::Write as _;
 
@@ -1593,7 +1598,7 @@ fn inject_invalid_recovery_policy(recovery: &Dir) -> io::Result<()> {
     file.sync_all()
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn inject_replaced_recovery_content(
     recovery: &Dir,
     path: &Path,
@@ -1637,14 +1642,6 @@ fn inject_symlink_recovery_content(recovery: &Dir, path: &Path) -> io::Result<()
     rustix::fs::symlinkat(MOVED_ORIGINAL, recovery, path).map_err(io::Error::from)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn claim_path(_directory: &Dir, _path: &Path, _kind: &str) -> io::Result<PathBuf> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic patch recovery is not supported on this platform",
-    ))
-}
-
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_no_replace(directory: &Dir, from: &Path, to: &Path) -> io::Result<()> {
     rustix::fs::renameat_with(
@@ -1657,6 +1654,7 @@ fn rename_no_replace(directory: &Dir, from: &Path, to: &Path) -> io::Result<()> 
     .map_err(io::Error::from)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn patch_target_changed() -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
@@ -1664,6 +1662,7 @@ fn patch_target_changed() -> io::Error {
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn published_target_changed(
     target: &Path,
     recovery: Option<&Path>,
@@ -1681,6 +1680,7 @@ fn published_target_changed(
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn claimed_staging_matches(
     directory: &Dir,
     claimed_path: &Path,
@@ -1700,6 +1700,7 @@ fn claimed_staging_matches(
         && claimed_snapshot.same_payload_and_metadata(&expected))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cleanup_open_staging_after_error<T>(
     directory: &Dir,
     staging_path: &Path,
@@ -1718,6 +1719,7 @@ fn cleanup_open_staging_after_error<T>(
     cleanup_expected_staging_after_error(directory, staging_path, staging_file, expected, source)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cleanup_expected_staging_after_error<T>(
     directory: &Dir,
     staging_path: &Path,
@@ -1853,6 +1855,7 @@ fn preserved_recovery_from_io_error(source: &io::Error) -> Option<PublishedRecov
         .map(|source| source.recovery.clone())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn cleanup_owned_staging_after_error<T>(
     directory: &Dir,
     staged: &StagedFile,
@@ -1984,19 +1987,6 @@ fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
         return Ok(true);
     }
     Ok(false)
-}
-
-#[cfg(not(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "hurd"
-)))]
-fn file_has_extended_attributes(_file: &File) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic patch extended-attribute validation is not supported on this platform",
-    ))
 }
 
 #[cfg(all(
@@ -2402,9 +2392,12 @@ impl Error for CodingWorkspaceError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{git_probe_command, CodingWorkspace};
+    use super::git_probe_command;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::CodingWorkspace;
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn replacement_metadata(

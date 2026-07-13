@@ -18,6 +18,8 @@ const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_QUERY_METADATA_SERIALIZED_BYTES: usize = 4 * 1024;
+const MAX_SEARCH_PATH_BYTES: usize = 8 * 1024;
+const MAX_SEARCH_PATH_METADATA_SERIALIZED_BYTES: usize = 4 * 1024;
 const MAX_SEARCH_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_SEARCH_DIRECTORIES: u64 = 10_000;
 const MAX_SEARCH_ENTRIES: u64 = 100_000;
@@ -53,7 +55,14 @@ pub(crate) fn execute(
         Err(output) => return output,
     };
     let path = match arguments.optional_string("path") {
-        Ok(Some(path)) => path,
+        Ok(Some(path)) if path.len() <= MAX_SEARCH_PATH_BYTES => path,
+        Ok(Some(_)) => {
+            return failure(
+                "invalid_arguments",
+                format!("argument 'path' exceeds {MAX_SEARCH_PATH_BYTES} bytes"),
+                false,
+            )
+        }
         Ok(None) => ".",
         Err(output) => return output,
     };
@@ -564,60 +573,125 @@ fn bounded_search_output(
     workspace: &CodingWorkspace,
     path: &str,
     query: &str,
-    mut results: SearchResults,
+    results: SearchResults,
 ) -> ToolOutput {
+    let (metadata_path, path_truncated) =
+        truncate_json_string(path, MAX_SEARCH_PATH_METADATA_SERIALIZED_BYTES);
     let (metadata_query, query_truncated) =
         truncate_json_string(query, MAX_SEARCH_QUERY_METADATA_SERIALIZED_BYTES);
-    loop {
-        let output = ToolOutput::Success {
-            content: vec![ToolContent::Json {
-                value: json!({ "matches": &results.matches }),
-            }],
-            metadata: BTreeMap::from([
-                ("path".to_string(), json!(path)),
-                ("query".to_string(), json!(metadata_query)),
-                ("query_bytes".to_string(), json!(query.len())),
-                ("query_truncated".to_string(), json!(query_truncated)),
-                ("matches".to_string(), json!(results.matches.len())),
-                ("bytes_searched".to_string(), json!(results.bytes_searched)),
-                ("files_searched".to_string(), json!(results.files_searched)),
-                (
-                    "directories_visited".to_string(),
-                    json!(results.directories_visited),
-                ),
-                (
-                    "entries_visited".to_string(),
-                    json!(results.entries_visited),
-                ),
-                (
-                    "binary_files_skipped".to_string(),
-                    json!(results.binary_files_skipped),
-                ),
-                (
-                    "lines_truncated".to_string(),
-                    json!(results.lines_truncated),
-                ),
-                ("truncated".to_string(), json!(results.truncated)),
-                ("workspace".to_string(), workspace.metadata()),
-            ]),
-            extensions: BTreeMap::new(),
-        };
-        if serde_json::to_vec(&output)
-            .expect("search output JSON serializes")
-            .len()
-            <= MAX_OUTPUT_BYTES
-        {
-            return finalize_output(output);
-        }
-        if results.matches.pop().is_none() {
-            return failure(
-                "output_too_large",
-                "search metadata exceeds the tool output budget",
-                false,
-            );
-        }
-        results.truncated = true;
+    let workspace_metadata = workspace.metadata();
+    let metadata = SearchOutputMetadata {
+        path: metadata_path,
+        path_bytes: path.len(),
+        path_truncated,
+        query: metadata_query,
+        query_bytes: query.len(),
+        query_truncated,
+        workspace: &workspace_metadata,
+    };
+    let full = build_search_output(
+        &results,
+        results.matches.len(),
+        results.truncated,
+        &metadata,
+    );
+    if search_output_fits(&full) {
+        return finalize_output(full);
     }
+
+    let Some(match_count) = largest_fitting_prefix(results.matches.len(), |match_count| {
+        search_output_fits(&build_search_output(&results, match_count, true, &metadata))
+    }) else {
+        return failure(
+            "output_too_large",
+            "search metadata exceeds the tool output budget",
+            false,
+        );
+    };
+    finalize_output(build_search_output(&results, match_count, true, &metadata))
+}
+
+struct SearchOutputMetadata<'a> {
+    path: &'a str,
+    path_bytes: usize,
+    path_truncated: bool,
+    query: &'a str,
+    query_bytes: usize,
+    query_truncated: bool,
+    workspace: &'a Value,
+}
+
+fn build_search_output(
+    results: &SearchResults,
+    match_count: usize,
+    truncated: bool,
+    metadata: &SearchOutputMetadata<'_>,
+) -> ToolOutput {
+    ToolOutput::Success {
+        content: vec![ToolContent::Json {
+            value: json!({ "matches": &results.matches[..match_count] }),
+        }],
+        metadata: BTreeMap::from([
+            ("path".to_string(), json!(metadata.path)),
+            ("path_bytes".to_string(), json!(metadata.path_bytes)),
+            ("path_truncated".to_string(), json!(metadata.path_truncated)),
+            ("query".to_string(), json!(metadata.query)),
+            ("query_bytes".to_string(), json!(metadata.query_bytes)),
+            (
+                "query_truncated".to_string(),
+                json!(metadata.query_truncated),
+            ),
+            ("matches".to_string(), json!(match_count)),
+            ("bytes_searched".to_string(), json!(results.bytes_searched)),
+            ("files_searched".to_string(), json!(results.files_searched)),
+            (
+                "directories_visited".to_string(),
+                json!(results.directories_visited),
+            ),
+            (
+                "entries_visited".to_string(),
+                json!(results.entries_visited),
+            ),
+            (
+                "binary_files_skipped".to_string(),
+                json!(results.binary_files_skipped),
+            ),
+            (
+                "lines_truncated".to_string(),
+                json!(results.lines_truncated),
+            ),
+            ("truncated".to_string(), json!(truncated)),
+            ("workspace".to_string(), metadata.workspace.clone()),
+        ]),
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn search_output_fits(output: &ToolOutput) -> bool {
+    serde_json::to_vec(output)
+        .expect("search output JSON serializes")
+        .len()
+        <= MAX_OUTPUT_BYTES
+}
+
+fn largest_fitting_prefix<F>(total: usize, mut fits: F) -> Option<usize>
+where
+    F: FnMut(usize) -> bool,
+{
+    if !fits(0) {
+        return None;
+    }
+    let mut low = 0;
+    let mut high = total;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Some(low)
 }
 
 fn visible_utf8_prefix(bytes: &[u8]) -> Result<&str, ()> {
@@ -632,7 +706,23 @@ fn visible_utf8_prefix(bytes: &[u8]) -> Result<&str, ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchResults, MAX_SEARCH_DIRECTORIES, MAX_SEARCH_ENTRIES};
+    use std::cell::Cell;
+
+    use super::{
+        largest_fitting_prefix, SearchResults, MAX_SEARCH_DIRECTORIES, MAX_SEARCH_ENTRIES,
+    };
+
+    #[test]
+    fn fitting_prefix_uses_logarithmic_size_probes() {
+        let probes = Cell::new(0);
+        let result = largest_fitting_prefix(200, |count| {
+            probes.set(probes.get() + 1);
+            count <= 137
+        });
+
+        assert_eq!(result, Some(137));
+        assert!(probes.get() <= 10, "used {} probes", probes.get());
+    }
 
     #[test]
     fn global_directory_budget_stops_before_opening_another_directory() {

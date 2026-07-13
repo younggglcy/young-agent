@@ -563,6 +563,61 @@ fn search_files_returns_structured_matches_through_the_tool_runtime() {
 }
 
 #[test]
+fn search_files_rejects_an_oversized_path_before_scanning() {
+    let test_workspace = TestWorkspace::new("search-oversized-path");
+    std::fs::write(test_workspace.path().join("match.txt"), "needle\n")
+        .expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let oversized_path = "./".repeat(4_097);
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-oversized-path"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "needle", "path": oversized_path }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("oversized search path must fail");
+    };
+    assert_eq!(error.code, "invalid_arguments");
+    assert!(error.message.contains("exceeds 8192 bytes"));
+}
+
+#[test]
+fn search_files_bounds_path_metadata_before_serialization() {
+    let test_workspace = TestWorkspace::new("search-bounded-path-metadata");
+    std::fs::write(test_workspace.path().join("match.txt"), "needle\n")
+        .expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let path = "./".repeat(3_000);
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-search-bounded-path-metadata"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "needle", "path": path }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success { metadata, .. } = result.output else {
+        panic!("bounded search path should succeed");
+    };
+    assert_eq!(metadata["path_bytes"], json!(6_000));
+    assert_eq!(metadata["path_truncated"], json!(true));
+    assert!(metadata["path"].as_str().expect("path is a string").len() < 6_000);
+}
+
+#[test]
 fn search_files_marks_results_truncated_at_the_directory_depth_limit() {
     let test_workspace = TestWorkspace::new("search-depth-limit");
     let mut deepest = test_workspace.path().to_path_buf();
@@ -1497,6 +1552,35 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
     assert!(metadata["exec_privilege_gain_blocked"].is_boolean());
     assert_eq!(metadata["detached_processes_tracked"], json!(false));
     assert!(extensions.is_empty());
+}
+
+#[test]
+fn run_command_captures_output_after_a_quiet_period() {
+    let test_workspace = TestWorkspace::new("run-command-quiet-period");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-command-quiet-period"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "sleep 0.12; printf delayed" }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success { content, .. } = result.output else {
+        panic!("quiet command should succeed");
+    };
+    let ToolContent::Json { value } = &content[0] else {
+        panic!("quiet command should return structured output");
+    };
+    assert_eq!(value["stdout"], json!("delayed"));
 }
 
 #[test]

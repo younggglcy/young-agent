@@ -6,17 +6,14 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(all(test, unix))]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(all(test, unix))]
-use std::cell::Cell;
-#[cfg(all(test, unix))]
-use std::sync::atomic::AtomicUsize;
-
 use command_group::{CommandGroup, GroupChild};
 use serde_json::json;
+#[cfg(all(test, unix))]
+use std::cell::Cell;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
@@ -25,7 +22,6 @@ use crate::tool_support::{
 };
 use crate::workspace::CodingWorkspace;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const INITIAL_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINATION_CONFIRM_GRACE: Duration = Duration::from_millis(100);
@@ -33,6 +29,7 @@ const FOREGROUND_EXIT_SETTLE_YIELDS: usize = 8;
 const TERMINAL_GROUP_SEAL_ROUNDS: usize = 8;
 const MAX_STREAM_READS_PER_TICK: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const MAX_COMMAND_SUPERVISION_SLOTS: usize = 64;
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -45,9 +42,6 @@ thread_local! {
     static LIVE_COMMAND_SUPERVISOR_HANDOFFS: Cell<usize> = const { Cell::new(0) };
     static LAST_SUPERVISED_COMMAND_ID: Cell<Option<u64>> = const { Cell::new(None) };
 }
-
-#[cfg(all(test, unix))]
-static COMMAND_SUPERVISOR_WORKER_STARTS: AtomicUsize = AtomicUsize::new(0);
 
 pub(crate) const APPROVAL_REASON: &str =
     "command execution requires approval until a command safety policy is configured";
@@ -149,7 +143,7 @@ fn run_shell_command(
     }
     let mut process = shell_command(command);
     ensure_process_tracking_supported()?;
-    ensure_command_supervisor_available()?;
+    let supervision_permit = prepare_command_supervision()?;
     workspace
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
@@ -182,7 +176,7 @@ fn run_shell_command(
     #[cfg(not(all(test, unix)))]
     let configure_result = make_nonblocking(&stdout).and_then(|()| make_nonblocking(&stderr));
     if let Err(source) = configure_result {
-        let cleanup = cleanup_process_group(child, false, true);
+        let cleanup = cleanup_process_group(child, false, true, supervision_permit);
         return match cleanup {
             Err(cleanup) => Err(cleanup),
             Ok(()) => Err(CommandError::ConfigureOutput(source)),
@@ -228,7 +222,7 @@ fn run_shell_command(
                 &mut stream_error,
             );
             if stdout_progress || stderr_progress {
-                exit_poll_interval = INITIAL_EXIT_POLL_INTERVAL;
+                exit_poll_interval = next_exit_poll_interval(exit_poll_interval, true);
             }
 
             if status.is_none() && !leader_terminal {
@@ -264,11 +258,7 @@ fn run_shell_command(
                     stderr_done,
                     exit_poll_interval,
                 )?;
-                if stdout_done && stderr_done {
-                    exit_poll_interval = exit_poll_interval
-                        .saturating_mul(2)
-                        .min(MAX_EXIT_POLL_INTERVAL);
-                }
+                exit_poll_interval = next_exit_poll_interval(exit_poll_interval, false);
             }
         }
     })();
@@ -277,6 +267,7 @@ fn run_shell_command(
         child,
         status.is_some(),
         status.is_none() && (cancelled || control_result.is_err()),
+        supervision_permit,
     );
     match (control_result, cleanup_result) {
         (Err(_), Err(cleanup)) => return Err(cleanup),
@@ -304,6 +295,14 @@ fn run_shell_command(
         stderr_truncated: stderr_capture.truncated || output_incomplete,
         output_incomplete,
     })
+}
+
+fn next_exit_poll_interval(current: Duration, made_progress: bool) -> Duration {
+    if made_progress {
+        INITIAL_EXIT_POLL_INTERVAL
+    } else {
+        current.saturating_mul(2).min(MAX_EXIT_POLL_INTERVAL)
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -335,10 +334,17 @@ fn ensure_process_tracking_supported() -> Result<(), CommandError> {
     Err(CommandError::UnsupportedProcessTracking)
 }
 
-fn ensure_command_supervisor_available() -> Result<(), CommandError> {
-    command_supervisor()
+fn prepare_command_supervision() -> Result<CommandSupervisionPermit, CommandError> {
+    prepare_command_supervision_with(command_supervisor())
+}
+
+fn prepare_command_supervision_with(
+    supervisor: &std::sync::Arc<CommandSupervisor>,
+) -> Result<CommandSupervisionPermit, CommandError> {
+    supervisor
         .ensure_worker_started()
-        .map_err(CommandError::SupervisorUnavailable)
+        .map_err(CommandError::SupervisorUnavailable)?;
+    supervisor.reserve_slot()
 }
 
 fn configure_command_security(command: &mut Command) {
@@ -553,6 +559,7 @@ fn cleanup_process_group(
     mut child: GroupChild,
     process_exited: bool,
     terminate_group: bool,
+    supervision_permit: CommandSupervisionPermit,
 ) -> Result<(), CommandError> {
     let mut first_error = None;
     if terminate_group {
@@ -566,6 +573,7 @@ fn cleanup_process_group(
                 Ok(false) => {
                     return Err(supervise_live_command(
                         child,
+                        supervision_permit,
                         first_error
                             .take()
                             .unwrap_or(CommandError::TerminationUnverified),
@@ -575,6 +583,7 @@ fn cleanup_process_group(
                 Err(wait) => {
                     return Err(supervise_live_command(
                         child,
+                        supervision_permit,
                         first_error
                             .take()
                             .unwrap_or(CommandError::TerminationUnverified),
@@ -585,20 +594,29 @@ fn cleanup_process_group(
                     if let Err(seal) = seal_terminal_process_group(&mut child) {
                         return Err(supervise_live_command(
                             child,
+                            supervision_permit,
                             first_error.take().unwrap_or(seal),
                             None,
                         ));
                     }
                     if let Err(source) = wait_for_command_group(&mut child) {
-                        if first_error.is_none() {
-                            first_error = Some(source);
-                        }
+                        return Err(supervise_live_command(
+                            child,
+                            supervision_permit,
+                            first_error.take().unwrap_or(source),
+                            None,
+                        ));
                     }
                 }
             }
         } else {
             if let Err(source) = wait_for_command_group(&mut child) {
-                first_error = Some(source);
+                return Err(supervise_live_command(
+                    child,
+                    supervision_permit,
+                    source,
+                    None,
+                ));
             }
         }
     }
@@ -610,6 +628,7 @@ fn cleanup_process_group(
 
 fn supervise_live_command(
     child: GroupChild,
+    supervision_permit: CommandSupervisionPermit,
     termination_error: CommandError,
     wait_error: Option<CommandError>,
 ) -> CommandError {
@@ -624,9 +643,9 @@ fn supervise_live_command(
     });
     let supervisor = command_supervisor();
     #[cfg(all(test, unix))]
-    let command_id = supervisor.enqueue(child);
+    let command_id = supervisor.enqueue(child, supervision_permit);
     #[cfg(not(all(test, unix)))]
-    supervisor.enqueue(child);
+    supervisor.enqueue(child, supervision_permit);
     #[cfg(all(test, unix))]
     LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(Some(command_id)));
     let supervision = match supervisor.ensure_worker_started() {
@@ -639,70 +658,82 @@ fn supervise_live_command(
 }
 
 struct CommandSupervisor {
-    registry: std::sync::Mutex<Vec<SupervisedCommand>>,
+    registry: std::sync::Mutex<std::collections::BinaryHeap<SupervisedCommand>>,
     wake: std::sync::Condvar,
     worker_state: std::sync::Mutex<SupervisorWorkerState>,
+    active_slots: AtomicUsize,
     #[cfg(all(test, unix))]
     next_command_id: AtomicU64,
     #[cfg(all(test, unix))]
     completed: std::sync::Mutex<std::collections::HashSet<u64>>,
     #[cfg(all(test, unix))]
     completion_wake: std::sync::Condvar,
+    #[cfg(all(test, unix))]
+    fail_next_worker_start: AtomicBool,
+    #[cfg(all(test, unix))]
+    panic_next_processing: AtomicBool,
+    #[cfg(all(test, unix))]
+    processing_panics: AtomicUsize,
+    #[cfg(all(test, unix))]
+    fail_next_wait: AtomicBool,
+    #[cfg(all(test, unix))]
+    wait_attempts: AtomicUsize,
 }
 
 impl CommandSupervisor {
     fn new() -> Self {
         Self {
-            registry: std::sync::Mutex::new(Vec::new()),
+            registry: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
             wake: std::sync::Condvar::new(),
             worker_state: std::sync::Mutex::new(SupervisorWorkerState::Stopped),
+            active_slots: AtomicUsize::new(0),
             #[cfg(all(test, unix))]
             next_command_id: AtomicU64::new(1),
             #[cfg(all(test, unix))]
             completed: std::sync::Mutex::new(std::collections::HashSet::new()),
             #[cfg(all(test, unix))]
             completion_wake: std::sync::Condvar::new(),
+            #[cfg(all(test, unix))]
+            fail_next_worker_start: AtomicBool::new(false),
+            #[cfg(all(test, unix))]
+            panic_next_processing: AtomicBool::new(false),
+            #[cfg(all(test, unix))]
+            processing_panics: AtomicUsize::new(0),
+            #[cfg(all(test, unix))]
+            fail_next_wait: AtomicBool::new(false),
+            #[cfg(all(test, unix))]
+            wait_attempts: AtomicUsize::new(0),
         }
     }
 
     #[cfg(all(test, unix))]
-    fn enqueue(&self, child: GroupChild) -> u64 {
+    fn enqueue(&self, child: GroupChild, permit: CommandSupervisionPermit) -> u64 {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(SupervisedCommand::new(id, child));
+            .push(SupervisedCommand::new(id, child, permit));
         self.wake.notify_one();
         id
     }
 
     #[cfg(not(all(test, unix)))]
-    fn enqueue(&self, child: GroupChild) {
+    fn enqueue(&self, child: GroupChild, permit: CommandSupervisionPermit) {
         self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(SupervisedCommand::new(child));
+            .push(SupervisedCommand::new(child, permit));
         self.wake.notify_one();
     }
 
     fn ensure_worker_started(self: &std::sync::Arc<Self>) -> std::io::Result<()> {
-        self.ensure_worker_started_with(|worker| {
-            let spawn = thread::Builder::new()
-                .name("young-command-supervisor".to_string())
-                .spawn(move || command_supervisor_worker(worker))
-                .map(|_| ());
-            #[cfg(all(test, unix))]
-            if spawn.is_ok() {
-                COMMAND_SUPERVISOR_WORKER_STARTS.fetch_add(1, Ordering::Relaxed);
-            }
-            spawn
-        })
-    }
-
-    fn ensure_worker_started_with<F>(self: &std::sync::Arc<Self>, start: F) -> std::io::Result<()>
-    where
-        F: FnOnce(std::sync::Arc<Self>) -> std::io::Result<()>,
-    {
+        #[cfg(all(test, unix))]
+        if self.fail_next_worker_start.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "injected worker start failure",
+            ));
+        }
         let mut state = self
             .worker_state
             .lock()
@@ -711,11 +742,45 @@ impl CommandSupervisor {
             return Ok(());
         }
         *state = SupervisorWorkerState::Running;
-        if let Err(source) = start(self.clone()) {
+        let worker = self.clone();
+        if let Err(source) = thread::Builder::new()
+            .name("young-command-supervisor".to_string())
+            .spawn(move || command_supervisor_worker(worker))
+        {
             *state = SupervisorWorkerState::Stopped;
             return Err(source);
         }
         Ok(())
+    }
+
+    fn reserve_slot(self: &std::sync::Arc<Self>) -> Result<CommandSupervisionPermit, CommandError> {
+        let mut active = self.active_slots.load(Ordering::Acquire);
+        loop {
+            if active >= MAX_COMMAND_SUPERVISION_SLOTS {
+                return Err(CommandError::SupervisorAtCapacity);
+            }
+            match self.active_slots.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(CommandSupervisionPermit {
+                        supervisor: self.clone(),
+                    })
+                }
+                Err(observed) => active = observed,
+            }
+        }
+    }
+
+    fn requeue(&self, command: SupervisedCommand) {
+        self.registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(command);
+        self.wake.notify_one();
     }
 
     #[cfg(all(test, unix))]
@@ -759,10 +824,21 @@ enum SupervisorWorkerState {
     Running,
 }
 
+struct CommandSupervisionPermit {
+    supervisor: std::sync::Arc<CommandSupervisor>,
+}
+
+impl Drop for CommandSupervisionPermit {
+    fn drop(&mut self) {
+        self.supervisor.active_slots.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct SupervisedCommand {
     #[cfg(all(test, unix))]
     id: u64,
     child: GroupChild,
+    _permit: CommandSupervisionPermit,
     termination_attempts_remaining: u8,
     retry_delay: Duration,
     next_action: Instant,
@@ -770,10 +846,11 @@ struct SupervisedCommand {
 
 impl SupervisedCommand {
     #[cfg(all(test, unix))]
-    fn new(id: u64, child: GroupChild) -> Self {
+    fn new(id: u64, child: GroupChild, permit: CommandSupervisionPermit) -> Self {
         Self {
             id,
             child,
+            _permit: permit,
             termination_attempts_remaining: 8,
             retry_delay: Duration::from_millis(10),
             next_action: Instant::now(),
@@ -781,12 +858,76 @@ impl SupervisedCommand {
     }
 
     #[cfg(not(all(test, unix)))]
-    fn new(child: GroupChild) -> Self {
+    fn new(child: GroupChild, permit: CommandSupervisionPermit) -> Self {
         Self {
             child,
+            _permit: permit,
             termination_attempts_remaining: 8,
             retry_delay: Duration::from_millis(10),
             next_action: Instant::now(),
+        }
+    }
+}
+
+impl PartialEq for SupervisedCommand {
+    fn eq(&self, other: &Self) -> bool {
+        self.next_action == other.next_action && self.child.id() == other.child.id()
+    }
+}
+
+impl Eq for SupervisedCommand {}
+
+impl PartialOrd for SupervisedCommand {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SupervisedCommand {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .next_action
+            .cmp(&self.next_action)
+            .then_with(|| other.child.id().cmp(&self.child.id()))
+    }
+}
+
+struct InFlightCommand {
+    supervisor: std::sync::Arc<CommandSupervisor>,
+    command: Option<SupervisedCommand>,
+}
+
+impl InFlightCommand {
+    fn new(supervisor: std::sync::Arc<CommandSupervisor>, command: SupervisedCommand) -> Self {
+        Self {
+            supervisor,
+            command: Some(command),
+        }
+    }
+
+    fn command_mut(&mut self) -> &mut SupervisedCommand {
+        self.command
+            .as_mut()
+            .expect("in-flight command is present until completion")
+    }
+
+    #[cfg(all(test, unix))]
+    fn id(&self) -> u64 {
+        self.command
+            .as_ref()
+            .expect("in-flight command is present until completion")
+            .id
+    }
+
+    fn complete(&mut self) {
+        self.command.take();
+    }
+}
+
+impl Drop for InFlightCommand {
+    fn drop(&mut self) {
+        if let Some(command) = self.command.take() {
+            self.supervisor.requeue(command);
         }
     }
 }
@@ -824,60 +965,75 @@ fn command_supervisor_worker(supervisor: std::sync::Arc<CommandSupervisor>) {
 
 fn command_supervisor_loop(supervisor: std::sync::Arc<CommandSupervisor>) {
     loop {
-        let mut registry = supervisor
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while registry.is_empty() {
-            registry = supervisor
-                .wake
-                .wait(registry)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let command = take_next_due_command(&supervisor);
+        let mut in_flight = InFlightCommand::new(supervisor.clone(), command);
+        #[cfg(all(test, unix))]
+        if supervisor
+            .panic_next_processing
+            .swap(false, Ordering::Relaxed)
+        {
+            supervisor.processing_panics.fetch_add(1, Ordering::Relaxed);
+            panic!("injected supervisor processing panic");
         }
-        let commands = std::mem::take(&mut *registry);
-        drop(registry);
-
-        let now = Instant::now();
-        let mut pending = Vec::with_capacity(commands.len());
-        for mut command in commands {
-            if supervise_command_once(&mut command, now) {
-                pending.push(command);
-            } else {
-                #[cfg(all(test, unix))]
-                supervisor.mark_completed(command.id);
-            }
-        }
-
-        let mut registry = supervisor
-            .registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.extend(pending);
-        if registry.is_empty() {
-            continue;
-        }
-        let now = Instant::now();
-        let wait = registry
-            .iter()
-            .map(|command| command.next_action.saturating_duration_since(now))
-            .min()
-            .unwrap_or(Duration::from_millis(250));
-        let waited = supervisor.wake.wait_timeout(registry, wait);
-        match waited {
-            Ok((guard, _)) => drop(guard),
-            Err(poisoned) => drop(poisoned.into_inner().0),
+        if supervise_command_once(in_flight.command_mut(), Instant::now(), &supervisor) {
+            drop(in_flight);
+        } else {
+            #[cfg(all(test, unix))]
+            let id = in_flight.id();
+            in_flight.complete();
+            #[cfg(all(test, unix))]
+            supervisor.mark_completed(id);
         }
     }
 }
 
-fn supervise_command_once(command: &mut SupervisedCommand, now: Instant) -> bool {
-    if now < command.next_action {
-        return true;
+fn take_next_due_command(supervisor: &CommandSupervisor) -> SupervisedCommand {
+    let mut registry = supervisor
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let Some(next) = registry.peek() else {
+            registry = supervisor
+                .wake
+                .wait(registry)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continue;
+        };
+        let wait = next.next_action.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return registry.pop().expect("peeked command remains queued");
+        }
+        let waited = supervisor.wake.wait_timeout(registry, wait);
+        registry = match waited {
+            Ok((guard, _)) => guard,
+            Err(poisoned) => poisoned.into_inner().0,
+        };
     }
+}
+
+fn supervise_command_once(
+    command: &mut SupervisedCommand,
+    now: Instant,
+    _supervisor: &CommandSupervisor,
+) -> bool {
     if matches!(command_leader_terminal(&command.child), Ok(true)) {
         if seal_terminal_process_group(&mut command.child).is_ok() {
-            let _ = wait_for_command_group(&mut command.child);
-            return false;
+            #[cfg(all(test, unix))]
+            _supervisor.wait_attempts.fetch_add(1, Ordering::Relaxed);
+            #[cfg(all(test, unix))]
+            let wait = if _supervisor.fail_next_wait.swap(false, Ordering::Relaxed) {
+                Err(CommandError::Wait(std::io::Error::other(
+                    "injected supervisor wait failure",
+                )))
+            } else {
+                wait_for_command_group(&mut command.child)
+            };
+            #[cfg(not(all(test, unix)))]
+            let wait = wait_for_command_group(&mut command.child);
+            if wait.is_ok() {
+                return false;
+            }
         }
         command.next_action = now + Duration::from_millis(250);
         return true;
@@ -1006,8 +1162,8 @@ where
         (true, true) => unreachable!("completed streams returned above"),
     };
     let timeout = rustix::event::Timespec {
-        tv_sec: 0,
-        tv_nsec: POLL_INTERVAL.as_nanos() as _,
+        tv_sec: exit_poll_interval.as_secs() as _,
+        tv_nsec: exit_poll_interval.subsec_nanos() as _,
     };
     loop {
         match rustix::event::poll(descriptors, Some(&timeout)) {
@@ -1026,11 +1182,7 @@ fn wait_for_stream_activity<Out, Err>(
     _stderr_done: bool,
     exit_poll_interval: Duration,
 ) -> Result<(), CommandError> {
-    if _stdout_done && _stderr_done {
-        thread::sleep(exit_poll_interval);
-    } else {
-        thread::sleep(POLL_INTERVAL);
-    }
+    thread::sleep(exit_poll_interval);
     Ok(())
 }
 
@@ -1068,6 +1220,7 @@ impl CapturedStream {
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
     SupervisorUnavailable(std::io::Error),
+    SupervisorAtCapacity,
     WorkspaceChanged(std::io::Error),
     ConfigureOutput(std::io::Error),
     Kill(std::io::Error),
@@ -1086,6 +1239,7 @@ impl CommandError {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
             Self::SupervisorUnavailable(_) => "command_supervisor_unavailable",
+            Self::SupervisorAtCapacity => "command_supervisor_pressure",
             Self::WorkspaceChanged(_) => "workspace_changed",
             Self::ConfigureOutput(_) | Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) => {
                 "command_io_error"
@@ -1101,15 +1255,17 @@ impl CommandError {
     }
 
     pub(crate) fn retryable(&self) -> bool {
-        matches!(self, Self::SupervisorUnavailable(_))
-            || matches!(
-                self,
-                Self::ConfigureOutput(source)
-                | Self::Kill(source)
-                | Self::Wait(source)
-                | Self::ReadOutput(source)
-                    if source.kind() == std::io::ErrorKind::Interrupted
-            )
+        matches!(
+            self,
+            Self::SupervisorUnavailable(_) | Self::SupervisorAtCapacity
+        ) || matches!(
+            self,
+            Self::ConfigureOutput(source)
+            | Self::Kill(source)
+            | Self::Wait(source)
+            | Self::ReadOutput(source)
+                if source.kind() == std::io::ErrorKind::Interrupted
+        )
     }
 }
 
@@ -1120,6 +1276,9 @@ impl fmt::Display for CommandError {
             Self::SupervisorUnavailable(source) => write!(
                 formatter,
                 "command supervisor is unavailable; no command was started: {source}"
+            ),
+            Self::SupervisorAtCapacity => formatter.write_str(
+                "command supervision capacity is exhausted; no command was started",
             ),
             Self::WorkspaceChanged(source) => {
                 write!(
@@ -1164,15 +1323,30 @@ mod tests {
     use command_group::CommandGroup as _;
 
     use super::{
-        cleanup_process_group, command_leader_terminal, command_supervisor, run_shell_command,
-        shell_command, supervise_live_command, CommandError, CommandSupervisor,
+        cleanup_process_group, command_leader_terminal, command_supervisor,
+        next_exit_poll_interval, prepare_command_supervision, prepare_command_supervision_with,
+        run_shell_command, shell_command, supervise_live_command, CommandError, CommandSupervisor,
         SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
-        COMMAND_SUPERVISOR_WORKER_STARTS, INJECT_GROUP_KILL_WRAPPER_FAILURE,
-        INJECT_NEXT_FULL_GROUP_KILL_FAILURE, INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE,
-        INJECT_PERSISTENT_GROUP_KILL_FAILURE, INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS,
-        LAST_SUPERVISED_COMMAND_ID, LIVE_COMMAND_SUPERVISOR_HANDOFFS, TERMINAL_GROUP_SEAL_ROUNDS,
+        INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
+        INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
+        INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS, MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL,
+        TERMINAL_GROUP_SEAL_ROUNDS,
     };
     use crate::workspace::CodingWorkspace;
+
+    #[test]
+    fn quiet_command_polling_backs_off_and_output_resets_it() {
+        let mut interval = Duration::from_millis(1);
+        for _ in 0..16 {
+            interval = next_exit_poll_interval(interval, false);
+        }
+        assert_eq!(interval, MAX_EXIT_POLL_INTERVAL);
+        assert_eq!(
+            next_exit_poll_interval(interval, true),
+            Duration::from_millis(1)
+        );
+    }
 
     fn take_last_supervised_command_id() -> u64 {
         LAST_SUPERVISED_COMMAND_ID.with(|id| {
@@ -1201,19 +1375,22 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_worker_start_failure_can_be_retried() {
+    fn supervisor_worker_start_failure_can_be_retried_with_a_real_worker() {
         let supervisor = Arc::new(CommandSupervisor::new());
-        let first = supervisor.ensure_worker_started_with(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "injected worker start failure",
-            ))
-        });
+        supervisor
+            .fail_next_worker_start
+            .store(true, Ordering::Relaxed);
+        let first = match prepare_command_supervision_with(&supervisor) {
+            Err(error) => error,
+            Ok(_) => panic!("first command preflight must fail closed"),
+        };
 
-        assert_eq!(
-            first.expect_err("first start fails").kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert_eq!(first.code(), "command_supervisor_unavailable");
+        assert!(first.retryable());
+        let CommandError::SupervisorUnavailable(source) = first else {
+            panic!("unexpected preflight error: {first:?}");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(
             *supervisor
                 .worker_state
@@ -1222,21 +1399,76 @@ mod tests {
             SupervisorWorkerState::Stopped
         );
 
-        let started = AtomicBool::new(false);
+        let permit = prepare_command_supervision_with(&supervisor)
+            .expect("a later preflight starts the real worker");
+        let mut process = shell_command("exit 0");
+        let child = process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("test command group starts");
+        let id = supervisor.enqueue(child, permit);
+
+        assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
+        assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn supervisor_processing_panic_requeues_the_same_command() {
+        let supervisor = Arc::new(CommandSupervisor::new());
+        let permit = prepare_command_supervision_with(&supervisor).expect("worker starts");
         supervisor
-            .ensure_worker_started_with(|_| {
-                started.store(true, Ordering::Relaxed);
-                Ok(())
-            })
-            .expect("a later preflight retries worker startup");
-        assert!(started.load(Ordering::Relaxed));
-        assert_eq!(
-            *supervisor
-                .worker_state
-                .lock()
-                .expect("worker state lock remains available"),
-            SupervisorWorkerState::Running
-        );
+            .panic_next_processing
+            .store(true, Ordering::Relaxed);
+        let mut process = shell_command("exit 0");
+        let child = process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("test command group starts");
+        let id = supervisor.enqueue(child, permit);
+
+        assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
+        assert_eq!(supervisor.processing_panics.load(Ordering::Relaxed), 1);
+        assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn supervisor_wait_failure_does_not_complete_before_reap() {
+        let supervisor = Arc::new(CommandSupervisor::new());
+        let permit = prepare_command_supervision_with(&supervisor).expect("worker starts");
+        supervisor.fail_next_wait.store(true, Ordering::Relaxed);
+        let mut process = shell_command("exit 0");
+        let child = process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("test command group starts");
+        let id = supervisor.enqueue(child, permit);
+
+        assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
+        assert!(supervisor.wait_attempts.load(Ordering::Relaxed) >= 2);
+        assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn supervisor_capacity_fails_closed_and_recovers() {
+        let supervisor = Arc::new(CommandSupervisor::new());
+        let permits: Vec<_> = (0..MAX_COMMAND_SUPERVISION_SLOTS)
+            .map(|_| supervisor.reserve_slot().expect("slot is available"))
+            .collect();
+
+        let error = match supervisor.reserve_slot() {
+            Err(error) => error,
+            Ok(_) => panic!("capacity must be enforced before command spawn"),
+        };
+        assert_eq!(error.code(), "command_supervisor_pressure");
+        assert!(error.retryable());
+        drop(permits);
+        assert!(supervisor.reserve_slot().is_ok());
     }
 
     #[test]
@@ -1399,7 +1631,8 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         INJECT_NEXT_FULL_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
 
-        let result = cleanup_process_group(child, false, true);
+        let permit = prepare_command_supervision().expect("supervision slot is available");
+        let result = cleanup_process_group(child, false, true, permit);
 
         assert!(
             matches!(result, Err(CommandError::Kill(_))),
@@ -1433,10 +1666,11 @@ mod tests {
         wait_for_terminal_leader(&child);
         LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
 
-        let result = supervise_live_command(child, CommandError::TerminationUnverified, None);
+        let permit = prepare_command_supervision().expect("supervision slot is available");
+        let result =
+            supervise_live_command(child, permit, CommandError::TerminationUnverified, None);
 
         assert!(matches!(result, CommandError::TerminationSupervised(_)));
-        assert_eq!(COMMAND_SUPERVISOR_WORKER_STARTS.load(Ordering::Relaxed), 1);
         wait_for_supervisor_completion(take_last_supervised_command_id());
         assert!(!root.join("delayed.txt").exists());
         std::fs::remove_dir_all(root).expect("test workspace is removed");
