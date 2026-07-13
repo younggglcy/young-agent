@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
 #[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(all(test, unix))]
@@ -27,6 +29,7 @@ const MAX_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINATION_CONFIRM_GRACE: Duration = Duration::from_millis(100);
 const FOREGROUND_EXIT_SETTLE_YIELDS: usize = 8;
 const TERMINAL_GROUP_SEAL_ROUNDS: usize = 8;
+const DESCENDANT_TOKEN_WAIT_SLICE: Duration = Duration::from_millis(5);
 const MAX_STREAM_READS_PER_TICK: usize = 16;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const MAX_COMMAND_SUPERVISION_SLOTS: usize = 64;
@@ -102,11 +105,11 @@ pub(crate) fn execute(
             ("process_scope".to_string(), json!("process_group")),
             (
                 "residual_process_group_policy".to_string(),
-                json!("kill_requested_before_leader_reap"),
+                json!("kill_and_tracking_token_close_before_leader_reap"),
             ),
             (
                 "background_process_policy".to_string(),
-                json!("kill_requested_at_foreground_exit"),
+                json!("tracked_descendants_terminated_at_foreground_exit"),
             ),
             (
                 "process_security_policy".to_string(),
@@ -135,6 +138,134 @@ pub(crate) struct CommandOutcome {
     pub(crate) output_incomplete: bool,
 }
 
+struct CommandProcess {
+    child: GroupChild,
+    #[cfg(unix)]
+    descendant_token: Option<DescendantToken>,
+}
+
+impl CommandProcess {
+    #[cfg(unix)]
+    fn tracked(child: GroupChild, descendant_token: DescendantToken) -> Self {
+        Self {
+            child,
+            descendant_token: Some(descendant_token),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn untracked(child: GroupChild) -> Self {
+        Self {
+            child,
+            descendant_token: None,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn untracked(child: GroupChild) -> Self {
+        Self { child }
+    }
+
+    fn seal_terminal_group(&mut self) -> Result<(), CommandError> {
+        #[cfg(unix)]
+        let descendant_token = self.descendant_token.as_mut();
+        #[cfg(not(unix))]
+        let descendant_token = None;
+        seal_terminal_process_group(&mut self.child, descendant_token)
+    }
+}
+
+impl std::ops::Deref for CommandProcess {
+    type Target = GroupChild;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for CommandProcess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+#[cfg(unix)]
+struct DescendantToken {
+    reader: UnixStream,
+    closed: bool,
+}
+
+#[cfg(not(unix))]
+struct DescendantToken;
+
+#[cfg(not(unix))]
+impl DescendantToken {
+    fn wait_for_close(&mut self, _timeout: Duration) -> Result<bool, CommandError> {
+        Ok(true)
+    }
+}
+
+#[cfg(unix)]
+impl DescendantToken {
+    fn register(command: &mut Command) -> Result<Self, CommandError> {
+        let (reader, writer) = UnixStream::pair().map_err(CommandError::ConfigureOutput)?;
+        reader
+            .set_nonblocking(true)
+            .map_err(CommandError::ConfigureOutput)?;
+        young_platform_process::inherit_descendant_token(command, writer.into())
+            .map_err(CommandError::ConfigureOutput)?;
+        Ok(Self {
+            reader,
+            closed: false,
+        })
+    }
+
+    fn wait_for_close(&mut self, timeout: Duration) -> Result<bool, CommandError> {
+        if self.observe_close()? {
+            return Ok(true);
+        }
+        let events = rustix::event::PollFlags::IN
+            | rustix::event::PollFlags::HUP
+            | rustix::event::PollFlags::ERR;
+        let mut descriptor = [rustix::event::PollFd::new(&self.reader, events)];
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.observe_close();
+            }
+            let timeout = rustix::event::Timespec {
+                tv_sec: remaining.as_secs() as _,
+                tv_nsec: remaining.subsec_nanos() as _,
+            };
+            match rustix::event::poll(&mut descriptor, Some(&timeout)) {
+                Ok(_) => return self.observe_close(),
+                Err(source) if source == rustix::io::Errno::INTR => continue,
+                Err(source) => return Err(CommandError::ReadOutput(std::io::Error::from(source))),
+            }
+        }
+    }
+
+    fn observe_close(&mut self) -> Result<bool, CommandError> {
+        if self.closed {
+            return Ok(true);
+        }
+        let mut buffer = [0u8; 64];
+        loop {
+            match self.reader.read(&mut buffer) {
+                Ok(0) => {
+                    self.closed = true;
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(source) => return Err(CommandError::ReadOutput(source)),
+            }
+        }
+    }
+}
+
 fn run_shell_command(
     workspace: &CodingWorkspace,
     command: &str,
@@ -151,12 +282,19 @@ fn run_shell_command(
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
     configure_command_security(&mut process);
+    #[cfg(unix)]
+    let descendant_token = DescendantToken::register(&mut process)?;
     let child = process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .group_spawn();
-    let mut child = child.map_err(CommandError::Spawn)?;
+    let child = child.map_err(CommandError::Spawn)?;
+    drop(process);
+    #[cfg(unix)]
+    let mut child = CommandProcess::tracked(child, descendant_token);
+    #[cfg(not(unix))]
+    let mut child = CommandProcess::untracked(child);
     let mut stdout = child
         .inner()
         .stdout
@@ -205,7 +343,7 @@ fn run_shell_command(
                 if status.is_none() {
                     terminate_command_group(&mut child)?;
                     if wait_for_leader_terminal_bounded(&child, TERMINATION_CONFIRM_GRACE)? {
-                        seal_terminal_process_group(&mut child)?;
+                        child.seal_terminal_group()?;
                         status = Some(wait_for_command_group(&mut child)?);
                     }
                 }
@@ -234,7 +372,7 @@ fn run_shell_command(
             if status.is_none() && leader_terminal {
                 // Keep the terminal leader unreaped while already-started descendant
                 // forks settle, then terminate the still-reserved process group once.
-                seal_terminal_process_group(&mut child)?;
+                child.seal_terminal_group()?;
                 status = Some(wait_for_command_group(&mut child)?);
             }
 
@@ -344,7 +482,10 @@ fn prepare_command_supervision() -> Result<CommandSupervisionPermit, CommandErro
 fn prepare_command_supervision_with(
     supervisor: &std::sync::Arc<CommandSupervisor>,
 ) -> Result<CommandSupervisionPermit, CommandError> {
-    supervisor.ensure_worker_started()?;
+    supervisor
+        .ensure_worker_started()
+        .map_err(CommandError::SupervisorUnavailable)?;
+    supervisor.ensure_admission_healthy()?;
     supervisor.reserve_slot()
 }
 
@@ -426,9 +567,7 @@ fn terminate_signal_compatible_group_after_leader_exit(
     child: &mut GroupChild,
 ) -> Result<(), CommandError> {
     match terminate_command_group(child) {
-        Err(CommandError::Kill(source))
-            if source.kind() == std::io::ErrorKind::PermissionDenied =>
-        {
+        Err(CommandError::Kill(source)) if group_signal_permission_denied(&source) => {
             // The terminal leader is intentionally unreaped and can keep an otherwise
             // empty group present. EPERM means no remaining member is signal-compatible
             // with this process; credential-changing descendants are outside the
@@ -439,12 +578,37 @@ fn terminate_signal_compatible_group_after_leader_exit(
     }
 }
 
-fn seal_terminal_process_group(child: &mut GroupChild) -> Result<(), CommandError> {
+fn group_signal_permission_denied(source: &std::io::Error) -> bool {
+    if source.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        source.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error())
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn seal_terminal_process_group(
+    child: &mut GroupChild,
+    mut descendant_token: Option<&mut DescendantToken>,
+) -> Result<(), CommandError> {
     for _ in 0..TERMINAL_GROUP_SEAL_ROUNDS {
         for _ in 0..FOREGROUND_EXIT_SETTLE_YIELDS {
             thread::yield_now();
         }
         terminate_signal_compatible_group_after_leader_exit(child)?;
+        if let Some(token) = descendant_token.as_deref_mut() {
+            if token.wait_for_close(DESCENDANT_TOKEN_WAIT_SLICE)? {
+                return Ok(());
+            }
+        }
+    }
+    if descendant_token.is_some() {
+        return Err(CommandError::TerminationUnverified);
     }
     Ok(())
 }
@@ -557,7 +721,7 @@ fn wait_for_command_group(child: &mut GroupChild) -> Result<ExitStatus, CommandE
 }
 
 fn cleanup_process_group(
-    mut child: GroupChild,
+    mut child: CommandProcess,
     process_exited: bool,
     terminate_group: bool,
     supervision_permit: CommandSupervisionPermit,
@@ -592,7 +756,7 @@ fn cleanup_process_group(
                     ));
                 }
                 Ok(true) => {
-                    if let Err(seal) = seal_terminal_process_group(&mut child) {
+                    if let Err(seal) = child.seal_terminal_group() {
                         return Err(supervise_live_command(
                             child,
                             supervision_permit,
@@ -628,7 +792,23 @@ fn cleanup_process_group(
 }
 
 fn supervise_live_command(
-    child: GroupChild,
+    child: CommandProcess,
+    supervision_permit: CommandSupervisionPermit,
+    termination_error: CommandError,
+    wait_error: Option<CommandError>,
+) -> CommandError {
+    supervise_live_command_with(
+        command_supervisor(),
+        child,
+        supervision_permit,
+        termination_error,
+        wait_error,
+    )
+}
+
+fn supervise_live_command_with(
+    supervisor: &std::sync::Arc<CommandSupervisor>,
+    child: CommandProcess,
     supervision_permit: CommandSupervisionPermit,
     termination_error: CommandError,
     wait_error: Option<CommandError>,
@@ -642,7 +822,6 @@ fn supervise_live_command(
     let wait_context = wait_error.map_or_else(String::new, |source| {
         format!("; nonblocking reap inspection also failed ({source})")
     });
-    let supervisor = command_supervisor();
     #[cfg(all(test, unix))]
     let command_id = supervisor.enqueue(child, supervision_permit);
     #[cfg(not(all(test, unix)))]
@@ -662,6 +841,7 @@ struct CommandSupervisor {
     registry: std::sync::Mutex<std::collections::BinaryHeap<SupervisedCommand>>,
     wake: std::sync::Condvar,
     worker_state: std::sync::Mutex<SupervisorWorkerState>,
+    admission_health: std::sync::Mutex<SupervisorAdmissionHealth>,
     active_slots: AtomicUsize,
     #[cfg(all(test, unix))]
     next_command_id: AtomicU64,
@@ -689,6 +869,7 @@ impl CommandSupervisor {
             registry: std::sync::Mutex::new(std::collections::BinaryHeap::new()),
             wake: std::sync::Condvar::new(),
             worker_state: std::sync::Mutex::new(SupervisorWorkerState::Stopped),
+            admission_health: std::sync::Mutex::new(SupervisorAdmissionHealth::Healthy),
             active_slots: AtomicUsize::new(0),
             #[cfg(all(test, unix))]
             next_command_id: AtomicU64::new(1),
@@ -712,14 +893,14 @@ impl CommandSupervisor {
     }
 
     #[cfg(all(test, unix))]
-    fn enqueue(&self, child: GroupChild, permit: CommandSupervisionPermit) -> u64 {
+    fn enqueue(&self, child: CommandProcess, permit: CommandSupervisionPermit) -> u64 {
         self.enqueue_at(child, permit, Instant::now())
     }
 
     #[cfg(all(test, unix))]
     fn enqueue_at(
         &self,
-        child: GroupChild,
+        child: CommandProcess,
         permit: CommandSupervisionPermit,
         next_action: Instant,
     ) -> u64 {
@@ -735,7 +916,7 @@ impl CommandSupervisor {
     }
 
     #[cfg(not(all(test, unix)))]
-    fn enqueue(&self, child: GroupChild, permit: CommandSupervisionPermit) {
+    fn enqueue(&self, child: CommandProcess, permit: CommandSupervisionPermit) {
         self.registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -743,22 +924,20 @@ impl CommandSupervisor {
         self.wake.notify_one();
     }
 
-    fn ensure_worker_started(self: &std::sync::Arc<Self>) -> Result<(), CommandError> {
+    fn ensure_worker_started(self: &std::sync::Arc<Self>) -> std::io::Result<()> {
         #[cfg(all(test, unix))]
         if self.fail_next_worker_start.swap(false, Ordering::Relaxed) {
-            return Err(CommandError::SupervisorUnavailable(std::io::Error::new(
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "injected worker start failure",
-            )));
+            ));
         }
         let mut state = self
             .worker_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match *state {
-            SupervisorWorkerState::Running => return Ok(()),
-            SupervisorWorkerState::Degraded => return Err(CommandError::SupervisorDegraded),
-            SupervisorWorkerState::Stopped => {}
+        if *state == SupervisorWorkerState::Running {
+            return Ok(());
         }
         *state = SupervisorWorkerState::Running;
         let worker = self.clone();
@@ -767,9 +946,20 @@ impl CommandSupervisor {
             .spawn(move || command_supervisor_worker(worker))
         {
             *state = SupervisorWorkerState::Stopped;
-            return Err(CommandError::SupervisorUnavailable(source));
+            return Err(source);
         }
         Ok(())
+    }
+
+    fn ensure_admission_healthy(&self) -> Result<(), CommandError> {
+        let health = self
+            .admission_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *health {
+            SupervisorAdmissionHealth::Healthy => Ok(()),
+            SupervisorAdmissionHealth::Degraded => Err(CommandError::SupervisorDegraded),
+        }
     }
 
     fn reserve_slot(self: &std::sync::Arc<Self>) -> Result<CommandSupervisionPermit, CommandError> {
@@ -811,10 +1001,10 @@ impl CommandSupervisor {
         command.next_action = Instant::now() + delay;
         if command.processing_panics >= MAX_COMMAND_PROCESSING_PANICS {
             *self
-                .worker_state
+                .admission_health
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                SupervisorWorkerState::Degraded;
+                SupervisorAdmissionHealth::Degraded;
         }
     }
 
@@ -870,6 +1060,11 @@ impl CommandSupervisor {
 enum SupervisorWorkerState {
     Stopped,
     Running,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupervisorAdmissionHealth {
+    Healthy,
     Degraded,
 }
 
@@ -886,7 +1081,7 @@ impl Drop for CommandSupervisionPermit {
 struct SupervisedCommand {
     #[cfg(all(test, unix))]
     id: u64,
-    child: GroupChild,
+    child: CommandProcess,
     _permit: CommandSupervisionPermit,
     processing_panics: u8,
     termination_attempts_remaining: u8,
@@ -896,7 +1091,7 @@ struct SupervisedCommand {
 
 impl SupervisedCommand {
     #[cfg(all(test, unix))]
-    fn new(id: u64, child: GroupChild, permit: CommandSupervisionPermit) -> Self {
+    fn new(id: u64, child: CommandProcess, permit: CommandSupervisionPermit) -> Self {
         Self {
             id,
             child,
@@ -909,7 +1104,7 @@ impl SupervisedCommand {
     }
 
     #[cfg(not(all(test, unix)))]
-    fn new(child: GroupChild, permit: CommandSupervisionPermit) -> Self {
+    fn new(child: CommandProcess, permit: CommandSupervisionPermit) -> Self {
         Self {
             child,
             _permit: permit,
@@ -1002,9 +1197,7 @@ impl Drop for SupervisorWorkerGuard {
             .worker_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *state != SupervisorWorkerState::Degraded {
-            *state = SupervisorWorkerState::Stopped;
-        }
+        *state = SupervisorWorkerState::Stopped;
     }
 }
 
@@ -1076,7 +1269,7 @@ fn supervise_command_once(
     _supervisor: &CommandSupervisor,
 ) -> bool {
     if matches!(command_leader_terminal(&command.child), Ok(true)) {
-        if seal_terminal_process_group(&mut command.child).is_ok() {
+        if command.child.seal_terminal_group().is_ok() {
             #[cfg(all(test, unix))]
             _supervisor.wait_attempts.fetch_add(1, Ordering::Relaxed);
             #[cfg(all(test, unix))]
@@ -1388,13 +1581,14 @@ mod tests {
     use super::{
         cleanup_process_group, command_leader_terminal, command_supervisor,
         next_exit_poll_interval, prepare_command_supervision, prepare_command_supervision_with,
-        run_shell_command, shell_command, supervise_live_command, CommandError, CommandSupervisor,
+        run_shell_command, shell_command, supervise_live_command, supervise_live_command_with,
+        CommandError, CommandProcess, CommandSupervisor, SupervisorAdmissionHealth,
         SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
         LIVE_COMMAND_SUPERVISOR_HANDOFFS, MAX_COMMAND_PROCESSING_PANICS,
-        MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL, TERMINAL_GROUP_SEAL_ROUNDS,
+        MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL,
     };
     use crate::workspace::CodingWorkspace;
 
@@ -1471,7 +1665,7 @@ mod tests {
             .stderr(Stdio::null())
             .group_spawn()
             .expect("test command group starts");
-        let id = supervisor.enqueue(child, permit);
+        let id = supervisor.enqueue(CommandProcess::untracked(child), permit);
 
         assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
         assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
@@ -1491,7 +1685,7 @@ mod tests {
             .stderr(Stdio::null())
             .group_spawn()
             .expect("test command group starts");
-        let id = supervisor.enqueue(child, permit);
+        let id = supervisor.enqueue(CommandProcess::untracked(child), permit);
 
         assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
         assert_eq!(
@@ -1527,9 +1721,13 @@ mod tests {
             .group_spawn()
             .expect("healthy test command group starts");
         let first_deadline = Instant::now() + Duration::from_millis(20);
-        let failing_id = supervisor.enqueue_at(failing_child, failing_permit, first_deadline);
+        let failing_id = supervisor.enqueue_at(
+            CommandProcess::untracked(failing_child),
+            failing_permit,
+            first_deadline,
+        );
         let healthy_id = supervisor.enqueue_at(
-            healthy_child,
+            CommandProcess::untracked(healthy_child),
             healthy_permit,
             first_deadline + Duration::from_millis(1),
         );
@@ -1547,10 +1745,10 @@ mod tests {
         );
         assert_eq!(
             *supervisor
-                .worker_state
+                .admission_health
                 .lock()
-                .expect("worker state remains available"),
-            SupervisorWorkerState::Degraded
+                .expect("admission health remains available"),
+            SupervisorAdmissionHealth::Degraded
         );
         let error = match prepare_command_supervision_with(&supervisor) {
             Err(error) => error,
@@ -1558,6 +1756,54 @@ mod tests {
         };
         assert_eq!(error.code(), "command_supervisor_degraded");
         assert!(!error.retryable());
+        assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn degraded_admission_restarts_cleanup_worker_and_reports_live_handoff() {
+        let supervisor = Arc::new(CommandSupervisor::new());
+        *supervisor
+            .admission_health
+            .lock()
+            .expect("admission health remains available") = SupervisorAdmissionHealth::Degraded;
+        let permit = supervisor
+            .reserve_slot()
+            .expect("cleanup ownership is reserved");
+        let mut process = shell_command("sleep 0.2");
+        let child = process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .group_spawn()
+            .expect("test command group starts");
+
+        let error = supervise_live_command_with(
+            &supervisor,
+            CommandProcess::untracked(child),
+            permit,
+            CommandError::TerminationUnverified,
+            None,
+        );
+
+        let CommandError::TerminationSupervised(message) = error else {
+            panic!("live ownership must be supervised");
+        };
+        assert!(message.contains("supervisor retries termination"));
+        assert!(!message.contains("worker is unavailable"));
+        let id = take_last_supervised_command_id();
+        assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
+        assert_eq!(
+            *supervisor
+                .worker_state
+                .lock()
+                .expect("worker state remains available"),
+            SupervisorWorkerState::Running
+        );
+        let admission = match prepare_command_supervision_with(&supervisor) {
+            Err(error) => error,
+            Ok(_) => panic!("degraded admission rejects new commands after cleanup restart"),
+        };
+        assert_eq!(admission.code(), "command_supervisor_degraded");
         assert_eq!(supervisor.active_slots.load(Ordering::Acquire), 0);
     }
 
@@ -1573,7 +1819,7 @@ mod tests {
             .stderr(Stdio::null())
             .group_spawn()
             .expect("test command group starts");
-        let id = supervisor.enqueue(child, permit);
+        let id = supervisor.enqueue(CommandProcess::untracked(child), permit);
 
         assert!(supervisor.wait_for_completion(id, Duration::from_secs(2)));
         assert!(supervisor.wait_attempts.load(Ordering::Relaxed) >= 2);
@@ -1633,8 +1879,8 @@ mod tests {
         );
         assert_eq!(
             COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.get()),
-            1 + TERMINAL_GROUP_SEAL_ROUNDS,
-            "the residual group is sealed repeatedly before its terminal leader is reaped"
+            2,
+            "cleanup terminates once, then confirms descendant-token closure before reaping"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         thread::sleep(Duration::from_millis(250));
@@ -1735,6 +1981,45 @@ mod tests {
     }
 
     #[test]
+    fn terminal_leader_partial_group_kill_success_never_reports_success() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-command-terminal-partial-termination-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS.with(|failure| failure.set(true));
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.set(0));
+        LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
+
+        let result = run_shell_command(
+            &workspace,
+            "(sleep 0.2; printf leaked > delayed.txt) >/dev/null 2>&1 & exit 0",
+            &AtomicBool::new(false),
+            1024,
+        );
+
+        INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS.with(|failure| failure.set(false));
+        assert!(
+            matches!(result, Err(CommandError::TerminationSupervised(_))),
+            "an unverified terminal group must be handed off: {result:?}"
+        );
+        assert_eq!(
+            LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.get()),
+            1
+        );
+        wait_for_supervisor_completion(take_last_supervised_command_id());
+        assert!(!root.join("delayed.txt").exists());
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
     fn cleanup_seals_residual_members_before_reaping_a_terminal_leader() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1758,7 +2043,7 @@ mod tests {
         INJECT_NEXT_FULL_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
 
         let permit = prepare_command_supervision().expect("supervision slot is available");
-        let result = cleanup_process_group(child, false, true, permit);
+        let result = cleanup_process_group(CommandProcess::untracked(child), false, true, permit);
 
         assert!(
             matches!(result, Err(CommandError::Kill(_))),
@@ -1793,8 +2078,12 @@ mod tests {
         LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
 
         let permit = prepare_command_supervision().expect("supervision slot is available");
-        let result =
-            supervise_live_command(child, permit, CommandError::TerminationUnverified, None);
+        let result = supervise_live_command(
+            CommandProcess::untracked(child),
+            permit,
+            CommandError::TerminationUnverified,
+            None,
+        );
 
         assert!(matches!(result, CommandError::TerminationSupervised(_)));
         wait_for_supervisor_completion(take_last_supervised_command_id());

@@ -47,12 +47,15 @@ async-signal-safe 的 `fchdir`，直接绑定已打开的 workspace handle；无
 reader 可停止回收。进程组 leader 退出后不能先 reap 再继续用它的 PID 作为 PGID：
 该数值可能被复用，后续探测或取消会等待、甚至终止无关进程。macOS/Linux 实现应先用
 `waitid(..., WNOWAIT)` 观察终态。用户 shell 源码保持原样；leader 终态后仍保留其
-unreaped identity 作为 PGID reservation，给已经开始的 fork 让出有限调度机会后，先终止
-background 与同组残余成员，再完成 leader reap。成功提交不应依赖
+unreaped identity 作为 PGID reservation。仅重复固定次数的 `yield + killpg` 不能证明 cleanup
+完成：最后一次 signal 之后，并发 fork 仍可能才完成。child 应额外继承一个匿名 ownership
+token，正常 fork 会原子继承它；parent 先终止 background 与同组残余成员，只有观察到 token
+EOF 才能完成 leader reap 并返回成功，否则把 child、token 与 permit 一起转交 supervisor。
+成功提交不应依赖
 `/proc` 或 `libproc` 的非原子成员快照；无法提供非回收终态观察的平台应在 spawn 前拒绝。
 Linux 额外用 `no_new_privs` 阻止后代通过 exec 获得新的 signal 权限；macOS 没有等价的
 portable primitive，因此 manifest 与 output 只能承诺向仍可 signal 的同组成员请求终止，
-不能把 credential-changing descendant 描述为已验证回收。
+不能把 credential-changing descendant，或主动关闭 tracking descriptor 的后代，描述为已验证回收。
 即使 wrapper 与 direct group kill 同时失败，也不能在 leader 仍存活时直接 drop child handle：
 应把 ownership 交给单一的进程级 supervisor registry/event loop，做有界 termination retry，
 之后继续持有并最终 reap；不能为每条失败命令创建一个可能永久存活的 detached thread。
@@ -63,8 +66,9 @@ registry，确保 child 启动后不会因容量已满而失去接管路径。de
 避免 staggered commands 反复全量扫描和搬移。worker 从 heap 取出的单条 command 必须放在
 in-flight RAII guard 中，任何 panic 都自动把同一 ownership 重新入队。若同一 command 持续
 触发内部 panic，原 deadline 直接重入会长期霸占 heap 顶部；因此要按 command 记录 panic、
-指数退避并让其他到期项先运行，达到阈值后把 supervisor 粘性标记为 degraded，继续清理已经
-接管的 ownership，但 fail closed 地拒绝启动新命令。
+指数退避并让其他到期项先运行。admission health 与 worker lifecycle 必须是正交状态：达到
+阈值后把 admission 粘性标记为 degraded、fail closed 地拒绝新命令，但 cleanup worker 仍可在
+退出后重启并继续清理已经接管的 ownership。
 测试不能用固定 sleep 猜测这条异步路径已经完成：先用 non-reaping 观察确认 fixture leader
 terminal，再等待对应 registry entry 的 completion barrier，才能证明 supervisor 已 seal 并 reap。
 只有 `wait` 确认 reap 成功才能触发 completion；reap error 必须保留 entry 并重试。
@@ -72,9 +76,9 @@ fail-closed 的非 Unix 路径也必须能通过编译，
 因此 Unix-only snapshot protocol 在其他平台需要可解析的 opaque token，即使调用总是返回
 `Unsupported`。
 cleanup 与 supervisor 也必须用 `waitid(..., WNOWAIT)` 观察 leader 终态；即使一次 group kill
-返回成功，也要先确认 leader terminal，并在保留 PGID reservation 时经过有限的多轮
-yield-and-kill seal residual group，最后才能 reap。否则 macOS 的 partial signal success、
-leader 先退出竞态，或终态观察附近仍在完成的 fork 都可能泄漏同组成员。
+返回成功，也要先确认 leader terminal，并在保留 PGID reservation 时等待 inherited token
+关闭，最后才能 reap。否则 macOS 的 partial signal success、leader 先退出竞态，或终态观察
+附近仍在完成的 fork 都可能泄漏同组成员。
 只要 stdout/stderr 都没有 I/O progress，状态轮询就应指数退避到有限上限，避免仍保持 pipe
 打开的长时间静默命令固定频率唤醒；一旦任一 pipe 又有进展就恢复低延迟轮询。
 read-only 与 mutating command 的细粒度分类属于 Issue #8。

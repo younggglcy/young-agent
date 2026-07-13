@@ -3,6 +3,9 @@
 use std::io;
 use std::process::Command;
 
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+
 use cap_std::fs::Dir;
 
 /// Binds a child process to an already-open directory capability.
@@ -48,6 +51,36 @@ pub fn block_exec_privilege_gain(command: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 pub fn block_exec_privilege_gain(_command: &mut Command) {}
+
+/// Gives the child an anonymous descriptor whose lifetime is inherited by its
+/// descendants but not retained by the parent.
+///
+/// The source descriptor is made close-on-exec before the hook is registered.
+/// The post-fork hook duplicates it without close-on-exec immediately before
+/// `exec`, so unrelated concurrent spawns cannot inherit the token from the
+/// parent process.
+#[cfg(unix)]
+pub fn inherit_descendant_token(command: &mut Command, token: OwnedFd) -> io::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let flags = rustix::io::fcntl_getfd(&token).map_err(io::Error::from)?;
+    rustix::io::fcntl_setfd(&token, flags | rustix::io::FdFlags::CLOEXEC)
+        .map_err(io::Error::from)?;
+
+    // SAFETY: the owned source descriptor outlives the hook. `dup` is
+    // async-signal-safe, and forgetting the returned descriptor only transfers
+    // its lifetime to the exec'd child and descendants; no allocation or
+    // shared-state access occurs after fork.
+    #[allow(unsafe_code)]
+    unsafe {
+        command.pre_exec(move || {
+            let inherited = rustix::io::dup(&token).map_err(io::Error::from)?;
+            std::mem::forget(inherited);
+            Ok(())
+        });
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

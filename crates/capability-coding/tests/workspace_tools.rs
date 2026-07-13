@@ -1542,11 +1542,11 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
     assert_eq!(metadata["process_scope"], json!("process_group"));
     assert_eq!(
         metadata["residual_process_group_policy"],
-        json!("kill_requested_before_leader_reap")
+        json!("kill_and_tracking_token_close_before_leader_reap")
     );
     assert_eq!(
         metadata["background_process_policy"],
-        json!("kill_requested_at_foreground_exit")
+        json!("tracked_descendants_terminated_at_foreground_exit")
     );
     assert!(metadata["process_security_policy"].is_string());
     assert!(metadata["exec_privilege_gain_blocked"].is_boolean());
