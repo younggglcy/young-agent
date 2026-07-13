@@ -274,6 +274,69 @@ fn read_file_rejects_a_symlink_that_escapes_the_selected_workspace() {
     assert_eq!(error.code, "outside_workspace");
 }
 
+#[cfg(unix)]
+#[test]
+fn file_tools_remain_bound_to_the_open_workspace_when_its_path_is_replaced() {
+    use std::os::unix::fs::symlink;
+
+    let container = TestWorkspace::new("workspace-handle");
+    let selected = container.path().join("selected");
+    let moved = container.path().join("moved");
+    let outside = container.path().join("outside");
+    std::fs::create_dir(&selected).expect("selected workspace is created");
+    std::fs::create_dir(&outside).expect("outside directory is created");
+    std::fs::write(selected.join("notes.txt"), "inside\n").expect("inside fixture is written");
+    std::fs::write(outside.join("notes.txt"), "outside\n").expect("outside fixture is written");
+    let workspace = CodingWorkspace::resolve(&selected).expect("workspace resolves");
+    std::fs::rename(&selected, &moved).expect("selected workspace path is moved");
+    symlink(&outside, &selected).expect("ambient workspace path is replaced");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let read = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-stable-root-read"),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "notes.txt" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Success { content, .. } = read.output else {
+        panic!("read should use the opened workspace handle");
+    };
+    assert_eq!(
+        content,
+        vec![ToolContent::Text {
+            text: "inside\n".to_string(),
+        }]
+    );
+
+    let patch_call = ToolCall {
+        id: ToolCallId::new("call-stable-root-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-inside\n+updated\n"
+        }),
+    };
+    let patched = runtime.dispatch(
+        patch_call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: patch_call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(matches!(patched.output, ToolOutput::Success { .. }));
+    assert_eq!(
+        std::fs::read_to_string(moved.join("notes.txt")).unwrap(),
+        "updated\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("notes.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
 #[test]
 fn read_file_truncates_at_a_valid_utf8_boundary() {
     let test_workspace = TestWorkspace::new("read-truncation");
@@ -304,11 +367,11 @@ fn read_file_truncates_at_a_valid_utf8_boundary() {
     let [ToolContent::Text { text }] = content.as_slice() else {
         panic!("read_file should return text");
     };
-    assert_eq!(text.len(), 64 * 1024 - 1);
+    assert_eq!(text.len(), 48 * 1024 - 2);
     assert_eq!(metadata["bytes"], json!(64 * 1024 + 6));
-    assert_eq!(metadata["returned_bytes"], json!(64 * 1024 - 1));
+    assert_eq!(metadata["returned_bytes"], json!(48 * 1024 - 2));
     assert_eq!(metadata["truncated"], json!(true));
-    assert_eq!(metadata["truncation_limit_bytes"], json!(64 * 1024));
+    assert_eq!(metadata["truncation_limit_bytes"], json!(48 * 1024));
 }
 
 #[test]
@@ -398,6 +461,79 @@ fn search_files_marks_a_truncated_matching_line() {
         8 * 1024
     );
     assert_eq!(metadata["truncated"], json!(true));
+}
+
+#[test]
+fn search_files_finds_a_match_beyond_its_bounded_line_preview() {
+    let test_workspace = TestWorkspace::new("search-long-line");
+    let mut long_line = "x".repeat(2 * 1024 * 1024);
+    long_line.push_str("needle\n");
+    std::fs::write(test_workspace.path().join("large.txt"), long_line).expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-streaming-search"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "needle" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success {
+        content, metadata, ..
+    } = result.output
+    else {
+        panic!("search_files should succeed");
+    };
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("search_files should return structured JSON");
+    };
+    assert_eq!(value["matches"][0]["line"], json!(1));
+    assert_eq!(
+        value["matches"][0]["text"].as_str().unwrap().len(),
+        8 * 1024
+    );
+    assert_eq!(metadata["lines_truncated"], json!(1));
+    assert_eq!(metadata["truncated"], json!(true));
+}
+
+#[test]
+fn search_files_observes_cancellation_while_scanning_a_large_line() {
+    let test_workspace = TestWorkspace::new("search-cancellation");
+    std::fs::write(
+        test_workspace.path().join("large.txt"),
+        vec![b'x'; 32 * 1024 * 1024],
+    )
+    .expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation_trigger = cancellation.clone();
+    let trigger = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        cancellation_trigger.store(true, Ordering::Relaxed);
+    });
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-cancelled-search"),
+            tool_name: "search_files".to_string(),
+            arguments: json!({ "query": "absent" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        cancellation,
+    );
+    trigger.join().expect("cancellation trigger finishes");
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("cancelled search must fail");
+    };
+    assert_eq!(error.code, "tool_cancelled");
 }
 
 #[cfg(unix)]
@@ -554,7 +690,7 @@ fn apply_patch_rejects_a_target_outside_the_selected_workspace() {
 }
 
 #[test]
-fn apply_patch_can_create_and_delete_files_in_one_validated_patch() {
+fn apply_patch_rejects_multi_file_edits_without_mutating_any_file() {
     let test_workspace = TestWorkspace::new("patch-create-delete");
     let old = test_workspace.path().join("old.txt");
     std::fs::write(&old, "obsolete\n").expect("fixture is written");
@@ -587,21 +723,41 @@ fn apply_patch_can_create_and_delete_files_in_one_validated_patch() {
         Arc::new(AtomicBool::new(false)),
     );
 
-    let ToolOutput::Success { content, .. } = result.output else {
-        panic!("create/delete patch should succeed");
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("multi-file patch must fail");
     };
+    assert_eq!(error.code, "invalid_patch");
+    assert!(!test_workspace.path().join("new.txt").exists());
     assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("new.txt"))
-            .expect("new file is readable"),
-        "created\nfile\n"
+        std::fs::read_to_string(old).expect("old file remains readable"),
+        "obsolete\n"
     );
-    assert!(!old.exists());
-    assert_eq!(
-        content,
-        vec![ToolContent::Json {
-            value: json!({ "changed_files": ["new.txt", "old.txt"] }),
-        }]
+}
+
+#[test]
+fn apply_patch_rejects_oversized_input_before_parsing_it() {
+    let test_workspace = TestWorkspace::new("patch-input-limit");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-oversized-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({ "patch": "x".repeat(4 * 1024 * 1024 + 1) }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
     );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("oversized patch must fail");
+    };
+    assert_eq!(error.code, "patch_too_large");
 }
 
 #[test]
@@ -805,10 +961,43 @@ fn run_command_truncates_large_output_without_losing_the_total_size() {
     let [ToolContent::Json { value }] = content.as_slice() else {
         panic!("run_command should return structured JSON");
     };
-    assert_eq!(value["stdout"].as_str().unwrap().len(), 64 * 1024);
+    assert_eq!(value["stdout"].as_str().unwrap().len(), 24 * 1024 - 2);
     assert_eq!(metadata["stdout_bytes"], json!(70_000));
     assert_eq!(metadata["stdout_truncated"], json!(true));
     assert_eq!(metadata["output_incomplete"], json!(false));
+}
+
+#[test]
+fn run_command_bounds_json_escaped_output() {
+    let test_workspace = TestWorkspace::new("command-json-budget");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-json-budget-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "dd if=/dev/zero bs=70000 count=1 2>/dev/null"
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let serialized_len = serde_json::to_vec(&result.output)
+        .expect("tool output serializes")
+        .len();
+    let ToolOutput::Success { metadata, .. } = result.output else {
+        panic!("run_command should succeed");
+    };
+    assert_eq!(metadata["stdout_bytes"], json!(70_000));
+    assert_eq!(metadata["stdout_truncated"], json!(true));
+    assert!(serialized_len <= 64 * 1024, "serialized output is bounded");
 }
 
 #[test]
@@ -870,4 +1059,44 @@ fn run_command_observes_cooperative_cancellation() {
         panic!("cancelled command must fail");
     };
     assert_eq!(error.code, "tool_cancelled");
+}
+
+#[test]
+fn run_command_cancellation_terminates_descendant_processes() {
+    let test_workspace = TestWorkspace::new("command-descendant-cancellation");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-cancelled-command-tree"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({
+            "command": "(sleep 0.2; printf leaked > descendant.txt) & wait"
+        }),
+    };
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation_trigger = cancellation.clone();
+    let trigger = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        cancellation_trigger.store(true, Ordering::Relaxed);
+    });
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        cancellation,
+    );
+    trigger.join().expect("cancellation trigger finishes");
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("cancelled command must fail");
+    };
+    assert_eq!(error.code, "tool_cancelled");
+    thread::sleep(Duration::from_millis(250));
+    assert!(
+        !test_workspace.path().join("descendant.txt").exists(),
+        "cancelled descendants must not mutate the workspace later"
+    );
 }

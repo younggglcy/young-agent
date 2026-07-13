@@ -8,10 +8,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use command_group::CommandGroup;
 use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
-use crate::tool_support::{failure, ToolArguments, MAX_OUTPUT_BYTES};
+use crate::tool_support::{
+    failure, truncate_json_string, ToolArguments, MAX_OUTPUT_BYTES,
+    MAX_TOOL_CONTENT_SERIALIZED_BYTES,
+};
 use crate::workspace::CodingWorkspace;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -43,13 +47,18 @@ pub(crate) fn execute(
         Err(error) => return failure(error.code(), error.to_string(), error.retryable()),
     };
     let cwd = workspace.context().root().display().to_string();
+    let stream_budget = MAX_TOOL_CONTENT_SERIALIZED_BYTES / 2;
+    let (stdout, stdout_serialization_truncated) =
+        truncate_json_string(&outcome.stdout, stream_budget);
+    let (stderr, stderr_serialization_truncated) =
+        truncate_json_string(&outcome.stderr, stream_budget);
     ToolOutput::Success {
         content: vec![ToolContent::Json {
             value: json!({
                 "success": outcome.status.success(),
                 "exit_code": outcome.status.code(),
-                "stdout": outcome.stdout,
-                "stderr": outcome.stderr,
+                "stdout": stdout,
+                "stderr": stderr,
             }),
         }],
         metadata: BTreeMap::from([
@@ -58,11 +67,11 @@ pub(crate) fn execute(
             ("stderr_bytes".to_string(), json!(outcome.stderr_bytes)),
             (
                 "stdout_truncated".to_string(),
-                json!(outcome.stdout_truncated),
+                json!(outcome.stdout_truncated || stdout_serialization_truncated),
             ),
             (
                 "stderr_truncated".to_string(),
-                json!(outcome.stderr_truncated),
+                json!(outcome.stderr_truncated || stderr_serialization_truncated),
             ),
             (
                 "output_incomplete".to_string(),
@@ -101,13 +110,21 @@ fn run_shell_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
+        .group_spawn()
         .map_err(CommandError::Spawn)?;
-    let stdout = child.stdout.take().expect("stdout was configured as piped");
-    let stderr = child.stderr.take().expect("stderr was configured as piped");
+    let stdout = child
+        .inner()
+        .stdout
+        .take()
+        .expect("stdout was configured as piped");
+    let stderr = child
+        .inner()
+        .stderr
+        .take()
+        .expect("stderr was configured as piped");
     let (sender, receiver) = mpsc::sync_channel(16);
-    spawn_reader(Stream::Stdout, stdout, sender.clone());
-    spawn_reader(Stream::Stderr, stderr, sender);
+    let stdout_reader = spawn_reader(Stream::Stdout, stdout, sender.clone());
+    let stderr_reader = spawn_reader(Stream::Stderr, stderr, sender);
 
     let mut stdout_capture = CapturedStream::new(max_output_bytes);
     let mut stderr_capture = CapturedStream::new(max_output_bytes);
@@ -116,12 +133,14 @@ fn run_shell_command(
     let mut status = None;
     let mut exited_at = None;
     let mut output_incomplete = false;
+    let mut cancelled = false;
 
     loop {
         if cancellation.load(Ordering::Relaxed) && status.is_none() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(CommandError::Cancelled);
+            cancelled = true;
+            child.kill().map_err(CommandError::Kill)?;
+            status = Some(child.wait().map_err(CommandError::Wait)?);
+            exited_at = Some(Instant::now());
         }
 
         receive_stream_message(
@@ -148,8 +167,17 @@ fn run_shell_command(
         }
     }
 
+    stdout_reader
+        .join()
+        .map_err(|_| CommandError::ReaderPanicked)?;
+    stderr_reader
+        .join()
+        .map_err(|_| CommandError::ReaderPanicked)?;
     if let Some(source) = stream_error {
         return Err(CommandError::ReadOutput(source));
+    }
+    if cancelled {
+        return Err(CommandError::Cancelled);
     }
     let status = status.expect("loop only exits after the child exits");
     Ok(CommandOutcome {
@@ -190,7 +218,11 @@ enum StreamMessage {
     Failed(Stream, std::io::Error),
 }
 
-fn spawn_reader<R>(stream: Stream, mut reader: R, sender: SyncSender<StreamMessage>)
+fn spawn_reader<R>(
+    stream: Stream,
+    mut reader: R,
+    sender: SyncSender<StreamMessage>,
+) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
@@ -217,7 +249,7 @@ where
                 }
             }
         }
-    });
+    })
 }
 
 fn receive_stream_message(
@@ -278,8 +310,10 @@ impl CapturedStream {
 #[derive(Debug)]
 pub(crate) enum CommandError {
     Spawn(std::io::Error),
+    Kill(std::io::Error),
     Wait(std::io::Error),
     ReadOutput(std::io::Error),
+    ReaderPanicked,
     Cancelled,
 }
 
@@ -287,7 +321,9 @@ impl CommandError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::Spawn(_) => "command_spawn_failed",
-            Self::Wait(_) | Self::ReadOutput(_) => "command_io_error",
+            Self::Kill(_) | Self::Wait(_) | Self::ReadOutput(_) | Self::ReaderPanicked => {
+                "command_io_error"
+            }
             Self::Cancelled => "tool_cancelled",
         }
     }
@@ -295,7 +331,7 @@ impl CommandError {
     pub(crate) fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::Wait(source) | Self::ReadOutput(source)
+            Self::Kill(source) | Self::Wait(source) | Self::ReadOutput(source)
                 if source.kind() == std::io::ErrorKind::Interrupted
         )
     }
@@ -305,10 +341,12 @@ impl fmt::Display for CommandError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(source) => write!(formatter, "failed to start command: {source}"),
+            Self::Kill(source) => write!(formatter, "failed to terminate command group: {source}"),
             Self::Wait(source) => write!(formatter, "failed to wait for command: {source}"),
             Self::ReadOutput(source) => {
                 write!(formatter, "failed to capture command output: {source}")
             }
+            Self::ReaderPanicked => formatter.write_str("command output reader panicked"),
             Self::Cancelled => formatter.write_str("run_command was cancelled"),
         }
     }

@@ -1,15 +1,21 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt;
-use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use cap_std::fs::File;
 use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
-use crate::tool_support::{failure, ToolArguments};
+use crate::tool_support::{display_relative_path, failure, truncate_utf8, ToolArguments};
 use crate::workspace::{CodingWorkspace, WorkspacePathError};
+
+const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PATCH_LINES: usize = 200_000;
+const MAX_PATCH_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_PATCH_FILE_LINES: usize = 1_000_000;
+const MAX_CONFLICT_LINE_BYTES: usize = 1024;
 
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
@@ -21,7 +27,14 @@ pub(crate) fn execute(
         Err(output) => return output,
     };
     let patch = match arguments.required_string("patch") {
-        Ok(patch) => patch,
+        Ok(patch) if patch.len() <= MAX_PATCH_BYTES => patch,
+        Ok(_) => {
+            return failure(
+                "patch_too_large",
+                format!("patch exceeds {MAX_PATCH_BYTES} bytes"),
+                false,
+            )
+        }
         Err(output) => return output,
     };
     let changed_files = match apply_unified_patch(workspace, patch, cancellation) {
@@ -45,97 +58,80 @@ fn apply_unified_patch(
     patch: &str,
     cancellation: &AtomicBool,
 ) -> Result<Vec<String>, PatchError> {
-    let file_patches = parse_patch(patch)?;
-    let mut pending = Vec::with_capacity(file_patches.len());
-    let mut seen_paths = BTreeSet::new();
-
-    for file_patch in file_patches {
-        if cancellation.load(Ordering::Relaxed) {
-            return Err(PatchError::Cancelled);
-        }
-        let path = file_patch.target_path()?;
-        let resolved = workspace
-            .resolve_for_write(path)
-            .map_err(PatchError::Workspace)?;
-        if !seen_paths.insert(resolved.absolute_path.clone()) {
-            return Err(PatchError::InvalidPatch(format!(
-                "patch contains duplicate target '{}'",
-                resolved.relative_path.display()
-            )));
-        }
-        let original = if resolved.existed {
-            let metadata =
-                fs::metadata(&resolved.absolute_path).map_err(|source| PatchError::Io {
-                    path: resolved.relative_path.clone(),
-                    source,
-                })?;
-            if !metadata.is_file() {
-                return Err(PatchError::Conflict(format!(
-                    "'{}' is not a file",
-                    resolved.relative_path.display()
-                )));
-            }
-            Some(
-                fs::read_to_string(&resolved.absolute_path).map_err(|source| PatchError::Io {
-                    path: resolved.relative_path.clone(),
-                    source,
-                })?,
-            )
-        } else {
-            None
-        };
-
-        let change = file_patch.prepare_change(original.as_deref())?;
-        pending.push(PendingChange {
-            absolute_path: resolved.absolute_path,
-            relative_path: resolved.relative_path,
-            existed: resolved.existed,
-            change,
-        });
+    let mut file_patches = parse_patch(patch, cancellation)?;
+    if file_patches.len() != 1 {
+        return Err(PatchError::InvalidPatch(
+            "the minimal patch tool accepts exactly one file patch".to_string(),
+        ));
     }
-
     if cancellation.load(Ordering::Relaxed) {
         return Err(PatchError::Cancelled);
     }
+    let file_patch = file_patches.pop().expect("exactly one patch was checked");
+    let path = file_patch.target_path()?;
+    let resolved = workspace
+        .resolve_for_write(path)
+        .map_err(PatchError::Workspace)?;
+    let original = if resolved.existed {
+        let file = workspace
+            .open_file(&resolved.relative_path)
+            .map_err(|source| PatchError::Io {
+                path: resolved.relative_path.clone(),
+                source,
+            })?;
+        let metadata = file.metadata().map_err(|source| PatchError::Io {
+            path: resolved.relative_path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(PatchError::Conflict(format!(
+                "'{}' is not a file",
+                resolved.relative_path.display()
+            )));
+        }
+        if metadata.len() > MAX_PATCH_FILE_BYTES {
+            return Err(PatchError::Limit(format!(
+                "patch target '{}' exceeds {MAX_PATCH_FILE_BYTES} bytes",
+                resolved.relative_path.display()
+            )));
+        }
+        Some(read_patch_target(
+            file,
+            &resolved.relative_path,
+            cancellation,
+        )?)
+    } else {
+        None
+    };
 
-    let changed_files = pending
-        .iter()
-        .map(|change| display_path(&change.relative_path))
-        .collect::<Vec<_>>();
-    for change in pending {
-        match change.change {
-            FileChange::Write(content) if change.existed => {
-                fs::write(&change.absolute_path, content).map_err(|source| PatchError::Io {
-                    path: change.relative_path,
+    let change = file_patch.prepare_change(original.as_deref(), cancellation)?;
+    if cancellation.load(Ordering::Relaxed) {
+        return Err(PatchError::Cancelled);
+    }
+    match change {
+        FileChange::Write(content) if resolved.existed => workspace
+            .replace_existing_atomically(&resolved.relative_path, content.as_bytes())
+            .map_err(|source| PatchError::Io {
+                path: resolved.relative_path.clone(),
+                source,
+            })?,
+        FileChange::Write(content) => {
+            if let Err(source) = workspace.create_new(&resolved.relative_path, content.as_bytes()) {
+                let _ = workspace.remove_file(&resolved.relative_path);
+                return Err(PatchError::Io {
+                    path: resolved.relative_path.clone(),
                     source,
-                })?;
-            }
-            FileChange::Write(content) => {
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                let mut file =
-                    options
-                        .open(&change.absolute_path)
-                        .map_err(|source| PatchError::Io {
-                            path: change.relative_path.clone(),
-                            source,
-                        })?;
-                std::io::Write::write_all(&mut file, content.as_bytes()).map_err(|source| {
-                    PatchError::Io {
-                        path: change.relative_path,
-                        source,
-                    }
-                })?;
-            }
-            FileChange::Delete => {
-                fs::remove_file(&change.absolute_path).map_err(|source| PatchError::Io {
-                    path: change.relative_path,
-                    source,
-                })?;
+                });
             }
         }
+        FileChange::Delete => workspace
+            .remove_file(&resolved.relative_path)
+            .map_err(|source| PatchError::Io {
+                path: resolved.relative_path.clone(),
+                source,
+            })?,
     }
-    Ok(changed_files)
+    Ok(vec![display_relative_path(&resolved.relative_path)])
 }
 
 #[derive(Debug)]
@@ -162,7 +158,11 @@ impl FilePatch {
         }
     }
 
-    fn prepare_change(&self, original: Option<&str>) -> Result<FileChange, PatchError> {
+    fn prepare_change(
+        &self,
+        original: Option<&str>,
+        cancellation: &AtomicBool,
+    ) -> Result<FileChange, PatchError> {
         match (&self.old_path, &self.new_path, original) {
             (None, Some(_), Some(_)) => Err(PatchError::Conflict(
                 "new-file patch target already exists".to_string(),
@@ -171,7 +171,7 @@ impl FilePatch {
                 "patch source file does not exist".to_string(),
             )),
             _ => {
-                let updated = apply_hunks(original.unwrap_or_default(), &self.hunks)?;
+                let updated = apply_hunks(original.unwrap_or_default(), &self.hunks, cancellation)?;
                 if self.new_path.is_none() {
                     if !updated.is_empty() {
                         return Err(PatchError::Conflict(
@@ -207,24 +207,31 @@ enum FileChange {
     Delete,
 }
 
-struct PendingChange {
-    absolute_path: PathBuf,
-    relative_path: PathBuf,
-    existed: bool,
-    change: FileChange,
-}
-
-fn parse_patch(patch: &str) -> Result<Vec<FilePatch>, PatchError> {
+fn parse_patch(patch: &str, cancellation: &AtomicBool) -> Result<Vec<FilePatch>, PatchError> {
     if patch.is_empty() {
         return Err(PatchError::InvalidPatch(
             "patch must not be empty".to_string(),
         ));
     }
-    let lines = patch.split_inclusive('\n').collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    for (index, line) in patch.split_inclusive('\n').enumerate() {
+        if index % 1024 == 0 && cancellation.load(Ordering::Relaxed) {
+            return Err(PatchError::Cancelled);
+        }
+        if lines.len() == MAX_PATCH_LINES {
+            return Err(PatchError::Limit(format!(
+                "patch exceeds {MAX_PATCH_LINES} lines"
+            )));
+        }
+        lines.push(line);
+    }
     let mut index = 0usize;
     let mut files = Vec::new();
 
     while index < lines.len() {
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(PatchError::Cancelled);
+        }
         while index < lines.len() && !lines[index].starts_with("--- ") {
             index += 1;
         }
@@ -247,6 +254,9 @@ fn parse_patch(patch: &str) -> Result<Vec<FilePatch>, PatchError> {
             let mut old_seen = 0usize;
             let mut new_seen = 0usize;
             while old_seen < old_count || new_seen < new_count {
+                if cancellation.load(Ordering::Relaxed) {
+                    return Err(PatchError::Cancelled);
+                }
                 let line = lines.get(index).ok_or_else(|| {
                     PatchError::InvalidPatch("hunk ended before its declared counts".to_string())
                 })?;
@@ -415,12 +425,19 @@ fn strip_last_line_ending(lines: &mut [PatchLine]) -> Result<(), PatchError> {
     Ok(())
 }
 
-fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, PatchError> {
+fn apply_hunks(
+    original: &str,
+    hunks: &[Hunk],
+    cancellation: &AtomicBool,
+) -> Result<String, PatchError> {
     let original_lines = original.split_inclusive('\n').collect::<Vec<_>>();
     let mut output = String::with_capacity(original.len());
     let mut cursor = 0usize;
 
     for hunk in hunks {
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(PatchError::Cancelled);
+        }
         let start = if hunk.old_start == 0 {
             0
         } else {
@@ -432,13 +449,19 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, PatchError> {
                 hunk.old_start
             )));
         }
-        for line in &original_lines[cursor..start] {
+        for (index, line) in original_lines[cursor..start].iter().enumerate() {
+            if index % 1024 == 0 && cancellation.load(Ordering::Relaxed) {
+                return Err(PatchError::Cancelled);
+            }
             output.push_str(line);
         }
         cursor = start;
         let mut old_seen = 0usize;
         let mut new_seen = 0usize;
         for line in &hunk.lines {
+            if cancellation.load(Ordering::Relaxed) {
+                return Err(PatchError::Cancelled);
+            }
             match line {
                 PatchLine::Context(expected) => {
                     require_original_line(&original_lines, cursor, expected)?;
@@ -464,10 +487,67 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, PatchError> {
             ));
         }
     }
-    for line in &original_lines[cursor..] {
+    for (index, line) in original_lines[cursor..].iter().enumerate() {
+        if index % 1024 == 0 && cancellation.load(Ordering::Relaxed) {
+            return Err(PatchError::Cancelled);
+        }
         output.push_str(line);
     }
     Ok(output)
+}
+
+fn read_patch_target(
+    mut file: File,
+    path: &Path,
+    cancellation: &AtomicBool,
+) -> Result<String, PatchError> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8 * 1024];
+    let mut newline_count = 0usize;
+
+    loop {
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(PatchError::Cancelled);
+        }
+        let bytes_read = file.read(&mut buffer).map_err(|source| PatchError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(bytes_read) > MAX_PATCH_FILE_BYTES as usize {
+            return Err(PatchError::Limit(format!(
+                "patch target '{}' exceeds {MAX_PATCH_FILE_BYTES} bytes",
+                path.display()
+            )));
+        }
+        newline_count = newline_count.saturating_add(
+            buffer[..bytes_read]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count(),
+        );
+        if newline_count > MAX_PATCH_FILE_LINES {
+            return Err(PatchError::Limit(format!(
+                "patch target '{}' exceeds {MAX_PATCH_FILE_LINES} lines",
+                path.display()
+            )));
+        }
+        bytes.extend_from_slice(&buffer[..bytes_read]);
+    }
+
+    let lines = newline_count + usize::from(bytes.last().is_some_and(|byte| *byte != b'\n'));
+    if lines > MAX_PATCH_FILE_LINES {
+        return Err(PatchError::Limit(format!(
+            "patch target '{}' exceeds {MAX_PATCH_FILE_LINES} lines",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes).map_err(|source| PatchError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+    })
 }
 
 fn require_original_line(
@@ -480,8 +560,8 @@ fn require_original_line(
         Some(actual) => Err(PatchError::Conflict(format!(
             "patch context mismatch at old line {}: expected {:?}, found {:?}",
             index + 1,
-            expected,
-            actual
+            truncate_utf8(expected, MAX_CONFLICT_LINE_BYTES),
+            truncate_utf8(actual, MAX_CONFLICT_LINE_BYTES)
         ))),
         None => Err(PatchError::Conflict(format!(
             "patch expects old line {}, but the file ended",
@@ -490,17 +570,10 @@ fn require_original_line(
     }
 }
 
-fn display_path(path: &Path) -> String {
-    if path.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        path.display().to_string()
-    }
-}
-
 #[derive(Debug)]
 pub(crate) enum PatchError {
     InvalidPatch(String),
+    Limit(String),
     Conflict(String),
     Workspace(WorkspacePathError),
     Io {
@@ -514,6 +587,7 @@ impl PatchError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::InvalidPatch(_) => "invalid_patch",
+            Self::Limit(_) => "patch_too_large",
             Self::Conflict(_) => "patch_conflict",
             Self::Workspace(error) => error.code(),
             Self::Io { .. } => "workspace_io_error",
@@ -525,7 +599,7 @@ impl PatchError {
         match self {
             Self::Workspace(error) => error.retryable(),
             Self::Io { source, .. } => source.kind() == std::io::ErrorKind::Interrupted,
-            Self::InvalidPatch(_) | Self::Conflict(_) | Self::Cancelled => false,
+            Self::InvalidPatch(_) | Self::Limit(_) | Self::Conflict(_) | Self::Cancelled => false,
         }
     }
 }
@@ -534,6 +608,7 @@ impl fmt::Display for PatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPatch(message) => write!(formatter, "invalid patch: {message}"),
+            Self::Limit(message) => write!(formatter, "patch limit exceeded: {message}"),
             Self::Conflict(message) => write!(formatter, "patch conflict: {message}"),
             Self::Workspace(error) => error.fmt(formatter),
             Self::Io { path, source } => {

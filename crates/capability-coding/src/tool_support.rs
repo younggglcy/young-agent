@@ -7,6 +7,8 @@ use young_tool_runtime::{ToolError, ToolOutput};
 use crate::workspace::WorkspacePathError;
 
 pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TOOL_CONTENT_SERIALIZED_BYTES: usize = 48 * 1024;
+const MAX_ERROR_MESSAGE_SERIALIZED_BYTES: usize = 8 * 1024;
 
 pub(crate) struct ToolArguments<'a> {
     values: &'a Map<String, Value>,
@@ -66,6 +68,24 @@ pub(crate) fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     &value[..boundary]
 }
 
+pub(crate) fn truncate_json_string(value: &str, max_serialized_bytes: usize) -> (&str, bool) {
+    let mut serialized_bytes = 2usize;
+    let mut boundary = 0usize;
+    for (index, character) in value.char_indices() {
+        let character_bytes = match character {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        if serialized_bytes.saturating_add(character_bytes) > max_serialized_bytes {
+            return (&value[..boundary], true);
+        }
+        serialized_bytes = serialized_bytes.saturating_add(character_bytes);
+        boundary = index + character.len_utf8();
+    }
+    (value, false)
+}
+
 pub(crate) fn display_relative_path(path: &Path) -> String {
     if path.as_os_str().is_empty() {
         ".".to_string()
@@ -79,10 +99,12 @@ pub(crate) fn workspace_path_failure(error: WorkspacePathError) -> ToolOutput {
 }
 
 pub(crate) fn failure(code: &str, message: impl Into<String>, retryable: bool) -> ToolOutput {
+    let message = message.into();
+    let (message, _) = truncate_json_string(&message, MAX_ERROR_MESSAGE_SERIALIZED_BYTES);
     ToolOutput::Failure {
         error: ToolError {
             code: code.to_string(),
-            message: message.into(),
+            message: message.to_string(),
             retryable,
         },
         extensions: BTreeMap::new(),

@@ -1,20 +1,21 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde_json::json;
+use cap_std::fs::{Dir, File, ReadDir};
+use serde_json::{json, Value};
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
-    display_relative_path, failure, truncate_utf8, workspace_path_failure, ToolArguments,
-    MAX_OUTPUT_BYTES,
+    display_relative_path, failure, workspace_path_failure, ToolArguments,
+    MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
 
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_LINE_BYTES: usize = 8 * 1024;
+const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
@@ -26,7 +27,14 @@ pub(crate) fn execute(
         Err(output) => return output,
     };
     let query = match arguments.required_string("query") {
-        Ok(query) => query,
+        Ok(query) if query.len() <= MAX_SEARCH_QUERY_BYTES => query,
+        Ok(_) => {
+            return failure(
+                "invalid_arguments",
+                format!("argument 'query' exceeds {MAX_SEARCH_QUERY_BYTES} bytes"),
+                false,
+            )
+        }
         Err(output) => return output,
     };
     let path = match arguments.optional_string("path") {
@@ -38,138 +46,93 @@ pub(crate) fn execute(
         Ok(resolved) => resolved,
         Err(error) => return workspace_path_failure(error),
     };
-    let files = match collect_files(&resolved.absolute_path, cancellation) {
-        Ok(files) => files,
-        Err(output) => return output,
-    };
+    let pattern = LiteralPattern::new(query.as_bytes());
+    let mut results = SearchResults::default();
 
-    let mut matches = Vec::new();
-    let mut output_bytes = 0usize;
-    let mut bytes_searched = 0u64;
-    let mut binary_files_skipped = 0u64;
-    let mut lines_truncated = 0u64;
-    let mut truncated = false;
-
-    'files: for file_path in files {
-        if cancellation.load(Ordering::Relaxed) {
-            return failure("tool_cancelled", "search_files was cancelled", false);
-        }
-        let file = match File::open(&file_path) {
-            Ok(file) => file,
-            Err(source) => {
-                return failure(
-                    "workspace_io_error",
-                    format!("failed to open '{}': {source}", file_path.display()),
-                    source.kind() == std::io::ErrorKind::Interrupted,
-                )
+    match workspace.open_dir(&resolved.relative_path) {
+        Ok(directory) => {
+            if let Err(output) = search_directory(
+                directory,
+                resolved.relative_path,
+                &pattern,
+                cancellation,
+                &mut results,
+            ) {
+                return output;
             }
-        };
-        let relative_path = file_path
-            .strip_prefix(workspace.context().root())
-            .expect("walked file stays inside workspace");
-        let display_path = display_relative_path(relative_path);
-        let mut reader = BufReader::new(file);
-        let mut line = Vec::new();
-        let mut line_number = 0u64;
-
-        loop {
-            line.clear();
-            let bytes_read = match reader.read_until(b'\n', &mut line) {
-                Ok(bytes_read) => bytes_read,
+        }
+        Err(_) => {
+            let file = match workspace.open_file(&resolved.relative_path) {
+                Ok(file) => file,
                 Err(source) => {
                     return failure(
                         "workspace_io_error",
-                        format!("failed to search '{}': {source}", display_path),
+                        format!(
+                            "failed to open '{}': {source}",
+                            resolved.relative_path.display()
+                        ),
                         source.kind() == std::io::ErrorKind::Interrupted,
                     )
                 }
             };
-            if bytes_read == 0 {
-                break;
-            }
-            bytes_searched = bytes_searched.saturating_add(bytes_read as u64);
-            line_number += 1;
-            let Ok(text) = std::str::from_utf8(&line) else {
-                binary_files_skipped += 1;
-                break;
-            };
-            let text = text.strip_suffix('\n').unwrap_or(text);
-            let text = text.strip_suffix('\r').unwrap_or(text);
-            if !text.contains(query) {
-                continue;
-            }
-
-            let visible_text = truncate_utf8(text, MAX_SEARCH_LINE_BYTES);
-            if visible_text.len() < text.len() {
-                lines_truncated += 1;
-                truncated = true;
-            }
-            let match_bytes = display_path.len().saturating_add(visible_text.len());
-            if matches.len() == MAX_SEARCH_MATCHES
-                || output_bytes.saturating_add(match_bytes) > MAX_OUTPUT_BYTES
+            let display_path = display_relative_path(&resolved.relative_path);
+            if let Err(output) =
+                search_file(file, &display_path, &pattern, cancellation, &mut results)
             {
-                truncated = true;
-                break 'files;
+                return output;
             }
-            output_bytes = output_bytes.saturating_add(match_bytes);
-            matches.push(json!({
-                "path": display_path,
-                "line": line_number,
-                "text": visible_text,
-            }));
         }
     }
 
     ToolOutput::Success {
         content: vec![ToolContent::Json {
-            value: json!({ "matches": matches }),
+            value: json!({ "matches": results.matches }),
         }],
         metadata: BTreeMap::from([
             ("path".to_string(), json!(path)),
             ("query".to_string(), json!(query)),
-            ("matches".to_string(), json!(matches.len())),
-            ("bytes_searched".to_string(), json!(bytes_searched)),
+            ("matches".to_string(), json!(results.matches.len())),
+            ("bytes_searched".to_string(), json!(results.bytes_searched)),
             (
                 "binary_files_skipped".to_string(),
-                json!(binary_files_skipped),
+                json!(results.binary_files_skipped),
             ),
-            ("lines_truncated".to_string(), json!(lines_truncated)),
-            ("truncated".to_string(), json!(truncated)),
+            (
+                "lines_truncated".to_string(),
+                json!(results.lines_truncated),
+            ),
+            ("truncated".to_string(), json!(results.truncated)),
             ("workspace".to_string(), workspace.metadata()),
         ]),
         extensions: BTreeMap::new(),
     }
 }
 
-fn collect_files(start: &Path, cancellation: &AtomicBool) -> Result<Vec<PathBuf>, ToolOutput> {
-    if cancellation.load(Ordering::Relaxed) {
-        return Err(failure(
-            "tool_cancelled",
-            "search_files was cancelled",
-            false,
-        ));
-    }
-    let metadata = std::fs::metadata(start).map_err(|source| {
+struct DirectoryFrame {
+    relative_path: PathBuf,
+    entries: ReadDir,
+}
+
+fn search_directory(
+    root: Dir,
+    relative_path: PathBuf,
+    pattern: &LiteralPattern,
+    cancellation: &AtomicBool,
+    results: &mut SearchResults,
+) -> Result<(), ToolOutput> {
+    let entries = root.entries().map_err(|source| {
         failure(
             "workspace_io_error",
-            format!("failed to inspect '{}': {source}", start.display()),
+            format!("failed to list '{}': {source}", relative_path.display()),
             source.kind() == std::io::ErrorKind::Interrupted,
         )
     })?;
-    if metadata.is_file() {
-        return Ok(vec![start.to_path_buf()]);
-    }
-    if !metadata.is_dir() {
-        return Err(failure(
-            "path_is_not_searchable",
-            format!("'{}' is neither a file nor a directory", start.display()),
-            false,
-        ));
-    }
+    let mut stack = vec![DirectoryFrame {
+        relative_path,
+        entries,
+    }];
 
-    let mut files = Vec::new();
-    let mut directories = vec![start.to_path_buf()];
-    while let Some(directory) = directories.pop() {
+    while let Some(frame) = stack.last_mut() {
         if cancellation.load(Ordering::Relaxed) {
             return Err(failure(
                 "tool_cancelled",
@@ -177,37 +140,244 @@ fn collect_files(start: &Path, cancellation: &AtomicBool) -> Result<Vec<PathBuf>
                 false,
             ));
         }
-        let entries = std::fs::read_dir(&directory).map_err(|source| {
+        let Some(entry) = frame.entries.next() else {
+            stack.pop();
+            continue;
+        };
+        let entry = entry.map_err(|source| {
             failure(
                 "workspace_io_error",
-                format!("failed to list '{}': {source}", directory.display()),
+                format!("failed to read a directory entry: {source}"),
                 source.kind() == std::io::ErrorKind::Interrupted,
             )
         })?;
-        let mut entries = entries
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| failure("workspace_io_error", source.to_string(), false))?;
-        entries.sort_by_key(std::fs::DirEntry::file_name);
-        for entry in entries.into_iter().rev() {
-            let file_type = entry.file_type().map_err(|source| {
+        let file_type = entry.file_type().map_err(|source| {
+            failure(
+                "workspace_io_error",
+                format!("failed to inspect a directory entry: {source}"),
+                source.kind() == std::io::ErrorKind::Interrupted,
+            )
+        })?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let entry_path = frame.relative_path.join(&file_name);
+        if file_type.is_dir() {
+            if file_name == ".git" {
+                continue;
+            }
+            let directory = entry.open_dir().map_err(|source| {
                 failure(
                     "workspace_io_error",
-                    format!("failed to inspect '{}': {source}", entry.path().display()),
+                    format!("failed to open '{}': {source}", entry_path.display()),
                     source.kind() == std::io::ErrorKind::Interrupted,
                 )
             })?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                if entry.file_name() != ".git" {
-                    directories.push(entry.path());
-                }
-            } else if file_type.is_file() {
-                files.push(entry.path());
+            let entries = directory.entries().map_err(|source| {
+                failure(
+                    "workspace_io_error",
+                    format!("failed to list '{}': {source}", entry_path.display()),
+                    source.kind() == std::io::ErrorKind::Interrupted,
+                )
+            })?;
+            stack.push(DirectoryFrame {
+                relative_path: entry_path,
+                entries,
+            });
+        } else if file_type.is_file() {
+            let file = entry.open().map_err(|source| {
+                failure(
+                    "workspace_io_error",
+                    format!("failed to open '{}': {source}", entry_path.display()),
+                    source.kind() == std::io::ErrorKind::Interrupted,
+                )
+            })?;
+            let display_path = display_relative_path(&entry_path);
+            search_file(file, &display_path, pattern, cancellation, results)?;
+            if results.limit_reached {
+                return Ok(());
             }
         }
     }
-    files.sort();
-    Ok(files)
+    Ok(())
+}
+
+fn search_file(
+    mut file: File,
+    display_path: &str,
+    pattern: &LiteralPattern,
+    cancellation: &AtomicBool,
+    results: &mut SearchResults,
+) -> Result<(), ToolOutput> {
+    let mut buffer = [0u8; 8 * 1024];
+    let mut line = LineState::default();
+    let mut line_number = 1u64;
+
+    loop {
+        if cancellation.load(Ordering::Relaxed) {
+            return Err(failure(
+                "tool_cancelled",
+                "search_files was cancelled",
+                false,
+            ));
+        }
+        let bytes_read = file.read(&mut buffer).map_err(|source| {
+            failure(
+                "workspace_io_error",
+                format!("failed to search '{display_path}': {source}"),
+                source.kind() == std::io::ErrorKind::Interrupted,
+            )
+        })?;
+        if bytes_read == 0 {
+            if line.bytes_seen > 0 {
+                finish_line(display_path, line_number, &line, results)?;
+            }
+            return Ok(());
+        }
+        results.bytes_searched = results.bytes_searched.saturating_add(bytes_read as u64);
+
+        let mut start = 0usize;
+        for newline in buffer[..bytes_read]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        {
+            line.feed(&buffer[start..newline], pattern);
+            finish_line(display_path, line_number, &line, results)?;
+            if results.limit_reached {
+                return Ok(());
+            }
+            line = LineState::default();
+            line_number += 1;
+            start = newline + 1;
+        }
+        line.feed(&buffer[start..bytes_read], pattern);
+    }
+}
+
+fn finish_line(
+    display_path: &str,
+    line_number: u64,
+    line: &LineState,
+    results: &mut SearchResults,
+) -> Result<(), ToolOutput> {
+    if !line.matched {
+        return Ok(());
+    }
+    let text = match visible_utf8_prefix(&line.visible) {
+        Ok(text) => text.strip_suffix('\r').unwrap_or(text),
+        Err(()) => {
+            results.binary_files_skipped += 1;
+            return Ok(());
+        }
+    };
+    if line.truncated {
+        results.lines_truncated += 1;
+        results.truncated = true;
+    }
+    let value = json!({
+        "path": display_path,
+        "line": line_number,
+        "text": text,
+    });
+    let serialized_bytes = serde_json::to_vec(&value)
+        .expect("search match JSON serializes")
+        .len();
+    if results.matches.len() == MAX_SEARCH_MATCHES
+        || results.serialized_bytes.saturating_add(serialized_bytes)
+            > MAX_TOOL_CONTENT_SERIALIZED_BYTES
+    {
+        results.truncated = true;
+        results.limit_reached = true;
+        return Ok(());
+    }
+    results.serialized_bytes = results.serialized_bytes.saturating_add(serialized_bytes);
+    results.matches.push(value);
+    Ok(())
+}
+
+#[derive(Default)]
+struct SearchResults {
+    matches: Vec<Value>,
+    serialized_bytes: usize,
+    bytes_searched: u64,
+    binary_files_skipped: u64,
+    lines_truncated: u64,
+    truncated: bool,
+    limit_reached: bool,
+}
+
+#[derive(Default)]
+struct LineState {
+    visible: Vec<u8>,
+    bytes_seen: usize,
+    matcher_state: usize,
+    matched: bool,
+    truncated: bool,
+}
+
+impl LineState {
+    fn feed(&mut self, bytes: &[u8], pattern: &LiteralPattern) {
+        self.bytes_seen = self.bytes_seen.saturating_add(bytes.len());
+        let remaining = MAX_SEARCH_LINE_BYTES.saturating_sub(self.visible.len());
+        let retained = remaining.min(bytes.len());
+        self.visible.extend_from_slice(&bytes[..retained]);
+        self.truncated |= retained < bytes.len();
+
+        if !self.matched {
+            for byte in bytes {
+                self.matcher_state = pattern.advance(self.matcher_state, *byte);
+                if self.matcher_state == pattern.needle.len() {
+                    self.matched = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+struct LiteralPattern {
+    needle: Vec<u8>,
+    fallback: Vec<usize>,
+}
+
+impl LiteralPattern {
+    fn new(needle: &[u8]) -> Self {
+        let mut fallback = vec![0usize; needle.len()];
+        let mut matched = 0usize;
+        for index in 1..needle.len() {
+            while matched > 0 && needle[index] != needle[matched] {
+                matched = fallback[matched - 1];
+            }
+            if needle[index] == needle[matched] {
+                matched += 1;
+            }
+            fallback[index] = matched;
+        }
+        Self {
+            needle: needle.to_vec(),
+            fallback,
+        }
+    }
+
+    fn advance(&self, mut matched: usize, byte: u8) -> usize {
+        while matched > 0 && byte != self.needle[matched] {
+            matched = self.fallback[matched - 1];
+        }
+        if byte == self.needle[matched] {
+            matched += 1;
+        }
+        matched
+    }
+}
+
+fn visible_utf8_prefix(bytes: &[u8]) -> Result<&str, ()> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Ok(text),
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).map_err(|_| ())
+        }
+        Err(_) => Err(()),
+    }
 }

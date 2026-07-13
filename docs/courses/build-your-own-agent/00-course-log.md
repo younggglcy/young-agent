@@ -20,7 +20,7 @@
 | 10 | 建立 Canonical Event Log | `crates/event-store/` | 用 append-only JSONL、replay 与 corruption handling 把运行事实变成可恢复的唯一真相。 |
 | 11 | 跑通确定性 Agent Runtime | `crates/agent-runtime/src/runtime.rs` | 用 FakeModelClient 和 fake tools 验证 turn、tool call、approval、cancellation 与 terminal result。 |
 | 12 | 实现 Tool Runtime 与内置 manifest | `crates/tool-runtime/`, `crates/capability-coding/coding-capability.toml` | 区分声明、注册、审批分类和执行分发，不让 manifest 变成插件 runtime。 |
-| 13 | 建立本地 Workspace Boundary | `crates/capability-coding/src/workspace.rs`, `crates/capability-coding/tests/workspace_tools.rs` | 用 lexical + canonical 两层路径检查保护 read/search/patch，并让 command 输出有界、worktree context 可观察。 |
+| 13 | 建立本地 Workspace Boundary | `crates/capability-coding/src/workspace.rs`, `crates/capability-coding/tests/workspace_tools.rs` | 用 lexical 筛选与 directory capability 约束实际 read/search/patch 操作，并让 command 输出有界、取消覆盖进程组、worktree context 可观察。 |
 
 ## 当前课程进度
 

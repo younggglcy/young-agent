@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +7,8 @@ use serde_json::json;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::tool_support::{
-    display_relative_path, failure, workspace_path_failure, ToolArguments, MAX_OUTPUT_BYTES,
+    display_relative_path, failure, truncate_json_string, workspace_path_failure, ToolArguments,
+    MAX_OUTPUT_BYTES, MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
 
@@ -32,7 +32,20 @@ pub(crate) fn execute(
         Ok(resolved) => resolved,
         Err(error) => return workspace_path_failure(error),
     };
-    let metadata = match std::fs::metadata(&resolved.absolute_path) {
+    let mut file = match workspace.open_file(&resolved.relative_path) {
+        Ok(file) => file,
+        Err(source) => {
+            return failure(
+                "workspace_io_error",
+                format!(
+                    "failed to open '{}': {source}",
+                    resolved.relative_path.display()
+                ),
+                source.kind() == std::io::ErrorKind::Interrupted,
+            )
+        }
+    };
+    let metadata = match file.metadata() {
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) => {
             return failure(
@@ -46,19 +59,6 @@ pub(crate) fn execute(
                 "workspace_io_error",
                 format!(
                     "failed to inspect '{}': {source}",
-                    resolved.relative_path.display()
-                ),
-                source.kind() == std::io::ErrorKind::Interrupted,
-            )
-        }
-    };
-    let mut file = match File::open(&resolved.absolute_path) {
-        Ok(file) => file,
-        Err(source) => {
-            return failure(
-                "workspace_io_error",
-                format!(
-                    "failed to open '{}': {source}",
                     resolved.relative_path.display()
                 ),
                 source.kind() == std::io::ErrorKind::Interrupted,
@@ -94,6 +94,9 @@ pub(crate) fn execute(
         Ok(text) => text,
         Err(message) => return failure("file_not_utf8", message, false),
     };
+    let (text, serialization_truncated) =
+        truncate_json_string(text, MAX_TOOL_CONTENT_SERIALIZED_BYTES);
+    let truncated = truncated || serialization_truncated;
     let relative_path = display_relative_path(&resolved.relative_path);
     let mut output_metadata = BTreeMap::from([
         ("path".to_string(), json!(relative_path)),
@@ -105,7 +108,7 @@ pub(crate) fn execute(
     if truncated {
         output_metadata.insert(
             "truncation_limit_bytes".to_string(),
-            json!(MAX_OUTPUT_BYTES),
+            json!(MAX_TOOL_CONTENT_SERIALIZED_BYTES),
         );
     }
 
