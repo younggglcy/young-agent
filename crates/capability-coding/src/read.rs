@@ -12,6 +12,8 @@ use crate::tool_support::{
 };
 use crate::workspace::CodingWorkspace;
 
+const MAX_READ_PATH_BYTES: usize = 8 * 1024;
+
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
     call: &ToolCall,
@@ -25,7 +27,14 @@ pub(crate) fn execute(
         Err(output) => return output,
     };
     let path = match arguments.required_string("path") {
-        Ok(path) => path,
+        Ok(path) if path.len() <= MAX_READ_PATH_BYTES => path,
+        Ok(_) => {
+            return failure(
+                "invalid_arguments",
+                format!("argument 'path' exceeds {MAX_READ_PATH_BYTES} bytes"),
+                false,
+            )
+        }
         Err(output) => return output,
     };
     let resolved = match workspace.resolve_existing(Path::new(path)) {

@@ -220,6 +220,19 @@ impl CommandProcess {
         wait_for_leader_terminal_bounded(&self.child, grace)
     }
 
+    fn tracked_descendants_are_sealed(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.descendant_token
+                .as_ref()
+                .is_some_and(|token| token.closed)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     #[cfg(all(test, unix))]
     fn inject_wait_failure(&mut self) {
         self.fail_next_wait = true;
@@ -816,6 +829,13 @@ fn cleanup_process_group(
                     first_error.take().unwrap_or(source),
                     None,
                 ));
+            }
+            if child.tracked_descendants_are_sealed()
+                && first_error.as_ref().is_some_and(|error| {
+                    matches!(error, CommandError::Kill(source) if group_signal_permission_denied(source))
+                })
+            {
+                first_error = None;
             }
         }
     }
@@ -2181,6 +2201,31 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         assert!(!root.join("delayed.txt").exists());
         std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
+    fn tracked_terminal_cleanup_accepts_permission_denied_after_token_seal() {
+        let mut process = shell_command("exit 0");
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (process, descendant_token) = DescendantToken::prepare(process).unwrap();
+        let child = process.spawn_group().expect("tracked command group starts");
+        wait_for_terminal_leader(&child);
+        INJECT_NEXT_FULL_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
+
+        let permit = prepare_command_supervision().expect("supervision slot is available");
+        let result = cleanup_process_group(
+            CommandProcess::tracked(child, descendant_token),
+            CommandCleanupState::TerminateAndReap,
+            permit,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a sealed tracking token proves terminal cleanup complete: {result:?}"
+        );
     }
 
     #[test]

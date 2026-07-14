@@ -245,6 +245,31 @@ fn read_file_rejects_path_traversal_outside_the_selected_workspace() {
     assert!(extensions.is_empty());
 }
 
+#[test]
+fn read_file_rejects_an_oversized_path_before_resolving_it() {
+    let test_workspace = TestWorkspace::new("read-oversized-path");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let result = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-read-oversized-path"),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "x".repeat(8 * 1024 + 1) }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("oversized read path must fail");
+    };
+    assert_eq!(error.code, "invalid_arguments");
+    assert_eq!(error.message, "argument 'path' exceeds 8192 bytes");
+    assert!(!error.retryable);
+}
+
 #[cfg(unix)]
 #[test]
 fn read_file_rejects_a_symlink_that_escapes_the_selected_workspace() {
