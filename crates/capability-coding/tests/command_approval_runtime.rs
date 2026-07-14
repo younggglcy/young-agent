@@ -62,9 +62,7 @@ fn run_request(run_id: &str) -> RunRequest {
     }
 }
 
-#[test]
-fn denied_mutating_command_is_not_executed_and_replays_its_decision() {
-    let directory = TestDirectory::new("denied");
+fn run_denied_command(directory: &TestDirectory, run_id: &str, command: &str) -> JsonlEventStore {
     let workspace = CodingWorkspace::resolve(directory.path()).expect("workspace resolves");
     let mut tools = ToolRuntime::default();
     register_builtin_coding_capability(&mut tools, workspace).expect("capability registers");
@@ -73,7 +71,7 @@ fn denied_mutating_command_is_not_executed_and_replays_its_decision() {
             ModelStreamEvent::ToolCall {
                 id: ModelToolCallId::new("model-command-001"),
                 name: "run_command".to_string(),
-                arguments: json!({ "command": "touch marker.txt" }),
+                arguments: json!({ "command": command }),
                 extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Completed {
@@ -83,7 +81,7 @@ fn denied_mutating_command_is_not_executed_and_replays_its_decision() {
         ]),
         ScriptedModelTurn::events([
             ModelStreamEvent::TextDelta {
-                delta: "Mutation was denied.".to_string(),
+                delta: "Command was denied.".to_string(),
                 extensions: BTreeMap::new(),
             },
             ModelStreamEvent::Completed {
@@ -96,8 +94,16 @@ fn denied_mutating_command_is_not_executed_and_replays_its_decision() {
     let mut runtime = AgentRuntime::new(model, tools, store.clone());
 
     runtime
-        .run_with_control(run_request("run-command-denied"), &mut DenyingControl)
+        .run_with_control(run_request(run_id), &mut DenyingControl)
         .expect("denied command should remain a replayable run");
+
+    store
+}
+
+#[test]
+fn denied_mutating_command_is_not_executed_and_replays_its_decision() {
+    let directory = TestDirectory::new("denied");
+    let store = run_denied_command(&directory, "run-command-denied", "touch marker.txt");
 
     assert!(!directory.path().join("marker.txt").exists());
     let replay = store.replay().expect("Event Log replays");
@@ -226,44 +232,11 @@ fn denied_shell_variable_mutation_cannot_redirect_a_later_command() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&fake_git, permissions).expect("fake git is executable");
 
-    let workspace = CodingWorkspace::resolve(directory.path()).expect("workspace resolves");
-    let mut tools = ToolRuntime::default();
-    register_builtin_coding_capability(&mut tools, workspace).expect("capability registers");
-    let model = FakeModelClient::new([
-        ScriptedModelTurn::events([
-            ModelStreamEvent::ToolCall {
-                id: ModelToolCallId::new("model-command-001"),
-                name: "run_command".to_string(),
-                arguments: json!({
-                    "command": "printf -v PATH .; git branch --show-current"
-                }),
-                extensions: BTreeMap::new(),
-            },
-            ModelStreamEvent::Completed {
-                finish_reason: Some("tool_calls".to_string()),
-                extensions: BTreeMap::new(),
-            },
-        ]),
-        ScriptedModelTurn::events([
-            ModelStreamEvent::TextDelta {
-                delta: "Shell mutation was denied.".to_string(),
-                extensions: BTreeMap::new(),
-            },
-            ModelStreamEvent::Completed {
-                finish_reason: Some("stop".to_string()),
-                extensions: BTreeMap::new(),
-            },
-        ]),
-    ]);
-    let store = JsonlEventStore::new(directory.path().join("run.jsonl"));
-    let mut runtime = AgentRuntime::new(model, tools, store.clone());
-
-    runtime
-        .run_with_control(
-            run_request("run-command-shell-variable-denied"),
-            &mut DenyingControl,
-        )
-        .expect("denied command should remain replayable");
+    let store = run_denied_command(
+        &directory,
+        "run-command-shell-variable-denied",
+        "printf -v PATH .; git branch --show-current",
+    );
 
     assert!(!directory.path().join("marker.txt").exists());
     let replay = store.replay().expect("Event Log replays");
