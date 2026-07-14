@@ -377,7 +377,7 @@ fn run_shell_command(
         );
         return match cleanup {
             Err(cleanup) => Err(cleanup),
-            Ok(()) => Err(CommandError::ConfigureOutput(source)),
+            Ok(_) => Err(CommandError::ConfigureOutput(source)),
         };
     }
     let mut stdout_capture = CapturedStream::new(max_output_bytes);
@@ -467,9 +467,15 @@ fn run_shell_command(
     let cleanup_result = cleanup_process_group(child, cleanup_state, supervision_permit);
     match (control_result, cleanup_result) {
         (Err(_), Err(cleanup)) => return Err(cleanup),
-        (Err(source), Ok(())) => return Err(source),
+        (
+            Err(CommandError::TerminationUnverified),
+            Ok(CommandCleanupCompletion::Reaped(cleanup_status)),
+        ) if stdout_done && stderr_done => {
+            status = Some(cleanup_status);
+        }
+        (Err(source), Ok(_)) => return Err(source),
         (Ok(()), Err(cleanup)) => return Err(cleanup),
-        (Ok(()), Ok(())) => {}
+        (Ok(()), Ok(_)) => {}
     }
     if let Some(source) = stream_error {
         return Err(CommandError::ReadOutput(source));
@@ -788,48 +794,53 @@ enum CommandCleanupState {
     TerminateAndReap,
 }
 
+#[derive(Debug)]
+enum CommandCleanupCompletion {
+    AlreadyReaped,
+    Reaped(ExitStatus),
+}
+
 fn cleanup_process_group(
     mut child: CommandProcess,
     state: CommandCleanupState,
     supervision_permit: CommandSupervisionPermit,
-) -> Result<(), CommandError> {
+) -> Result<CommandCleanupCompletion, CommandError> {
     if matches!(state, CommandCleanupState::AlreadyReaped) {
-        return Ok(());
+        return Ok(CommandCleanupCompletion::AlreadyReaped);
     }
     let mut first_error = None;
     if let Err(source) = child.terminate_group() {
         first_error = Some(source);
     }
     match child.wait_for_leader_terminal(TERMINATION_CONFIRM_GRACE) {
-        Ok(false) => {
-            return Err(supervise_live_command(
-                child,
-                supervision_permit,
-                first_error
-                    .take()
-                    .unwrap_or(CommandError::TerminationUnverified),
-                None,
-            ));
-        }
-        Err(wait) => {
-            return Err(supervise_live_command(
-                child,
-                supervision_permit,
-                first_error
-                    .take()
-                    .unwrap_or(CommandError::TerminationUnverified),
-                Some(wait),
-            ));
-        }
+        Ok(false) => Err(supervise_live_command(
+            child,
+            supervision_permit,
+            first_error
+                .take()
+                .unwrap_or(CommandError::TerminationUnverified),
+            None,
+        )),
+        Err(wait) => Err(supervise_live_command(
+            child,
+            supervision_permit,
+            first_error
+                .take()
+                .unwrap_or(CommandError::TerminationUnverified),
+            Some(wait),
+        )),
         Ok(true) => {
-            if let Err(source) = child.seal_and_reap_terminal_group() {
-                return Err(supervise_live_command(
-                    child,
-                    supervision_permit,
-                    first_error.take().unwrap_or(source),
-                    None,
-                ));
-            }
+            let status = match child.seal_and_reap_terminal_group() {
+                Ok(status) => status,
+                Err(source) => {
+                    return Err(supervise_live_command(
+                        child,
+                        supervision_permit,
+                        first_error.take().unwrap_or(source),
+                        None,
+                    ));
+                }
+            };
             if child.tracked_descendants_are_sealed()
                 && first_error.as_ref().is_some_and(|error| {
                     matches!(error, CommandError::Kill(source) if group_signal_permission_denied(source))
@@ -837,11 +848,11 @@ fn cleanup_process_group(
             {
                 first_error = None;
             }
+            match first_error {
+                Some(source) => Err(source),
+                None => Ok(CommandCleanupCompletion::Reaped(status)),
+            }
         }
-    }
-    match first_error {
-        Some(source) => Err(source),
-        None => Ok(()),
     }
 }
 

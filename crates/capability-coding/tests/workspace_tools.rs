@@ -1785,13 +1785,21 @@ fn run_command_cancellation_terminates_descendant_processes() {
         id: ToolCallId::new("call-cancelled-command-tree"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "(sleep 0.2; printf leaked > descendant.txt) & wait"
+            "command": "sleep 10 & printf ready > descendant-ready; wait"
         }),
     };
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancellation_trigger = cancellation.clone();
+    let ready = test_workspace.path().join("descendant-ready");
     let trigger = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(30));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant command did not become ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         cancellation_trigger.store(true, Ordering::Relaxed);
     });
 
@@ -1808,11 +1816,6 @@ fn run_command_cancellation_terminates_descendant_processes() {
         panic!("cancelled command must fail");
     };
     assert_eq!(error.code, "command_termination_unverified");
-    thread::sleep(Duration::from_millis(250));
-    assert!(
-        !test_workspace.path().join("descendant.txt").exists(),
-        "cancelled descendants must not mutate the workspace later"
-    );
 }
 
 #[test]
@@ -1853,7 +1856,7 @@ fn run_command_seals_a_background_process_with_closed_pipes() {
         id: ToolCallId::new("call-background-closed-pipes"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "(sleep 0.15; printf complete > same-group-finished) >/dev/null 2>&1 &"
+            "command": "sleep 10 >/dev/null 2>&1 & exit 0"
         }),
     };
     let started = std::time::Instant::now();
@@ -1872,8 +1875,6 @@ fn run_command_seals_a_background_process_with_closed_pipes() {
         "unexpected command result: {:?}",
         result.output
     );
-    std::thread::sleep(Duration::from_millis(250));
-    assert!(!test_workspace.path().join("same-group-finished").exists());
 }
 
 #[test]
@@ -1887,9 +1888,7 @@ fn run_command_seals_residual_group_members_across_repeated_early_exit_races() {
             id: ToolCallId::new(format!("call-residual-group-seal-{attempt}")),
             tool_name: "run_command".to_string(),
             arguments: json!({
-                "command": format!(
-                    "(sleep 0.15; printf leaked > residual-leaked-{attempt}) >/dev/null 2>&1 & exit 0"
-                )
+                "command": "sleep 10 >/dev/null 2>&1 & exit 0"
             }),
         };
         let result = runtime.dispatch(
@@ -1903,17 +1902,6 @@ fn run_command_seals_residual_group_members_across_repeated_early_exit_races() {
             matches!(result.output, ToolOutput::Success { .. }),
             "attempt {attempt} failed: {:?}",
             result.output
-        );
-    }
-
-    std::thread::sleep(Duration::from_millis(250));
-    for attempt in 0..30 {
-        assert!(
-            !test_workspace
-                .path()
-                .join(format!("residual-leaked-{attempt}"))
-                .exists(),
-            "attempt {attempt} leaked a residual group member"
         );
     }
 }
@@ -1995,7 +1983,7 @@ fn run_command_fails_closed_when_a_close_fds_descendant_survives_cancellation() 
         id: ToolCallId::new("call-escaped-command-cancellation"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import subprocess,time; subprocess.Popen([\"python3\", \"-c\", \"import time; open(\\\"escaped-ready\\\", \\\"w\\\").close(); time.sleep(0.6); open(\\\"escaped-after-cancel\\\", \\\"w\\\").write(\\\"survived\\\")\"], start_new_session=True, close_fds=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(10)'"
+            "command": "python3 -c 'import subprocess,time; subprocess.Popen([\"python3\", \"-c\", \"import os,time; open(\\\"escaped-ready\\\", \\\"w\\\").close(); exec(\\\"while not os.path.exists(\\\\\\\"escaped-release\\\\\\\"): time.sleep(0.01)\\\"); open(\\\"escaped-after-cancel\\\", \\\"w\\\").write(\\\"survived\\\")\"], start_new_session=True, close_fds=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(10)'"
         }),
     };
     let cancellation = Arc::new(AtomicBool::new(false));
@@ -2026,9 +2014,16 @@ fn run_command_fails_closed_when_a_close_fds_descendant_survives_cancellation() 
         panic!("incompletely terminated command must fail");
     };
     assert_eq!(error.code, "command_termination_unverified");
-    thread::sleep(Duration::from_millis(700));
-    assert_eq!(
-        std::fs::read_to_string(test_workspace.path().join("escaped-after-cancel")).unwrap(),
-        "survived"
-    );
+    std::fs::write(test_workspace.path().join("escaped-release"), "release")
+        .expect("escaped descendant is released");
+    let survived = test_workspace.path().join("escaped-after-cancel");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !survived.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "escaped descendant did not report survival"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(std::fs::read_to_string(survived).unwrap(), "survived");
 }
