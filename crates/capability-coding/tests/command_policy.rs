@@ -11,7 +11,6 @@ fn low_risk_read_and_validation_commands_are_allowed() {
 
     for command in [
         "pwd",
-        "git diff --no-textconv --no-ext-diff -- Cargo.toml",
         "cargo check --workspace",
         "cargo test --workspace",
         "cargo clippy --workspace --all-targets",
@@ -39,7 +38,11 @@ fn side_effecting_and_uncertain_commands_require_an_informative_approval() {
         ("cargo add anyhow", "dependencies"),
         ("npm install", "dependencies"),
         ("sleep 30 &", "background"),
-        ("git status --short", "executes a helper"),
+        ("git status --short", "fsmonitor"),
+        (
+            "git diff --no-textconv --no-ext-diff -- Cargo.toml",
+            "fsmonitor",
+        ),
         ("curl https://example.com", "not classified as low-risk"),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
@@ -170,7 +173,7 @@ fn shell_composition_cannot_hide_a_risky_operation() {
         ("rg needle --pre 'touch marker.txt'", "executes a helper"),
         ("cargo test --workspace &", "background"),
         ("cargo test --workspace\nrm -rf target", "destructive"),
-        ("git status --short | tee status.txt", "executes a helper"),
+        ("git status --short | tee status.txt", "fsmonitor"),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
             policy.classify(&workspace, command)
