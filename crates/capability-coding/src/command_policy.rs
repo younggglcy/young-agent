@@ -91,6 +91,9 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     };
     let arguments = &words[1..];
 
+    if path_bearing_option_escapes(workspace, program, arguments) {
+        return requires_approval("command may access a path outside the workspace");
+    }
     if arguments
         .iter()
         .filter_map(|word| path_candidate(word))
@@ -311,6 +314,81 @@ fn short_option_cluster_contains(argument: &str, option: char) -> bool {
 fn long_option_matches_or_abbreviates(argument: &str, full_option: &str) -> bool {
     let name = argument.split_once('=').map_or(argument, |(name, _)| name);
     name.starts_with("--") && name.len() > 2 && full_option.starts_with(name)
+}
+
+fn path_bearing_option_escapes(
+    workspace: &CodingWorkspace,
+    program: &str,
+    arguments: &[String],
+) -> bool {
+    match (program, arguments) {
+        ("rg" | "grep", arguments) => {
+            option_path_escapes(workspace, arguments, 'f', "--file", false)
+        }
+        ("git", [subcommand, arguments @ ..]) if subcommand == "grep" => {
+            option_path_escapes(workspace, arguments, 'f', "--file", false)
+        }
+        ("git", [subcommand, arguments @ ..]) if subcommand == "ls-files" => {
+            option_path_escapes(workspace, arguments, 'X', "--exclude-from", false)
+        }
+        ("file", arguments) => {
+            option_path_escapes(workspace, arguments, 'm', "--magic-file", true)
+                || option_path_escapes(workspace, arguments, 'M', "--magic-file", true)
+        }
+        _ => false,
+    }
+}
+
+fn option_path_escapes(
+    workspace: &CodingWorkspace,
+    arguments: &[String],
+    short_option: char,
+    long_option: &str,
+    colon_separated: bool,
+) -> bool {
+    for (index, argument) in arguments.iter().enumerate() {
+        let value = if is_exact_short_option(argument, short_option)
+            || long_option_matches_or_abbreviates(argument, long_option) && !argument.contains('=')
+        {
+            arguments.get(index + 1).map(String::as_str)
+        } else if let Some((_, value)) = argument.split_once('=') {
+            long_option_matches_or_abbreviates(argument, long_option).then_some(value)
+        } else {
+            attached_short_option_value(argument, short_option)
+        };
+
+        if value.is_some_and(|value| {
+            if colon_separated {
+                value
+                    .split(':')
+                    .any(|path| escapes_workspace(workspace, path))
+            } else {
+                escapes_workspace(workspace, value)
+            }
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_exact_short_option(argument: &str, option: char) -> bool {
+    argument
+        .strip_prefix('-')
+        .is_some_and(|argument| argument.len() == option.len_utf8() && argument.starts_with(option))
+}
+
+fn attached_short_option_value(argument: &str, option: char) -> Option<&str> {
+    if !argument.starts_with('-') || argument.starts_with("--") {
+        return None;
+    }
+    let option_index = argument
+        .char_indices()
+        .skip(1)
+        .find_map(|(index, character)| {
+            (character == option).then_some(index + character.len_utf8())
+        })?;
+    (option_index < argument.len()).then_some(&argument[option_index..])
 }
 
 fn classify_hard_rejection(

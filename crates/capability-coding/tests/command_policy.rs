@@ -297,6 +297,32 @@ fn recursive_and_indirect_read_modes_require_approval() {
 }
 
 #[test]
+fn path_bearing_options_cannot_hide_cross_workspace_inputs() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+
+    for command in [
+        "rg -f/etc/patterns needle",
+        "rg --file=/etc/patterns needle",
+        "grep -nf/etc/patterns needle",
+        "git grep -f/etc/patterns needle",
+        "git ls-files -X/etc/ignore",
+        "file -m/etc/magic Cargo.toml",
+        "file -M/etc/magic Cargo.toml",
+        "file -m Cargo.toml:/etc/magic Cargo.toml",
+        "file --magic-file=Cargo.toml:/etc/magic Cargo.toml",
+    ] {
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, command)
+        else {
+            panic!("expected cross-workspace option path approval: {command}");
+        };
+        assert!(reason.contains("outside the workspace"), "{reason}");
+    }
+}
+
+#[test]
 fn policy_work_is_bounded_for_overly_complex_shell_input() {
     let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
         .expect("capability workspace resolves");
