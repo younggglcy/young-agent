@@ -236,6 +236,13 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     {
         return requires_approval("command starts a long-running file monitor");
     }
+    if program == "printf"
+        && arguments.first().is_some_and(|argument| {
+            argument == "-v" || (argument.starts_with("-v") && argument.len() > 2)
+        })
+    {
+        return requires_approval("command changes a shell variable");
+    }
     if program == "find"
         && arguments.iter().any(|argument| {
             matches!(

@@ -38,6 +38,8 @@ fn side_effecting_and_uncertain_commands_require_an_informative_approval() {
         ("cargo add anyhow", "dependencies"),
         ("npm install", "dependencies"),
         ("sleep 30 &", "background"),
+        ("printf -v PATH .", "shell variable"),
+        ("printf -vPATH .", "shell variable"),
         ("git status --short", "fsmonitor"),
         (
             "git diff --no-textconv --no-ext-diff -- Cargo.toml",

@@ -3,6 +3,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -211,4 +212,66 @@ fn low_risk_command_executes_without_approval_events() {
     assert!(tool_call.approval_decision().is_none());
     let result = tool_call.result().expect("tool result replays");
     assert!(matches!(result.output, ToolOutput::Success { .. }));
+}
+
+#[test]
+fn denied_shell_variable_mutation_cannot_redirect_a_later_command() {
+    let directory = TestDirectory::new("shell-variable-denied");
+    let fake_git = directory.path().join("git");
+    std::fs::write(&fake_git, "#!/bin/sh\n: > marker.txt\n")
+        .expect("fake git executable is written");
+    let mut permissions = std::fs::metadata(&fake_git)
+        .expect("fake git metadata is available")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_git, permissions).expect("fake git is executable");
+
+    let workspace = CodingWorkspace::resolve(directory.path()).expect("workspace resolves");
+    let mut tools = ToolRuntime::default();
+    register_builtin_coding_capability(&mut tools, workspace).expect("capability registers");
+    let model = FakeModelClient::new([
+        ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-command-001"),
+                name: "run_command".to_string(),
+                arguments: json!({
+                    "command": "printf -v PATH .; git branch --show-current"
+                }),
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: BTreeMap::new(),
+            },
+        ]),
+        ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "Shell mutation was denied.".to_string(),
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: BTreeMap::new(),
+            },
+        ]),
+    ]);
+    let store = JsonlEventStore::new(directory.path().join("run.jsonl"));
+    let mut runtime = AgentRuntime::new(model, tools, store.clone());
+
+    runtime
+        .run_with_control(
+            run_request("run-command-shell-variable-denied"),
+            &mut DenyingControl,
+        )
+        .expect("denied command should remain replayable");
+
+    assert!(!directory.path().join("marker.txt").exists());
+    let replay = store.replay().expect("Event Log replays");
+    let tool_call = replay.tool_calls().next().expect("tool call replays");
+    let approval = tool_call.approval().expect("approval request replays");
+    assert!(approval.reason.contains("shell variable"));
+    assert!(matches!(
+        tool_call.approval_decision(),
+        Some(ApprovalDecision::Deny { .. })
+    ));
 }
