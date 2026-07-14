@@ -234,6 +234,7 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
         ),
         ("find . -fprint report.txt", "mutate workspace files"),
         ("file --compile -m magic", "mutate workspace files"),
+        ("file -Cm magic", "mutate workspace files"),
         (
             "find . -fprintf report.txt '%p\\n'",
             "mutate workspace files",

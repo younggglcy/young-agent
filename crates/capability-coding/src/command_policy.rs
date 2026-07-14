@@ -153,7 +153,7 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     if program == "file"
         && arguments
             .iter()
-            .any(|argument| matches!(argument.as_str(), "-C" | "--compile"))
+            .any(|argument| is_file_compile_option(argument))
     {
         return requires_approval("command may mutate workspace files");
     }
@@ -245,6 +245,11 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     } else {
         requires_approval("command is not classified as low-risk")
     }
+}
+
+fn is_file_compile_option(argument: &str) -> bool {
+    argument == "--compile"
+        || (argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains('C'))
 }
 
 fn classify_hard_rejection(
