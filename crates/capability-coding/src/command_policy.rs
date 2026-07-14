@@ -94,11 +94,7 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     if path_bearing_option_escapes(workspace, program, arguments) {
         return requires_approval("command may access a path outside the workspace");
     }
-    if arguments
-        .iter()
-        .filter_map(|word| path_candidate(word))
-        .any(|path| escapes_workspace(workspace, path))
-    {
+    if arguments_escape_workspace(workspace, arguments) {
         return requires_approval("command may access a path outside the workspace");
     }
     if matches!(
@@ -588,12 +584,15 @@ impl ParsedShellCommand {
                     }
                     '\\' => {
                         if let Some(escaped) = characters.next() {
-                            word.push(escaped);
+                            if escaped != '\n' {
+                                word.push(escaped);
+                                word_started = true;
+                            }
                         } else {
                             word.push('\\');
                             parsed.has_unclassified_syntax = true;
+                            word_started = true;
                         }
-                        word_started = true;
                     }
                     '$' | '`' | '(' | ')' | '{' | '}' => {
                         parsed.has_dynamic_expansion = true;
@@ -684,6 +683,25 @@ fn push_command(commands: &mut Vec<Vec<String>>, words: &mut Vec<String>) -> Res
 fn path_candidate(word: &str) -> Option<&str> {
     let candidate = word.split_once('=').map_or(word, |(_, value)| value);
     (!candidate.is_empty() && candidate != "." && !candidate.starts_with('-')).then_some(candidate)
+}
+
+fn arguments_escape_workspace(workspace: &CodingWorkspace, arguments: &[String]) -> bool {
+    let mut positional_only = false;
+    for argument in arguments {
+        if argument == "--" && !positional_only {
+            positional_only = true;
+            continue;
+        }
+        let candidate = if positional_only {
+            Some(argument.as_str())
+        } else {
+            path_candidate(argument)
+        };
+        if candidate.is_some_and(|path| escapes_workspace(workspace, path)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn escapes_workspace(workspace: &CodingWorkspace, candidate: &str) -> bool {

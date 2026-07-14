@@ -103,6 +103,23 @@ fn explicit_cross_workspace_access_requires_approval() {
             panic!("double-quoted backslash must preserve the shell's actual path");
         };
         assert!(reason.contains("outside the workspace"), "{reason}");
+
+        std::os::unix::fs::symlink(&outside, root.join("safeq"))
+            .expect("line-continuation outside symlink is created");
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, "cat safe\\\nq")
+        else {
+            panic!("unquoted line continuation must match the shell's actual path");
+        };
+        assert!(reason.contains("outside the workspace"), "{reason}");
+
+        std::fs::create_dir(root.join("-")).expect("dash-prefixed path fixture is created");
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, "cat -- -/../../outside.txt")
+        else {
+            panic!("paths after -- must still receive workspace validation");
+        };
+        assert!(reason.contains("outside the workspace"), "{reason}");
     }
 }
 
