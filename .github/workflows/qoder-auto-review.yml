@@ -19,7 +19,11 @@ jobs:
           fetch-depth: 0
 
       - name: Run Qoder Code Review
-        uses: QoderAI/qoder-action@v0
+        id: qoder
+        continue-on-error: true
+        uses: younggglcy/qoder-action@codex/use-official-github-mcp
+        env:
+          ACTIONS_STEP_DEBUG: 'true'
         with:
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           flags: --model ultimate
@@ -27,3 +31,66 @@ jobs:
             /review-pr
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
             OUTPUT_LANGUAGE:Chinese
+
+      - name: Collect redacted official MCP diagnostics
+        if: always()
+        env:
+          QODER_OUTPUT_FILE: ${{ steps.qoder.outputs.output_file }}
+        run: |
+          if [[ -f "${HOME}/.qoder.json" ]]; then
+            echo "Current GitHub MCP entry:"
+            jq -S '.mcpServers.github // null' "${HOME}/.qoder.json"
+          else
+            echo "Qoder configuration was restored and removed."
+          fi
+          if [[ -f "${HOME}/.qoder-action-github-mcp-backup.json" ]]; then
+            echo "Temporary GitHub MCP entry from recovery journal:"
+            jq -S '.temporary_github // null' "${HOME}/.qoder-action-github-mcp-backup.json"
+          else
+            echo "GitHub MCP recovery journal was consumed."
+          fi
+
+          if [[ -n "${QODER_OUTPUT_FILE}" && -f "${QODER_OUTPUT_FILE}" ]]; then
+            echo "GitHub MCP tool results:"
+            jq -c '
+              def redact:
+                walk(
+                  if type == "object" then
+                    with_entries(
+                      if (.key | ascii_downcase | test("token|password|secret|authorization|credential|private|cert|access_key"))
+                      then .value = "******"
+                      else .
+                      end
+                    )
+                  else .
+                  end
+                );
+              .. | objects
+              | select((.type // "") | test("function_result|tool_result"))
+              | redact
+            ' "${QODER_OUTPUT_FILE}"
+            echo "Qoder stream event shapes:"
+            jq -c '{
+              type,
+              subtype,
+              content_types: [.message.content[]? | .type]
+            }' "${QODER_OUTPUT_FILE}"
+          fi
+
+      - name: Preserve Qoder failure status
+        if: always() && steps.qoder.outcome != 'success'
+        run: exit 1
+
+      - name: Assert final review is visible
+        if: steps.qoder.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/reviews" \
+            | jq -e --arg sha "${EXPECTED_HEAD_SHA}" 'any(.[];
+                .user.login == "qoderai[bot]"
+                and .commit_id == $sha
+                and .state == "COMMENTED"
+                and (.body | contains("## 👋 Review Summary"))
+              )'

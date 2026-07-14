@@ -8,9 +8,7 @@ on:
 
 jobs:
   qoder-assistant:
-    if: |
-      contains(github.event.comment.body, '@qoder') &&
-      !endsWith(github.event.comment.user.login, '[bot]')
+    if: "!endsWith(github.event.comment.user.login, '[bot]')"
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,9 +52,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Run Qoder Assistant
-        uses: QoderAI/qoder-action@v0
+        uses: younggglcy/qoder-action@codex/use-official-github-mcp
         with:
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+          trigger_phrase: '@qoder'
           flags: --model ultimate
           prompt: |
             /assistant
