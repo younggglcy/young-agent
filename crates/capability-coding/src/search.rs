@@ -270,6 +270,27 @@ fn search_file(
     }
     results.files_searched = results.files_searched.saturating_add(1);
     let checkpoint = results.checkpoint();
+    search_reader(
+        &mut file,
+        display_path,
+        pattern,
+        cancellation,
+        checkpoint,
+        results,
+    )
+}
+
+fn search_reader<R>(
+    reader: &mut R,
+    display_path: &str,
+    pattern: &LiteralPattern,
+    cancellation: &AtomicBool,
+    checkpoint: SearchCheckpoint,
+    results: &mut SearchResults,
+) -> Result<(), ToolOutput>
+where
+    R: Read,
+{
     let mut buffer = [0u8; 8 * 1024];
     let mut line = LineState::default();
     let mut line_number = 1u64;
@@ -286,7 +307,7 @@ fn search_file(
         let remaining_bytes = MAX_SEARCH_BYTES.saturating_sub(results.bytes_searched);
         if remaining_bytes == 0 {
             let mut probe = [0u8; 1];
-            let bytes_read = file.read(&mut probe).map_err(|source| {
+            let bytes_read = reader.read(&mut probe).map_err(|source| {
                 failure(
                     "workspace_io_error",
                     format!("failed to search '{display_path}': {source}"),
@@ -307,7 +328,7 @@ fn search_file(
             return Ok(());
         }
         let read_limit = buffer.len().min(remaining_bytes as usize);
-        let bytes_read = file.read(&mut buffer[..read_limit]).map_err(|source| {
+        let bytes_read = reader.read(&mut buffer[..read_limit]).map_err(|source| {
             failure(
                 "workspace_io_error",
                 format!("failed to search '{display_path}': {source}"),
@@ -722,10 +743,12 @@ fn visible_utf8_prefix(bytes: &[u8]) -> Result<&str, ()> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::io::{self, Read};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
-        largest_fitting_prefix, LineState, LiteralPattern, SearchResults, MAX_SEARCH_DIRECTORIES,
-        MAX_SEARCH_ENTRIES,
+        largest_fitting_prefix, search_reader, LineState, LiteralPattern, SearchResults,
+        MAX_SEARCH_DIRECTORIES, MAX_SEARCH_ENTRIES,
     };
     use serde_json::json;
 
@@ -779,6 +802,55 @@ mod tests {
         assert_eq!(line.visible.as_ptr(), pointer);
         assert_eq!(line.visible.capacity(), capacity);
         assert_eq!(line.visible, b"next");
+    }
+
+    #[test]
+    fn search_observes_cancellation_after_scanning_has_started() {
+        struct CancelAfterFirstRead<'a> {
+            cancellation: &'a AtomicBool,
+            read: bool,
+        }
+
+        impl Read for CancelAfterFirstRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(
+                    !self.read,
+                    "cancellation should be checked before another read"
+                );
+                self.read = true;
+                buffer.fill(b'x');
+                self.cancellation.store(true, Ordering::Relaxed);
+                Ok(buffer.len())
+            }
+        }
+
+        let cancellation = AtomicBool::new(false);
+        let mut reader = CancelAfterFirstRead {
+            cancellation: &cancellation,
+            read: false,
+        };
+        let mut results = SearchResults {
+            files_searched: 1,
+            ..SearchResults::default()
+        };
+        let checkpoint = results.checkpoint();
+
+        let output = search_reader(
+            &mut reader,
+            "large.txt",
+            &LiteralPattern::new(b"absent"),
+            &cancellation,
+            checkpoint,
+            &mut results,
+        )
+        .expect_err("cancellation after the first read stops the scan");
+
+        let young_tool_runtime::ToolOutput::Failure { error, .. } = output else {
+            panic!("cancelled search must fail");
+        };
+        assert_eq!(error.code, "tool_cancelled");
+        assert!(reader.read);
+        assert_eq!(results.bytes_searched, 8 * 1024);
     }
 
     #[test]

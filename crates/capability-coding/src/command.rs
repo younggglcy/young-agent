@@ -1555,12 +1555,17 @@ where
         tv_sec: exit_poll_interval.as_secs() as _,
         tv_nsec: exit_poll_interval.subsec_nanos() as _,
     };
-    loop {
-        match rustix::event::poll(descriptors, Some(&timeout)) {
-            Ok(_) => return Ok(()),
-            Err(source) if source == rustix::io::Errno::INTR => continue,
-            Err(source) => return Err(CommandError::ReadOutput(std::io::Error::from(source))),
-        }
+    poll_streams_once(|| rustix::event::poll(descriptors, Some(&timeout)))
+}
+
+#[cfg(unix)]
+fn poll_streams_once<P>(poll: P) -> Result<(), CommandError>
+where
+    P: FnOnce() -> Result<usize, rustix::io::Errno>,
+{
+    match poll() {
+        Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+        Err(source) => Err(CommandError::ReadOutput(std::io::Error::from(source))),
     }
 }
 
@@ -1721,11 +1726,11 @@ mod tests {
 
     use super::{
         cleanup_process_group, command_leader_terminal, command_supervisor,
-        drain_streams_after_reap, next_exit_poll_interval, prepare_command_supervision,
-        prepare_command_supervision_with, run_shell_command, shell_command, supervise_live_command,
-        supervise_live_command_with, CapturedStream, CommandCleanupState, CommandError,
-        CommandProcess, CommandSupervisor, DescendantToken, SupervisorAdmissionHealth,
-        SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
+        drain_streams_after_reap, next_exit_poll_interval, poll_streams_once,
+        prepare_command_supervision, prepare_command_supervision_with, run_shell_command,
+        shell_command, supervise_live_command, supervise_live_command_with, CapturedStream,
+        CommandCleanupState, CommandError, CommandProcess, CommandSupervisor, DescendantToken,
+        SupervisorAdmissionHealth, SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
@@ -1770,6 +1775,19 @@ mod tests {
         assert!(stderr_done);
         assert!(stream_error.is_none());
         assert_eq!(stdout_capture.total_bytes, output_bytes as u64);
+    }
+
+    #[test]
+    fn interrupted_stream_poll_returns_to_the_deadline_owner_without_retrying() {
+        let mut calls = 0;
+
+        poll_streams_once(|| {
+            calls += 1;
+            Err(rustix::io::Errno::INTR)
+        })
+        .expect("an interrupted poll yields to the outer deadline loop");
+
+        assert_eq!(calls, 1);
     }
 
     #[test]

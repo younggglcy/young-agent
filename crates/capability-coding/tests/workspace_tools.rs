@@ -789,41 +789,6 @@ fn search_files_finds_a_match_beyond_its_bounded_line_preview() {
 }
 
 #[test]
-fn search_files_observes_cancellation_while_scanning_a_large_line() {
-    let test_workspace = TestWorkspace::new("search-cancellation");
-    std::fs::write(
-        test_workspace.path().join("large.txt"),
-        vec![b'x'; 32 * 1024 * 1024],
-    )
-    .expect("fixture is written");
-    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
-    let mut runtime = ToolRuntime::default();
-    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let cancellation_trigger = cancellation.clone();
-    let trigger = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(5));
-        cancellation_trigger.store(true, Ordering::Relaxed);
-    });
-
-    let result = runtime.dispatch(
-        ToolCall {
-            id: ToolCallId::new("call-cancelled-search"),
-            tool_name: "search_files".to_string(),
-            arguments: json!({ "query": "absent" }),
-        },
-        ToolExecutionAuthorization::NotRequired,
-        cancellation,
-    );
-    trigger.join().expect("cancellation trigger finishes");
-
-    let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("cancelled search must fail");
-    };
-    assert_eq!(error.code, "tool_cancelled");
-}
-
-#[test]
 fn search_files_skips_an_entire_file_when_late_bytes_are_not_utf8() {
     let test_workspace = TestWorkspace::new("search-binary-file");
     std::fs::write(
@@ -1747,12 +1712,22 @@ fn run_command_observes_cooperative_cancellation() {
     let call = ToolCall {
         id: ToolCallId::new("call-cancelled-command"),
         tool_name: "run_command".to_string(),
-        arguments: json!({ "command": "while :; do :; done" }),
+        arguments: json!({
+            "command": "printf ready > command-ready; while :; do :; done"
+        }),
     };
     let cancellation = Arc::new(AtomicBool::new(false));
     let cancellation_trigger = cancellation.clone();
+    let ready = test_workspace.path().join("command-ready");
     let trigger = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "command did not become ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         cancellation_trigger.store(true, Ordering::Relaxed);
     });
 
