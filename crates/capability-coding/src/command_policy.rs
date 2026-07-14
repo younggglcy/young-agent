@@ -1,0 +1,486 @@
+use crate::workspace::CodingWorkspace;
+use std::path::{Component, Path};
+use young_tool_runtime::ToolCall;
+
+pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_SIMPLE_COMMANDS: usize = 32;
+const MAX_POLICY_WORDS: usize = 256;
+
+/// Result of classifying one concrete `run_command` invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandPolicyDecision {
+    Allow,
+    RequiresApproval { reason: String },
+    Reject { reason: String },
+}
+
+/// Conservative first-phase policy for local command execution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CommandApprovalPolicy;
+
+impl CommandApprovalPolicy {
+    pub(crate) fn classify_call(
+        &self,
+        workspace: &CodingWorkspace,
+        call: &ToolCall,
+    ) -> CommandPolicyDecision {
+        let Some(arguments) = call.arguments.as_object() else {
+            return reject("run_command arguments must be an object");
+        };
+        let Some(command) = arguments
+            .get("command")
+            .and_then(|command| command.as_str())
+        else {
+            return reject("run_command requires a string 'command' argument");
+        };
+        if arguments.len() != 1 {
+            return reject("run_command does not accept unknown arguments");
+        }
+        self.classify(workspace, command)
+    }
+
+    pub fn classify(&self, workspace: &CodingWorkspace, command: &str) -> CommandPolicyDecision {
+        if command.trim().is_empty() {
+            return reject("command must not be empty");
+        }
+        if command.len() > MAX_COMMAND_BYTES {
+            return reject("command exceeds the 65536 bytes policy limit");
+        }
+        let parsed = match ParsedShellCommand::parse(command) {
+            Ok(parsed) => parsed,
+            Err(()) => return reject("command contains malformed shell syntax"),
+        };
+        if parsed.commands.len() > MAX_SIMPLE_COMMANDS
+            || parsed.commands.iter().map(Vec::len).sum::<usize>() > MAX_POLICY_WORDS
+        {
+            return reject("command is too complex for the first-phase approval policy");
+        }
+        if parsed.has_background {
+            return requires_approval("command starts or manages a background process");
+        }
+        if parsed.has_redirection {
+            return requires_approval("command redirects input or output");
+        }
+        if parsed.has_dynamic_expansion {
+            return requires_approval("command uses dynamic shell expansion");
+        }
+        if parsed.has_comment || parsed.has_unclassified_syntax {
+            return requires_approval(
+                "command contains shell syntax that is not classified as low-risk",
+            );
+        }
+
+        for words in &parsed.commands {
+            match classify_simple_command(workspace, words) {
+                CommandPolicyDecision::Allow => {}
+                decision => return decision,
+            }
+        }
+        CommandPolicyDecision::Allow
+    }
+}
+
+fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> CommandPolicyDecision {
+    let Some(program) = words.first().map(String::as_str) else {
+        return reject("command contains malformed shell syntax");
+    };
+    let arguments = &words[1..];
+
+    if matches!(program, "sudo" | "doas" | "su") {
+        return reject("command attempts privilege elevation");
+    }
+    if program == "rm"
+        && arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "/" | "/*"))
+    {
+        return reject("command targets the filesystem root");
+    }
+    if program == "cd"
+        && arguments
+            .first()
+            .is_some_and(|path| escapes_workspace(workspace, path))
+    {
+        return reject("command changes its working directory outside the workspace");
+    }
+    if arguments
+        .iter()
+        .filter_map(|word| path_candidate(word))
+        .any(|path| escapes_workspace(workspace, path))
+    {
+        return requires_approval("command may access a path outside the workspace");
+    }
+    if matches!(
+        words,
+        [cargo, operation, ..]
+            if cargo == "cargo" && matches!(operation.as_str(), "add" | "install" | "update")
+    ) || matches!(
+        words,
+        [manager, operation, ..]
+            if matches!(manager.as_str(), "npm" | "pnpm" | "yarn" | "pip" | "pip3")
+                && matches!(operation.as_str(), "install" | "add" | "update")
+    ) {
+        return requires_approval("command installs or updates dependencies");
+    }
+    if program == "rm"
+        || matches!(words, [git, operation, ..] if git == "git" && matches!(operation.as_str(), "reset" | "clean"))
+    {
+        return requires_approval("command performs a destructive workspace operation");
+    }
+    if matches!(
+        program,
+        "touch" | "mkdir" | "cp" | "mv" | "chmod" | "chown" | "tee"
+    ) || (program == "sed"
+        && arguments
+            .iter()
+            .any(|argument| argument == "-i" || argument.starts_with("-i")))
+    {
+        return requires_approval("command may mutate workspace files");
+    }
+    if program == "git"
+        && arguments
+            .iter()
+            .any(|argument| argument == "--output" || argument.starts_with("--output="))
+    {
+        return requires_approval("command may mutate workspace files");
+    }
+    if program == "git"
+        && arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-O" | "--open-files-in-pager" | "--ext-diff" | "--textconv"
+            )
+        })
+    {
+        return requires_approval("command executes a helper configured by Git");
+    }
+    if program == "cargo"
+        && arguments
+            .iter()
+            .any(|argument| argument == "--config" || argument.starts_with("--config="))
+    {
+        return requires_approval("command executes configured tooling");
+    }
+    if program == "rg"
+        && arguments
+            .iter()
+            .any(|argument| argument == "--pre" || argument.starts_with("--pre="))
+    {
+        return requires_approval("command executes a helper while searching files");
+    }
+    if program == "find"
+        && arguments.iter().any(|argument| {
+            matches!(
+                argument.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        })
+    {
+        return requires_approval("command may mutate workspace files or execute a helper");
+    }
+    if program == "sed"
+        && sed_program(arguments)
+            .is_some_and(|program| program.contains('w') || program.contains('e'))
+    {
+        return requires_approval("command may mutate workspace files or execute a helper");
+    }
+
+    let allowed = match words {
+        [program] if program == "pwd" => true,
+        [git, subcommand, ..]
+            if git == "git"
+                && matches!(
+                    subcommand.as_str(),
+                    "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "grep"
+                ) =>
+        {
+            true
+        }
+        [git, branch, option]
+            if git == "git" && branch == "branch" && option == "--show-current" =>
+        {
+            true
+        }
+        [cargo, operation, ..]
+            if cargo == "cargo"
+                && matches!(operation.as_str(), "check" | "test" | "clippy" | "metadata") =>
+        {
+            true
+        }
+        [cargo, operation, arguments @ ..]
+            if cargo == "cargo"
+                && operation == "fmt"
+                && arguments.iter().any(|argument| argument == "--check") =>
+        {
+            true
+        }
+        [command, flag, _program] if command == "command" && flag == "-v" => true,
+        [program, arguments @ ..] if program == "sed" && is_safe_sed_read(arguments) => true,
+        [program, ..]
+            if matches!(
+                program.as_str(),
+                "rg" | "ls"
+                    | "cat"
+                    | "grep"
+                    | "head"
+                    | "tail"
+                    | "wc"
+                    | "stat"
+                    | "file"
+                    | "find"
+                    | "echo"
+                    | "printf"
+                    | "true"
+                    | "false"
+            ) =>
+        {
+            true
+        }
+        _ => false,
+    };
+
+    if allowed {
+        CommandPolicyDecision::Allow
+    } else {
+        requires_approval("command is not classified as low-risk")
+    }
+}
+
+fn is_safe_sed_read(arguments: &[String]) -> bool {
+    let Some(program) = sed_program(arguments) else {
+        return false;
+    };
+    !program.is_empty()
+        && program.chars().all(|character| {
+            character.is_ascii_digit() || matches!(character, ',' | '$' | 'p' | 'q')
+        })
+}
+
+fn sed_program(arguments: &[String]) -> Option<&str> {
+    arguments
+        .iter()
+        .find(|argument| !argument.starts_with('-'))
+        .map(String::as_str)
+}
+
+#[derive(Default)]
+struct ParsedShellCommand {
+    commands: Vec<Vec<String>>,
+    has_background: bool,
+    has_redirection: bool,
+    has_dynamic_expansion: bool,
+    has_comment: bool,
+    has_unclassified_syntax: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    None,
+    Single,
+    Double,
+}
+
+impl ParsedShellCommand {
+    fn parse(command: &str) -> Result<Self, ()> {
+        let mut parsed = Self::default();
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut word_started = false;
+        let mut quote = Quote::None;
+        let mut characters = command.chars().peekable();
+        let mut requires_following_command = false;
+
+        while let Some(character) = characters.next() {
+            match quote {
+                Quote::Single => {
+                    if character == '\'' {
+                        quote = Quote::None;
+                    } else {
+                        word.push(character);
+                    }
+                    word_started = true;
+                }
+                Quote::Double => match character {
+                    '"' => quote = Quote::None,
+                    '\\' => {
+                        if let Some(escaped) = characters.next() {
+                            word.push(escaped);
+                        } else {
+                            word.push('\\');
+                            parsed.has_unclassified_syntax = true;
+                        }
+                        word_started = true;
+                    }
+                    '$' | '`' => {
+                        parsed.has_dynamic_expansion = true;
+                        word.push(character);
+                        word_started = true;
+                    }
+                    _ => {
+                        word.push(character);
+                        word_started = true;
+                    }
+                },
+                Quote::None => match character {
+                    '\'' => {
+                        quote = Quote::Single;
+                        word_started = true;
+                    }
+                    '"' => {
+                        quote = Quote::Double;
+                        word_started = true;
+                    }
+                    '\\' => {
+                        if let Some(escaped) = characters.next() {
+                            word.push(escaped);
+                        } else {
+                            word.push('\\');
+                            parsed.has_unclassified_syntax = true;
+                        }
+                        word_started = true;
+                    }
+                    '$' | '`' | '(' | ')' | '{' | '}' => {
+                        parsed.has_dynamic_expansion = true;
+                        word.push(character);
+                        word_started = true;
+                    }
+                    '#' if !word_started => {
+                        parsed.has_comment = true;
+                        break;
+                    }
+                    '>' | '<' => {
+                        push_word(&mut words, &mut word, &mut word_started);
+                        parsed.has_redirection = true;
+                    }
+                    '&' => {
+                        push_word(&mut words, &mut word, &mut word_started);
+                        if characters.peek() == Some(&'&') {
+                            characters.next();
+                            push_command(&mut parsed.commands, &mut words)?;
+                            requires_following_command = true;
+                        } else {
+                            push_command(&mut parsed.commands, &mut words)?;
+                            parsed.has_background = true;
+                            requires_following_command = false;
+                        }
+                    }
+                    '|' => {
+                        push_word(&mut words, &mut word, &mut word_started);
+                        if characters.peek() == Some(&'|') {
+                            characters.next();
+                        }
+                        push_command(&mut parsed.commands, &mut words)?;
+                        requires_following_command = true;
+                    }
+                    ';' | '\n' => {
+                        push_word(&mut words, &mut word, &mut word_started);
+                        if !words.is_empty() {
+                            push_command(&mut parsed.commands, &mut words)?;
+                        }
+                        requires_following_command = false;
+                    }
+                    character if character.is_whitespace() => {
+                        push_word(&mut words, &mut word, &mut word_started);
+                    }
+                    _ => {
+                        word.push(character);
+                        word_started = true;
+                    }
+                },
+            }
+        }
+
+        if quote != Quote::None {
+            return Err(());
+        }
+        push_word(&mut words, &mut word, &mut word_started);
+        if !words.is_empty() {
+            push_command(&mut parsed.commands, &mut words)?;
+            requires_following_command = false;
+        }
+        if parsed.commands.is_empty() || requires_following_command {
+            return Err(());
+        }
+        Ok(parsed)
+    }
+}
+
+fn push_word(words: &mut Vec<String>, word: &mut String, word_started: &mut bool) {
+    if *word_started {
+        words.push(std::mem::take(word));
+        *word_started = false;
+    }
+}
+
+fn push_command(commands: &mut Vec<Vec<String>>, words: &mut Vec<String>) -> Result<(), ()> {
+    if words.is_empty() {
+        return Err(());
+    }
+    commands.push(std::mem::take(words));
+    Ok(())
+}
+
+fn path_candidate(word: &str) -> Option<&str> {
+    let candidate = word.split_once('=').map_or(word, |(_, value)| value);
+    (!candidate.is_empty() && candidate != "." && !candidate.starts_with('-')).then_some(candidate)
+}
+
+fn escapes_workspace(workspace: &CodingWorkspace, candidate: &str) -> bool {
+    if candidate == "~" || candidate.starts_with("~/") {
+        return true;
+    }
+    let path = Path::new(candidate);
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return true;
+    }
+
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.context().root().join(path)
+    };
+    if path.is_absolute() && !path.starts_with(workspace.context().root()) {
+        return true;
+    }
+
+    let mut existing_ancestor = resolved;
+    loop {
+        match existing_ancestor.canonicalize() {
+            Ok(resolved) => return !resolved.starts_with(workspace.context().root()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                if !existing_ancestor.pop() {
+                    return true;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
+fn requires_approval(reason: &str) -> CommandPolicyDecision {
+    CommandPolicyDecision::RequiresApproval {
+        reason: reason.to_string(),
+    }
+}
+
+fn reject(reason: &str) -> CommandPolicyDecision {
+    CommandPolicyDecision::Reject {
+        reason: reason.to_string(),
+    }
+}

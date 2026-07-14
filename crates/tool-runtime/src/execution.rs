@@ -40,6 +40,19 @@ pub enum ToolExecutionAuthorization {
     ApprovalGranted { call_id: ToolCallId },
 }
 
+/// Dynamic policy result for one concrete call to a `CallDependent` tool.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ToolCallPolicy {
+    #[default]
+    Allow,
+    RequiresApproval {
+        reason: String,
+    },
+    Reject {
+        reason: String,
+    },
+}
+
 impl ToolExecutionAuthorization {
     fn is_granted_for(&self, call: &ToolCall) -> bool {
         matches!(
@@ -179,10 +192,9 @@ impl PreparedToolCall {
 /// Internal seam implemented by one concrete registered tool adapter.
 pub trait ToolHandler {
     /// Classifies a call only when its definition uses a call-dependent policy.
-    /// Every handler must make the allow decision explicit so changing a
-    /// definition to `CallDependent` cannot silently inherit a fail-open
-    /// default.
-    fn approval_reason(&self, call: &ToolCall) -> Option<String>;
+    /// Every handler must make allow, approval, and rejection explicit so
+    /// changing a definition to `CallDependent` cannot fail open.
+    fn classify(&self, call: &ToolCall) -> ToolCallPolicy;
 
     /// Executes one invocation. Implementations that can block on external
     /// work must observe `cancellation` and return promptly once it is set;

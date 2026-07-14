@@ -21,8 +21,8 @@ use young_model_runtime::{
     ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
 use young_tool_runtime::{
-    CapabilityRef, FakeToolDispatcher, ToolApprovalPolicy, ToolCall, ToolCallId, ToolContent,
-    ToolDefinition, ToolError, ToolHandler, ToolOutput, ToolResult, ToolRuntime,
+    CapabilityRef, FakeToolDispatcher, ToolApprovalPolicy, ToolCall, ToolCallId, ToolCallPolicy,
+    ToolContent, ToolDefinition, ToolError, ToolHandler, ToolOutput, ToolResult, ToolRuntime,
 };
 
 struct TestLog {
@@ -165,8 +165,8 @@ struct RecordingToolHandler {
 }
 
 impl ToolHandler for RecordingToolHandler {
-    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
-        None
+    fn classify(&self, _call: &ToolCall) -> ToolCallPolicy {
+        ToolCallPolicy::Allow
     }
 
     fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
@@ -504,8 +504,8 @@ impl AgentEventSink for AmbiguousJsonlSink {
 }
 
 impl ToolHandler for BlockingToolHandler {
-    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
-        None
+    fn classify(&self, _call: &ToolCall) -> ToolCallPolicy {
+        ToolCallPolicy::Allow
     }
 
     fn execute(&mut self, _call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {

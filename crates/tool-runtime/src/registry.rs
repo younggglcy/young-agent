@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::execution::{
-    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolCallPolicy, ToolDispatcher,
     ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
     ToolResult,
 };
@@ -248,11 +248,20 @@ impl ToolDispatcher for ToolRuntime {
             ToolApprovalPolicy::RequiresApproval { reason } => {
                 PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason.clone())
             }
-            ToolApprovalPolicy::CallDependent => match tool.handler.approval_reason(&call) {
-                Some(reason) => {
+            ToolApprovalPolicy::CallDependent => match tool.handler.classify(&call) {
+                ToolCallPolicy::Allow => PreparedToolCall::ready(self.dispatcher_identity, call),
+                ToolCallPolicy::RequiresApproval { reason } => {
                     PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
                 }
-                None => PreparedToolCall::ready(self.dispatcher_identity, call),
+                ToolCallPolicy::Reject { reason } => PreparedToolCall::rejected(
+                    self.dispatcher_identity,
+                    call,
+                    ToolError {
+                        code: "tool_rejected".to_string(),
+                        message: reason,
+                        retryable: false,
+                    },
+                ),
             },
             ToolApprovalPolicy::AlwaysReject { reason } => PreparedToolCall::rejected(
                 self.dispatcher_identity,

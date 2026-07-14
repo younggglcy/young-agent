@@ -23,5 +23,10 @@ cap-fs-ext.workspace = true
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 exacl.workspace = true
 
+[dev-dependencies]
+young-agent-runtime = { path = "../agent-runtime" }
+young-event-store = { path = "../event-store" }
+young-model-runtime = { path = "../model-runtime" }
+
 [lints]
 workspace = true

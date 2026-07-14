@@ -20,6 +20,7 @@ use serde_json::json;
 use std::cell::Cell;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
+use crate::command_policy::MAX_COMMAND_BYTES;
 use crate::tool_support::{
     failure, finalize_output, truncate_json_string, ToolArguments, MAX_OUTPUT_BYTES,
     MAX_TOOL_CONTENT_SERIALIZED_BYTES,
@@ -38,7 +39,6 @@ const MAX_COMMAND_SUPERVISION_SLOTS: usize = 64;
 const MAX_COMMAND_PROCESSING_PANICS: u8 = 8;
 const INITIAL_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(250);
-const MAX_COMMAND_BYTES: usize = 64 * 1024;
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -51,9 +51,6 @@ thread_local! {
     static LIVE_COMMAND_SUPERVISOR_HANDOFFS: Cell<usize> = const { Cell::new(0) };
     static LAST_SUPERVISED_COMMAND_ID: Cell<Option<u64>> = const { Cell::new(None) };
 }
-
-pub(crate) const APPROVAL_REASON: &str =
-    "command execution requires approval until a command safety policy is configured";
 
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
