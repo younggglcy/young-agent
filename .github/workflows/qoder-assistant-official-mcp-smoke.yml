@@ -1,0 +1,39 @@
+name: Qoder Assistant Official MCP Smoke
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  qoder-assistant-smoke:
+    if: github.head_ref == 'codex/official-mcp-ci-smoke'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Run Qoder Assistant with the official GitHub MCP Server
+        uses: younggglcy/qoder-action@codex/use-official-github-mcp
+        with:
+          qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+          flags: --model ultimate
+          prompt: |
+            /assistant
+            REPO:${{ github.repository }}
+            REQUEST_SOURCE:issue_comment
+            THREAD_ID:official-mcp-assistant-smoke
+            COMMENT_ID:0
+            AUTHOR:${{ github.actor }}
+            BODY:请读取并概括当前测试 PR，确认使用官方 GitHub MCP 完成读取，并在最终回复中包含 [official-mcp-assistant-smoke]。
+            URL:${{ github.event.pull_request.html_url }}
+            IS_PR:true
+            ISSUE_OR_PR_NUMBER:${{ github.event.pull_request.number }}
+            OUTPUT_LANGUAGE:Chinese
