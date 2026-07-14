@@ -54,7 +54,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Run Qoder Assistant
-        uses: QoderAI/qoder-action@v0
+        uses: younggglcy/qoder-action@codex/use-official-github-mcp
         with:
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           flags: --model ultimate
