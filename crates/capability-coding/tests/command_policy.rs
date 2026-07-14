@@ -11,7 +11,6 @@ fn low_risk_read_and_validation_commands_are_allowed() {
 
     for command in [
         "pwd",
-        "git status --short",
         "git diff --no-textconv --no-ext-diff -- Cargo.toml",
         "cargo check --workspace",
         "cargo test --workspace",
@@ -40,6 +39,7 @@ fn side_effecting_and_uncertain_commands_require_an_informative_approval() {
         ("cargo add anyhow", "dependencies"),
         ("npm install", "dependencies"),
         ("sleep 30 &", "background"),
+        ("git status --short", "executes a helper"),
         ("curl https://example.com", "not classified as low-risk"),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
@@ -170,10 +170,7 @@ fn shell_composition_cannot_hide_a_risky_operation() {
         ("rg needle --pre 'touch marker.txt'", "executes a helper"),
         ("cargo test --workspace &", "background"),
         ("cargo test --workspace\nrm -rf target", "destructive"),
-        (
-            "git status --short | tee status.txt",
-            "mutate workspace files",
-        ),
+        ("git status --short | tee status.txt", "executes a helper"),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
             policy.classify(&workspace, command)
@@ -194,7 +191,6 @@ fn composed_read_and_validation_commands_remain_low_risk() {
     let policy = CommandApprovalPolicy;
 
     for command in [
-        "git status --short && cargo test --workspace",
         "rg approval src tests | head -n 20",
         "cargo test --workspace || cargo check --workspace",
         "printf '%s\\n' ready; pwd",

@@ -159,6 +159,11 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
             "command executes a helper configured by Git unless explicitly disabled",
         );
     }
+    if program == "git" && matches!(arguments.first().map(String::as_str), Some("status")) {
+        return requires_approval(
+            "command executes a helper configured by Git or starts its fsmonitor daemon",
+        );
+    }
     if program == "cargo"
         && arguments
             .iter()
@@ -254,7 +259,7 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
             if git == "git"
                 && matches!(
                     subcommand.as_str(),
-                    "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "grep"
+                    "diff" | "log" | "show" | "rev-parse" | "ls-files" | "grep"
                 ) =>
         {
             true
