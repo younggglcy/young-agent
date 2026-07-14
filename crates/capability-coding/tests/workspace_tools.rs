@@ -1,49 +1,26 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use common::TestDirectory;
 use serde_json::json;
 use young_capability_coding::{register_builtin_coding_capability, CodingWorkspace};
 use young_tool_runtime::{
     ToolCall, ToolCallId, ToolContent, ToolExecutionAuthorization, ToolOutput, ToolRuntime,
 };
 
-struct TestWorkspace {
-    root: PathBuf,
-}
+type TestWorkspace = TestDirectory;
 
-impl TestWorkspace {
-    fn new(name: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after the Unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "young-capability-coding-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("test workspace is created");
-        Self { root }
-    }
-
-    fn path(&self) -> &Path {
-        &self.root
-    }
-
+impl TestDirectory {
     fn git(&self, arguments: &[&str]) {
-        run_git(&self.root, arguments);
-    }
-}
-
-impl Drop for TestWorkspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        run_git(self.path(), arguments);
     }
 }
 

@@ -1,34 +1,7 @@
+mod common;
+
+use common::TestDirectory;
 use young_capability_coding::{CodingWorkspace, CommandApprovalPolicy, CommandPolicyDecision};
-
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-struct TestDirectory(PathBuf);
-
-impl TestDirectory {
-    fn new(name: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after the Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "young-command-policy-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).expect("test directory is created");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 #[test]
 fn low_risk_read_and_validation_commands_are_allowed() {
@@ -119,6 +92,15 @@ fn explicit_cross_workspace_access_requires_approval() {
             policy.classify(&workspace, "cat outside-link/not-created-yet")
         else {
             panic!("expected a missing descendant of an outside symlink to require approval");
+        };
+        assert!(reason.contains("outside the workspace"), "{reason}");
+
+        std::os::unix::fs::symlink(&outside, root.join("safe\\q"))
+            .expect("backslash-named outside symlink is created");
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, "cat \"safe\\q\"")
+        else {
+            panic!("double-quoted backslash must preserve the shell's actual path");
         };
         assert!(reason.contains("outside the workspace"), "{reason}");
     }

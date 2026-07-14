@@ -1,11 +1,12 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+mod common;
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use common::TestDirectory;
 use serde_json::json;
 use young_agent_runtime::{
     AgentRuntime, ApprovalDecision, ApprovalRequest, RunControl, RunControlFlow, RunId, RunRequest,
@@ -16,33 +17,6 @@ use young_model_runtime::{
     FakeModelClient, ModelMessage, ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
 use young_tool_runtime::{ToolOutput, ToolRuntime};
-
-struct TestDirectory(PathBuf);
-
-impl TestDirectory {
-    fn new(name: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after the Unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "young-command-approval-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).expect("test directory is created");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 struct DenyingControl;
 struct ApprovingControl;

@@ -549,12 +549,23 @@ impl ParsedShellCommand {
                     '"' => quote = Quote::None,
                     '\\' => {
                         if let Some(escaped) = characters.next() {
-                            word.push(escaped);
+                            match escaped {
+                                '$' | '`' | '"' | '\\' => {
+                                    word.push(escaped);
+                                    word_started = true;
+                                }
+                                '\n' => {}
+                                _ => {
+                                    word.push('\\');
+                                    word.push(escaped);
+                                    word_started = true;
+                                }
+                            }
                         } else {
                             word.push('\\');
                             parsed.has_unclassified_syntax = true;
+                            word_started = true;
                         }
-                        word_started = true;
                     }
                     '$' | '`' => {
                         parsed.has_dynamic_expansion = true;
