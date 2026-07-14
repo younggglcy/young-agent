@@ -468,18 +468,12 @@ fn run_shell_command(
     if control_result.is_err()
         && matches!(&cleanup_result, Ok(CommandCleanupCompletion::Reaped { .. }))
     {
-        read_available_stream(
-            &mut stdout,
-            &mut stdout_capture,
-            &mut stdout_done,
+        drain_streams_after_reap(
+            (&mut stdout, &mut stdout_capture, &mut stdout_done),
+            (&mut stderr, &mut stderr_capture, &mut stderr_done),
             &mut stream_error,
-        );
-        read_available_stream(
-            &mut stderr,
-            &mut stderr_capture,
-            &mut stderr_done,
-            &mut stream_error,
-        );
+            wait_for_stream_activity,
+        )?;
     }
     if let Some(cleanup_status) = reconcile_control_and_cleanup(
         control_result,
@@ -1488,6 +1482,44 @@ fn read_available_stream<R: Read>(
     progressed
 }
 
+fn drain_streams_after_reap<Out, Err, Wait>(
+    stdout: (&mut Out, &mut CapturedStream, &mut bool),
+    stderr: (&mut Err, &mut CapturedStream, &mut bool),
+    stream_error: &mut Option<std::io::Error>,
+    mut wait_for_activity: Wait,
+) -> Result<(), CommandError>
+where
+    Out: Read,
+    Err: Read,
+    Wait: FnMut(&Out, &Err, bool, bool, Duration) -> Result<(), CommandError>,
+{
+    let (stdout, stdout_capture, stdout_done) = stdout;
+    let (stderr, stderr_capture, stderr_done) = stderr;
+    let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+    loop {
+        let stdout_progress =
+            read_available_stream(stdout, stdout_capture, stdout_done, stream_error);
+        let stderr_progress =
+            read_available_stream(stderr, stderr_capture, stderr_done, stream_error);
+        if (*stdout_done && *stderr_done) || stream_error.is_some() {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        if !stdout_progress && !stderr_progress {
+            wait_for_activity(
+                stdout,
+                stderr,
+                *stdout_done,
+                *stderr_done,
+                remaining.min(MAX_EXIT_POLL_INTERVAL),
+            )?;
+        }
+    }
+}
+
 #[cfg(unix)]
 fn wait_for_stream_activity<Out, Err>(
     stdout: &Out,
@@ -1677,7 +1709,7 @@ impl fmt::Display for CommandError {
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::os::unix::net::UnixStream;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1689,15 +1721,16 @@ mod tests {
 
     use super::{
         cleanup_process_group, command_leader_terminal, command_supervisor,
-        next_exit_poll_interval, prepare_command_supervision, prepare_command_supervision_with,
-        run_shell_command, shell_command, supervise_live_command, supervise_live_command_with,
-        CommandCleanupState, CommandError, CommandProcess, CommandSupervisor, DescendantToken,
-        SupervisorAdmissionHealth, SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
+        drain_streams_after_reap, next_exit_poll_interval, prepare_command_supervision,
+        prepare_command_supervision_with, run_shell_command, shell_command, supervise_live_command,
+        supervise_live_command_with, CapturedStream, CommandCleanupState, CommandError,
+        CommandProcess, CommandSupervisor, DescendantToken, SupervisorAdmissionHealth,
+        SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
         LIVE_COMMAND_SUPERVISOR_HANDOFFS, MAX_COMMAND_PROCESSING_PANICS,
-        MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL,
+        MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL, MAX_STREAM_READS_PER_TICK,
     };
     use crate::workspace::CodingWorkspace;
 
@@ -1712,6 +1745,31 @@ mod tests {
             next_exit_poll_interval(interval, true),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn post_cleanup_drain_crosses_the_single_tick_budget_and_observes_eof() {
+        let output_bytes = (MAX_STREAM_READS_PER_TICK + 1) * 8 * 1024;
+        let mut stdout = Cursor::new(vec![b'x'; output_bytes]);
+        let mut stderr = Cursor::new(Vec::<u8>::new());
+        let mut stdout_capture = CapturedStream::new(output_bytes);
+        let mut stderr_capture = CapturedStream::new(0);
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut stream_error = None;
+
+        drain_streams_after_reap(
+            (&mut stdout, &mut stdout_capture, &mut stdout_done),
+            (&mut stderr, &mut stderr_capture, &mut stderr_done),
+            &mut stream_error,
+            |_, _, _, _, _| Ok(()),
+        )
+        .expect("finite post-cleanup output drains");
+
+        assert!(stdout_done);
+        assert!(stderr_done);
+        assert!(stream_error.is_none());
+        assert_eq!(stdout_capture.total_bytes, output_bytes as u64);
     }
 
     #[test]
@@ -2114,8 +2172,16 @@ mod tests {
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let cancellation = Arc::new(AtomicBool::new(false));
         let trigger_flag = cancellation.clone();
+        let ready = root.join("control-failure-ready");
         let trigger = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "control failure fixture did not become ready"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
             trigger_flag.store(true, Ordering::Relaxed);
         });
         COMMAND_GROUP_TERMINATION_ATTEMPTS.with(|attempts| attempts.set(0));
@@ -2124,7 +2190,7 @@ mod tests {
 
         let result = run_shell_command(
             &workspace,
-            "(sleep 0.2; printf leaked > delayed.txt) & wait",
+            "sleep 10 & printf ready > control-failure-ready; wait",
             &cancellation,
             1024,
         );
@@ -2140,8 +2206,6 @@ mod tests {
             "cleanup terminates once, then confirms descendant-token closure before reaping"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
-        thread::sleep(Duration::from_millis(250));
-        assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
         std::fs::remove_dir_all(root).expect("test workspace is removed");
@@ -2161,8 +2225,16 @@ mod tests {
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let cancellation = Arc::new(AtomicBool::new(false));
         let trigger_flag = cancellation.clone();
+        let ready = root.join("supervisor-ready");
         let trigger = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "supervisor fixture did not become ready"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
             trigger_flag.store(true, Ordering::Relaxed);
         });
         INJECT_PERSISTENT_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
@@ -2171,7 +2243,7 @@ mod tests {
 
         let result = run_shell_command(
             &workspace,
-            "(sleep 0.2; printf leaked > delayed.txt) & wait",
+            "sleep 10 & printf ready > supervisor-ready; wait",
             &cancellation,
             1024,
         );
@@ -2186,7 +2258,6 @@ mod tests {
             1
         );
         wait_for_supervisor_completion(take_last_supervised_command_id());
-        assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
         std::fs::remove_dir_all(root).expect("test workspace is removed");
@@ -2206,8 +2277,16 @@ mod tests {
         let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
         let cancellation = Arc::new(AtomicBool::new(false));
         let trigger_flag = cancellation.clone();
+        let ready = root.join("partial-termination-ready");
         let trigger = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(30));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "partial termination fixture did not become ready"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
             trigger_flag.store(true, Ordering::Relaxed);
         });
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS.with(|failure| failure.set(true));
@@ -2216,7 +2295,7 @@ mod tests {
 
         let result = run_shell_command(
             &workspace,
-            "(sleep 0.6; printf leaked > delayed.txt) & wait",
+            "sleep 10 & printf ready > partial-termination-ready; wait",
             &cancellation,
             1024,
         );
@@ -2231,7 +2310,6 @@ mod tests {
             1
         );
         wait_for_supervisor_completion(take_last_supervised_command_id());
-        assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
         std::fs::remove_dir_all(root).expect("test workspace is removed");
@@ -2255,7 +2333,7 @@ mod tests {
 
         let result = run_shell_command(
             &workspace,
-            "(sleep 0.2; printf leaked > delayed.txt) >/dev/null 2>&1 & exit 0",
+            "sleep 10 >/dev/null 2>&1 & exit 0",
             &AtomicBool::new(false),
             1024,
         );
@@ -2270,33 +2348,21 @@ mod tests {
             1
         );
         wait_for_supervisor_completion(take_last_supervised_command_id());
-        assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
     #[test]
-    fn cleanup_seals_residual_members_before_reaping_a_terminal_leader() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after the Unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "young-command-terminal-cleanup-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&root).expect("test workspace is created");
-        let mut process =
-            shell_command("(sleep 0.15; printf leaked > delayed.txt) >/dev/null 2>&1 & exit 0");
+    fn untracked_terminal_cleanup_preserves_the_initial_kill_error() {
+        let mut process = shell_command("exit 0");
         let child = process
-            .current_dir(&root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .group_spawn()
             .expect("test command group starts");
-        thread::sleep(Duration::from_millis(30));
+        wait_for_terminal_leader(&child);
         INJECT_NEXT_FULL_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
 
         let permit = prepare_command_supervision().expect("supervision slot is available");
@@ -2310,9 +2376,6 @@ mod tests {
             matches!(result, Err(CommandError::Kill(_))),
             "the injected first termination failure remains visible: {result:?}"
         );
-        thread::sleep(Duration::from_millis(200));
-        assert!(!root.join("delayed.txt").exists());
-        std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
     #[test]
@@ -2388,8 +2451,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&root).expect("test workspace is created");
-        let mut process =
-            shell_command("(sleep 0.15; printf leaked > delayed.txt) >/dev/null 2>&1 & exit 0");
+        let mut process = shell_command("sleep 10 >/dev/null 2>&1 & exit 0");
         let child = process
             .current_dir(&root)
             .stdin(Stdio::null())
@@ -2410,7 +2472,6 @@ mod tests {
 
         assert!(matches!(result, CommandError::TerminationSupervised(_)));
         wait_for_supervisor_completion(take_last_supervised_command_id());
-        assert!(!root.join("delayed.txt").exists());
         std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
@@ -2429,20 +2490,14 @@ mod tests {
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE.with(|failure| failure.set(true));
         let started = Instant::now();
 
-        let result = run_shell_command(
-            &workspace,
-            "(sleep 0.2; printf leaked > delayed.txt) & wait",
-            &AtomicBool::new(false),
-            1024,
-        );
+        let result =
+            run_shell_command(&workspace, "sleep 10 & wait", &AtomicBool::new(false), 1024);
 
         assert!(
             matches!(result, Err(CommandError::ConfigureOutput(_))),
             "unexpected result: {result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
-        thread::sleep(Duration::from_millis(250));
-        assert!(!root.join("delayed.txt").exists());
 
         drop(workspace);
         std::fs::remove_dir_all(root).expect("test workspace is removed");

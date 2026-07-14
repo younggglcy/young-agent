@@ -70,6 +70,8 @@ cleanup 的首次 group signal 若返回 `EPERM`，但随后确认 leader termin
 reap 成功，不能再把这条已过时的 signal error 返回给调用方；没有 tracking token 的路径仍应保留错误。
 同理，第一次 bounded seal 超时后，若第二阶段 cleanup 已返回实际 reap status 且两个输出 pipe 都已
 关闭，应使用该 status 完成结果；若 pipe 未关闭或 ownership 已交给 supervisor，仍须 fail closed。
+cleanup 后的 pipe 检查不能只执行一个 per-tick read budget；应在总 deadline 内持续 drain，并在无
+progress 时 poll，直到双 EOF、stream error 或 deadline，避免有限 backlog 把已完成 cleanup 误报为失败。
 control/cleanup 的合并应集中处理，并让 `Reaped` completion 显式携带 tracking token 是否 sealed；
 cancellation 首次 signal 的 `EPERM` 也只有在同一组 proof 齐全时才能回到既定 cancellation 语义。
 即使 wrapper 与 direct group kill 同时失败，也不能在 leader 仍存活时直接 drop child handle：
