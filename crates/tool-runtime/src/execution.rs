@@ -41,16 +41,11 @@ pub enum ToolExecutionAuthorization {
 }
 
 /// Dynamic policy result for one concrete call to a `CallDependent` tool.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolCallPolicy {
-    #[default]
     Allow,
-    RequiresApproval {
-        reason: String,
-    },
-    Reject {
-        reason: String,
-    },
+    RequiresApproval { reason: String },
+    Reject { reason: String },
 }
 
 impl ToolExecutionAuthorization {
@@ -104,6 +99,28 @@ enum ToolExecutionDisposition {
 }
 
 impl PreparedToolCall {
+    pub(crate) fn classified(
+        dispatcher_identity: ToolDispatcherIdentity,
+        call: ToolCall,
+        policy: ToolCallPolicy,
+    ) -> Self {
+        match policy {
+            ToolCallPolicy::Allow => Self::ready(dispatcher_identity, call),
+            ToolCallPolicy::RequiresApproval { reason } => {
+                Self::requiring_approval(dispatcher_identity, call, reason)
+            }
+            ToolCallPolicy::Reject { reason } => Self::rejected(
+                dispatcher_identity,
+                call,
+                ToolError {
+                    code: "tool_rejected".to_string(),
+                    message: reason,
+                    retryable: false,
+                },
+            ),
+        }
+    }
+
     pub(crate) fn ready(dispatcher_identity: ToolDispatcherIdentity, call: ToolCall) -> Self {
         Self {
             dispatcher_identity,

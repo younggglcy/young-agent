@@ -7,11 +7,17 @@ use crate::execution::{
     ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FakeToolHandler {
     outputs: VecDeque<ToolOutput>,
     calls: Vec<ToolCall>,
     policy: ToolCallPolicy,
+}
+
+impl Default for FakeToolHandler {
+    fn default() -> Self {
+        Self::new([])
+    }
 }
 
 impl FakeToolHandler {
@@ -134,21 +140,8 @@ impl crate::execution::sealed::Sealed for FakeToolDispatcher {}
 
 impl ToolDispatcher for FakeToolDispatcher {
     fn prepare(&self, call: ToolCall) -> PreparedToolCall {
-        match self.handler.classify(&call) {
-            ToolCallPolicy::Allow => PreparedToolCall::ready(self.dispatcher_identity, call),
-            ToolCallPolicy::RequiresApproval { reason } => {
-                PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
-            }
-            ToolCallPolicy::Reject { reason } => PreparedToolCall::rejected(
-                self.dispatcher_identity,
-                call,
-                ToolError {
-                    code: "tool_rejected".to_string(),
-                    message: reason,
-                    retryable: false,
-                },
-            ),
-        }
+        let policy = self.handler.classify(&call);
+        PreparedToolCall::classified(self.dispatcher_identity, call, policy)
     }
 
     fn execute_prepared(

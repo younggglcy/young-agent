@@ -94,6 +94,7 @@ fn explicit_cross_workspace_access_requires_approval() {
     for command in [
         "cat ../outside.txt".to_string(),
         format!("cat {}", outside.display()),
+        "cat ~young/.ssh/config".to_string(),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
             policy.classify(&workspace, &command)
@@ -134,6 +135,7 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         ("", "must not be empty"),
         (oversized.as_str(), "65536 bytes"),
         ("sudo rm -rf target", "privilege elevation"),
+        ("/usr/bin/sudo rm -rf target", "privilege elevation"),
         ("rm -rf /", "filesystem root"),
         ("cd ..", "outside the workspace"),
         ("echo 'unterminated", "malformed shell syntax"),
@@ -162,6 +164,7 @@ fn shell_composition_cannot_hide_a_risky_operation() {
         ("pwd > marker.txt", "redirects input or output"),
         ("echo $(touch marker.txt)", "dynamic shell expansion"),
         ("echo `touch marker.txt`", "dynamic shell expansion"),
+        ("cat *.rs", "dynamic shell expansion"),
         ("rg needle --pre 'touch marker.txt'", "executes a helper"),
         ("cargo test --workspace &", "background"),
         ("cargo test --workspace\nrm -rf target", "destructive"),
@@ -197,6 +200,7 @@ fn composed_read_and_validation_commands_remain_low_risk() {
         "sed -n '1,20p' Cargo.toml",
         "command -v cargo",
         "cargo metadata --no-deps",
+        "cat '*.rs'",
     ] {
         assert_eq!(
             policy.classify(&workspace, command),
@@ -215,6 +219,11 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
     for (command, expected_reason_fragment) in [
         ("git diff --output=diff.txt", "mutate workspace files"),
         ("git grep -O less approval", "executes a helper"),
+        ("git grep -Oless approval", "executes a helper"),
+        (
+            "git grep --open-files-in-pager=less approval",
+            "executes a helper",
+        ),
         ("git diff --ext-diff", "executes a helper"),
         (
             "cargo test --config build.rustc-wrapper=./wrapper",
@@ -229,6 +238,7 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
             "sed -n '1w report.txt' Cargo.toml",
             "mutate workspace files",
         ),
+        ("sed -e'1w marker.txt' 1", "mutate workspace files"),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
             policy.classify(&workspace, command)

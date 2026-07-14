@@ -61,7 +61,7 @@ impl CommandApprovalPolicy {
         if parsed.has_redirection {
             return requires_approval("command redirects input or output");
         }
-        if parsed.has_dynamic_expansion {
+        if parsed.has_dynamic_expansion || parsed.has_pathname_expansion {
             return requires_approval("command uses dynamic shell expansion");
         }
         if parsed.has_comment || parsed.has_unclassified_syntax {
@@ -86,7 +86,7 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     };
     let arguments = &words[1..];
 
-    if matches!(program, "sudo" | "doas" | "su") {
+    if matches!(program_basename(program), "sudo" | "doas" | "su") {
         return reject("command attempts privilege elevation");
     }
     if program == "rm"
@@ -149,7 +149,8 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
             matches!(
                 argument.as_str(),
                 "-O" | "--open-files-in-pager" | "--ext-diff" | "--textconv"
-            )
+            ) || (argument.starts_with("-O") && argument.len() > 2)
+                || argument.starts_with("--open-files-in-pager=")
         })
     {
         return requires_approval("command executes a helper configured by Git");
@@ -186,10 +187,7 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     {
         return requires_approval("command may mutate workspace files or execute a helper");
     }
-    if program == "sed"
-        && sed_program(arguments)
-            .is_some_and(|program| program.contains('w') || program.contains('e'))
-    {
+    if program == "sed" && !is_safe_sed_read(arguments) {
         return requires_approval("command may mutate workspace files or execute a helper");
     }
 
@@ -255,20 +253,64 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
 }
 
 fn is_safe_sed_read(arguments: &[String]) -> bool {
-    let Some(program) = sed_program(arguments) else {
-        return false;
-    };
-    !program.is_empty()
-        && program.chars().all(|character| {
+    let mut scripts = Vec::new();
+    let mut index = 0;
+    let mut implicit_script_seen = false;
+
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        match argument.as_str() {
+            "-n" | "--quiet" | "--silent" => index += 1,
+            "-e" | "--expression" => {
+                let Some(script) = arguments.get(index + 1) else {
+                    return false;
+                };
+                scripts.push(script.as_str());
+                index += 2;
+            }
+            "--" => {
+                index += 1;
+                if scripts.is_empty() {
+                    let Some(script) = arguments.get(index) else {
+                        return false;
+                    };
+                    scripts.push(script.as_str());
+                }
+                break;
+            }
+            _ if argument.starts_with("--expression=") => {
+                scripts.push(&argument["--expression=".len()..]);
+                index += 1;
+            }
+            _ if argument.starts_with("-e") && argument.len() > 2 => {
+                scripts.push(&argument[2..]);
+                index += 1;
+            }
+            _ if argument.starts_with('-') => return false,
+            _ if scripts.is_empty() && !implicit_script_seen => {
+                scripts.push(argument.as_str());
+                implicit_script_seen = true;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+
+    !scripts.is_empty() && scripts.into_iter().all(is_safe_sed_script)
+}
+
+fn is_safe_sed_script(script: &str) -> bool {
+    !script.is_empty()
+        && script.chars().all(|character| {
             character.is_ascii_digit() || matches!(character, ',' | '$' | 'p' | 'q')
         })
 }
 
-fn sed_program(arguments: &[String]) -> Option<&str> {
-    arguments
-        .iter()
-        .find(|argument| !argument.starts_with('-'))
-        .map(String::as_str)
+fn program_basename(program: &str) -> &str {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
 }
 
 #[derive(Default)]
@@ -277,6 +319,7 @@ struct ParsedShellCommand {
     has_background: bool,
     has_redirection: bool,
     has_dynamic_expansion: bool,
+    has_pathname_expansion: bool,
     has_comment: bool,
     has_unclassified_syntax: bool,
 }
@@ -349,6 +392,11 @@ impl ParsedShellCommand {
                     }
                     '$' | '`' | '(' | ')' | '{' | '}' => {
                         parsed.has_dynamic_expansion = true;
+                        word.push(character);
+                        word_started = true;
+                    }
+                    '*' | '?' | '[' => {
+                        parsed.has_pathname_expansion = true;
                         word.push(character);
                         word_started = true;
                     }
@@ -434,7 +482,7 @@ fn path_candidate(word: &str) -> Option<&str> {
 }
 
 fn escapes_workspace(workspace: &CodingWorkspace, candidate: &str) -> bool {
-    if candidate == "~" || candidate.starts_with("~/") {
+    if candidate.starts_with('~') {
         return true;
     }
     let path = Path::new(candidate);
