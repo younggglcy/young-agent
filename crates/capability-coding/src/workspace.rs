@@ -31,6 +31,17 @@ thread_local! {
 pub(crate) const MAX_FILE_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const RECOVERY_DIRECTORY: &str = ".young-agent-recovery";
 
+pub(crate) fn ensure_atomic_patch_supported() -> io::Result<()> {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "safe atomic patching is not supported on this platform",
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct CodingWorkspace {
     context: Arc<WorkspaceContext>,

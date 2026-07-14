@@ -35,6 +35,36 @@ impl Drop for TestWorkspace {
 }
 
 #[test]
+fn patch_platform_preflight_runs_before_patch_parsing() {
+    let root = TestWorkspace::new();
+    let workspace = CodingWorkspace::resolve(&root.0).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("unsupported-invalid-patch"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({ "patch": "not a unified diff" }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, .. } = result.output else {
+        panic!("unsupported patch platform must fail before parsing");
+    };
+    assert_eq!(error.code, "unsupported_file_metadata");
+    assert_eq!(
+        error.message,
+        "safe atomic patching is not supported on this platform"
+    );
+}
+
+#[test]
 fn existing_file_patch_fails_closed_when_metadata_validation_is_unsupported() {
     let root = TestWorkspace::new();
     std::fs::write(root.0.join("notes.txt"), "old\n").expect("fixture is written");

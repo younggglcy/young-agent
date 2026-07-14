@@ -13,8 +13,8 @@ use crate::tool_support::{
     ToolArguments,
 };
 use crate::workspace::{
-    AtomicCreateError, AtomicReplaceError, CodingWorkspace, PublishedRecovery, WorkspacePathError,
-    MAX_FILE_SNAPSHOT_BYTES,
+    ensure_atomic_patch_supported, AtomicCreateError, AtomicReplaceError, CodingWorkspace,
+    PublishedRecovery, WorkspacePathError, MAX_FILE_SNAPSHOT_BYTES,
 };
 
 const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -43,6 +43,9 @@ pub(crate) fn execute(
         }
         Err(output) => return output,
     };
+    if let Err(error) = ensure_atomic_patch_supported() {
+        return failure("unsupported_file_metadata", error.to_string(), false);
+    }
     let result = match apply_unified_patch(workspace, patch, cancellation) {
         Ok(result) => result,
         Err(error) => return error.into_output(),
