@@ -148,6 +148,17 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     {
         return requires_approval("command executes a helper configured by Git");
     }
+    if program == "git"
+        && matches!(
+            arguments.first().map(String::as_str),
+            Some("diff" | "log" | "show")
+        )
+        && !git_patch_helpers_disabled(arguments)
+    {
+        return requires_approval(
+            "command executes a helper configured by Git unless explicitly disabled",
+        );
+    }
     if program == "cargo"
         && arguments
             .iter()
@@ -305,6 +316,11 @@ fn is_file_compile_option(argument: &str) -> bool {
 
 fn short_option_cluster_contains(argument: &str, option: char) -> bool {
     argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains(option)
+}
+
+fn git_patch_helpers_disabled(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| argument == "--no-textconv")
+        && arguments.iter().any(|argument| argument == "--no-ext-diff")
 }
 
 fn long_option_matches_or_abbreviates(argument: &str, full_option: &str) -> bool {

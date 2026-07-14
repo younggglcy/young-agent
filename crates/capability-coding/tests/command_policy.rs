@@ -12,7 +12,7 @@ fn low_risk_read_and_validation_commands_are_allowed() {
     for command in [
         "pwd",
         "git status --short",
-        "git diff -- Cargo.toml",
+        "git diff --no-textconv --no-ext-diff -- Cargo.toml",
         "cargo check --workspace",
         "cargo test --workspace",
         "cargo clippy --workspace --all-targets",
@@ -220,6 +220,9 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
 
     for (command, expected_reason_fragment) in [
         ("git diff --output=diff.txt", "mutate workspace files"),
+        ("git diff -- Cargo.toml", "executes a helper"),
+        ("git log -p", "executes a helper"),
+        ("git show HEAD", "executes a helper"),
         ("git grep -O less approval", "executes a helper"),
         ("git grep -Oless approval", "executes a helper"),
         (
