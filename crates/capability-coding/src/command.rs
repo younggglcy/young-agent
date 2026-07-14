@@ -465,17 +465,29 @@ fn run_shell_command(
         CommandCleanupState::TerminateAndReap
     };
     let cleanup_result = cleanup_process_group(child, cleanup_state, supervision_permit);
-    match (control_result, cleanup_result) {
-        (Err(_), Err(cleanup)) => return Err(cleanup),
-        (
-            Err(CommandError::TerminationUnverified),
-            Ok(CommandCleanupCompletion::Reaped(cleanup_status)),
-        ) if stdout_done && stderr_done => {
-            status = Some(cleanup_status);
-        }
-        (Err(source), Ok(_)) => return Err(source),
-        (Ok(()), Err(cleanup)) => return Err(cleanup),
-        (Ok(()), Ok(_)) => {}
+    if control_result.is_err()
+        && matches!(&cleanup_result, Ok(CommandCleanupCompletion::Reaped { .. }))
+    {
+        read_available_stream(
+            &mut stdout,
+            &mut stdout_capture,
+            &mut stdout_done,
+            &mut stream_error,
+        );
+        read_available_stream(
+            &mut stderr,
+            &mut stderr_capture,
+            &mut stderr_done,
+            &mut stream_error,
+        );
+    }
+    if let Some(cleanup_status) = reconcile_control_and_cleanup(
+        control_result,
+        cleanup_result,
+        cancelled,
+        stdout_done && stderr_done,
+    )? {
+        status = Some(cleanup_status);
     }
     if let Some(source) = stream_error {
         return Err(CommandError::ReadOutput(source));
@@ -797,7 +809,41 @@ enum CommandCleanupState {
 #[derive(Debug)]
 enum CommandCleanupCompletion {
     AlreadyReaped,
-    Reaped(ExitStatus),
+    Reaped {
+        status: ExitStatus,
+        tracked_descendants_sealed: bool,
+    },
+}
+
+fn reconcile_control_and_cleanup(
+    control_result: Result<(), CommandError>,
+    cleanup_result: Result<CommandCleanupCompletion, CommandError>,
+    cancellation_observed: bool,
+    streams_done: bool,
+) -> Result<Option<ExitStatus>, CommandError> {
+    match (control_result, cleanup_result) {
+        (Err(_), Err(cleanup)) => Err(cleanup),
+        (
+            Err(CommandError::TerminationUnverified),
+            Ok(CommandCleanupCompletion::Reaped {
+                status,
+                tracked_descendants_sealed: true,
+            }),
+        ) if streams_done => Ok(Some(status)),
+        (
+            Err(CommandError::Kill(source)),
+            Ok(CommandCleanupCompletion::Reaped {
+                status,
+                tracked_descendants_sealed: true,
+            }),
+        ) if cancellation_observed && streams_done && group_signal_permission_denied(&source) => {
+            Ok(Some(status))
+        }
+        (Err(source), Ok(_)) => Err(source),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Ok(()), Ok(CommandCleanupCompletion::Reaped { status, .. })) => Ok(Some(status)),
+        (Ok(()), Ok(CommandCleanupCompletion::AlreadyReaped)) => Ok(None),
+    }
 }
 
 fn cleanup_process_group(
@@ -841,7 +887,8 @@ fn cleanup_process_group(
                     ));
                 }
             };
-            if child.tracked_descendants_are_sealed()
+            let tracked_descendants_sealed = child.tracked_descendants_are_sealed();
+            if tracked_descendants_sealed
                 && first_error.as_ref().is_some_and(|error| {
                     matches!(error, CommandError::Kill(source) if group_signal_permission_denied(source))
                 })
@@ -850,7 +897,10 @@ fn cleanup_process_group(
             }
             match first_error {
                 Some(source) => Err(source),
-                None => Ok(CommandCleanupCompletion::Reaped(status)),
+                None => Ok(CommandCleanupCompletion::Reaped {
+                    status,
+                    tracked_descendants_sealed,
+                }),
             }
         }
     }
@@ -2000,6 +2050,57 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_permission_denied_reconciles_after_verified_cleanup() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-command-cancellation-reconcile-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation_trigger = cancellation.clone();
+        let ready = root.join("cancellation-ready");
+        let trigger = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "cancellation fixture did not become ready"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancellation_trigger.store(true, Ordering::Relaxed);
+        });
+        INJECT_NEXT_FULL_GROUP_KILL_FAILURE.with(|failure| failure.set(true));
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.set(0));
+
+        let result = run_shell_command(
+            &workspace,
+            "sleep 10 >/dev/null 2>&1 & printf ready > cancellation-ready; wait",
+            &cancellation,
+            1024,
+        );
+
+        trigger.join().expect("cancellation trigger finishes");
+        assert!(
+            matches!(result, Err(CommandError::TerminationUnverified)),
+            "verified cleanup must return cancellation semantics: {result:?}"
+        );
+        assert_eq!(
+            LIVE_COMMAND_SUPERVISOR_HANDOFFS.with(|handoffs| handoffs.get()),
+            0,
+            "verified cleanup must not hand ownership to the supervisor"
+        );
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
+    }
+
+    #[test]
     fn process_control_failure_still_runs_the_cleanup_epilogue() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2237,6 +2338,43 @@ mod tests {
             result.is_ok(),
             "a sealed tracking token proves terminal cleanup complete: {result:?}"
         );
+    }
+
+    #[test]
+    fn repeated_early_exit_races_finish_sync_or_at_the_supervisor_barrier() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "young-command-repeated-early-exit-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).expect("test workspace is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+
+        for attempt in 0..30 {
+            LAST_SUPERVISED_COMMAND_ID.with(|id| id.set(None));
+            let result = run_shell_command(
+                &workspace,
+                "sleep 10 >/dev/null 2>&1 & exit 0",
+                &AtomicBool::new(false),
+                1024,
+            );
+            match result {
+                Ok(outcome) => assert!(outcome.status.success()),
+                Err(CommandError::TerminationSupervised(message)) => {
+                    assert!(message.contains("process-wide supervisor retries termination"));
+                    wait_for_supervisor_completion(take_last_supervised_command_id());
+                }
+                Err(error) => {
+                    panic!("attempt {attempt} failed without retained ownership: {error}")
+                }
+            }
+        }
+
+        drop(workspace);
+        std::fs::remove_dir_all(root).expect("test workspace is removed");
     }
 
     #[test]

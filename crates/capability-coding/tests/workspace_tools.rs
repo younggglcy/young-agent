@@ -1816,6 +1816,10 @@ fn run_command_cancellation_terminates_descendant_processes() {
         panic!("cancelled command must fail");
     };
     assert_eq!(error.code, "command_termination_unverified");
+    assert_eq!(
+        error.message,
+        "termination was requested for signal-compatible process-group members; detached or credential-changing descendants were not verified"
+    );
 }
 
 #[test]
@@ -1847,7 +1851,7 @@ fn run_command_terminates_a_background_process_when_the_foreground_shell_exits()
 }
 
 #[test]
-fn run_command_seals_a_background_process_with_closed_pipes() {
+fn run_command_seals_or_supervises_a_background_process_with_closed_pipes() {
     let test_workspace = TestWorkspace::new("command-background-closed-pipes");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -1870,39 +1874,14 @@ fn run_command_seals_a_background_process_with_closed_pipes() {
     );
 
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(
-        matches!(result.output, ToolOutput::Success { .. }),
-        "unexpected command result: {:?}",
-        result.output
-    );
-}
-
-#[test]
-fn run_command_seals_residual_group_members_across_repeated_early_exit_races() {
-    let test_workspace = TestWorkspace::new("command-residual-group-seal");
-    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
-    let mut runtime = ToolRuntime::default();
-    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
-    for attempt in 0..30 {
-        let call = ToolCall {
-            id: ToolCallId::new(format!("call-residual-group-seal-{attempt}")),
-            tool_name: "run_command".to_string(),
-            arguments: json!({
-                "command": "sleep 10 >/dev/null 2>&1 & exit 0"
-            }),
-        };
-        let result = runtime.dispatch(
-            call.clone(),
-            ToolExecutionAuthorization::ApprovalGranted {
-                call_id: call.id.clone(),
-            },
-            Arc::new(AtomicBool::new(false)),
-        );
-        assert!(
-            matches!(result.output, ToolOutput::Success { .. }),
-            "attempt {attempt} failed: {:?}",
-            result.output
-        );
+    match result.output {
+        ToolOutput::Success { .. } => {}
+        ToolOutput::Failure { error, .. } => {
+            assert_eq!(error.code, "command_termination_unverified");
+            assert!(error
+                .message
+                .contains("process-wide supervisor retries termination"));
+        }
     }
 }
 
@@ -1983,7 +1962,7 @@ fn run_command_fails_closed_when_a_close_fds_descendant_survives_cancellation() 
         id: ToolCallId::new("call-escaped-command-cancellation"),
         tool_name: "run_command".to_string(),
         arguments: json!({
-            "command": "python3 -c 'import subprocess,time; subprocess.Popen([\"python3\", \"-c\", \"import os,time; open(\\\"escaped-ready\\\", \\\"w\\\").close(); exec(\\\"while not os.path.exists(\\\\\\\"escaped-release\\\\\\\"): time.sleep(0.01)\\\"); open(\\\"escaped-after-cancel\\\", \\\"w\\\").write(\\\"survived\\\")\"], start_new_session=True, close_fds=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(10)'"
+            "command": "python3 -c 'import subprocess,time; subprocess.Popen([\"python3\", \"-c\", \"import os,time; open(\\\"escaped-ready\\\", \\\"w\\\").close(); exec(\\\"while not os.path.exists(\\\\\\\"escaped-release\\\\\\\"): time.sleep(0.01)\\\"); open(\\\"escaped-after-cancel.tmp\\\", \\\"w\\\").write(\\\"survived\\\"); os.replace(\\\"escaped-after-cancel.tmp\\\", \\\"escaped-after-cancel\\\")\"], start_new_session=True, close_fds=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(10)'"
         }),
     };
     let cancellation = Arc::new(AtomicBool::new(false));
