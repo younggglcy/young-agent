@@ -125,20 +125,26 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     {
         return requires_approval("command may mutate workspace files");
     }
+    if matches!(words, [cargo, operation, arguments @ ..]
+        if cargo == "cargo"
+            && operation == "clippy"
+            && arguments.iter().any(|argument| argument == "--fix"))
+    {
+        return requires_approval("command may mutate workspace files");
+    }
     if program == "git"
         && arguments
             .iter()
-            .any(|argument| argument == "--output" || argument.starts_with("--output="))
+            .any(|argument| long_option_matches_or_abbreviates(argument, "--output"))
     {
         return requires_approval("command may mutate workspace files");
     }
     if program == "git"
         && arguments.iter().any(|argument| {
-            matches!(
-                argument.as_str(),
-                "-O" | "--open-files-in-pager" | "--ext-diff" | "--textconv"
-            ) || (argument.starts_with("-O") && argument.len() > 2)
-                || argument.starts_with("--open-files-in-pager=")
+            short_option_cluster_contains(argument, 'O')
+                || long_option_matches_or_abbreviates(argument, "--open-files-in-pager")
+                || long_option_matches_or_abbreviates(argument, "--ext-diff")
+                || long_option_matches_or_abbreviates(argument, "--textconv")
         })
     {
         return requires_approval("command executes a helper configured by Git");
@@ -158,11 +164,57 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
         return requires_approval("command may mutate workspace files");
     }
     if program == "rg"
-        && arguments
-            .iter()
-            .any(|argument| argument == "--pre" || argument.starts_with("--pre="))
+        && arguments.iter().any(|argument| {
+            long_option_matches_or_abbreviates(argument, "--pre")
+                || long_option_matches_or_abbreviates(argument, "--search-zip")
+                || short_option_cluster_contains(argument, 'z')
+        })
     {
         return requires_approval("command executes a helper while searching files");
+    }
+    if (program == "rg"
+        && arguments.iter().any(|argument| {
+            long_option_matches_or_abbreviates(argument, "--follow")
+                || short_option_cluster_contains(argument, 'L')
+        }))
+        || (program == "grep"
+            && arguments.iter().any(|argument| {
+                long_option_matches_or_abbreviates(argument, "--dereference-recursive")
+                    || short_option_cluster_contains(argument, 'R')
+            }))
+        || (program == "find"
+            && arguments.iter().any(|argument| {
+                matches!(argument.as_str(), "-L" | "-follow")
+                    || argument.starts_with("-files0-from")
+            }))
+        || (program == "file"
+            && arguments.iter().any(|argument| {
+                argument == "-f"
+                    || short_option_cluster_contains(argument, 'f')
+                    || long_option_matches_or_abbreviates(argument, "--files-from")
+            }))
+        || (program == "wc"
+            && arguments
+                .iter()
+                .any(|argument| long_option_matches_or_abbreviates(argument, "--files0-from")))
+        || (program == "ls"
+            && arguments.iter().any(|argument| {
+                short_option_cluster_contains(argument, 'L')
+                    || long_option_matches_or_abbreviates(argument, "--dereference")
+            }))
+    {
+        return requires_approval("command may follow or load paths outside the workspace");
+    }
+    if program == "tail"
+        && arguments.iter().any(|argument| {
+            short_option_cluster_contains(argument, 'f')
+                || short_option_cluster_contains(argument, 'F')
+                || long_option_matches_or_abbreviates(argument, "--follow")
+                || long_option_matches_or_abbreviates(argument, "--retry")
+                || long_option_matches_or_abbreviates(argument, "--pid")
+        })
+    {
+        return requires_approval("command starts a long-running file monitor");
     }
     if program == "find"
         && arguments.iter().any(|argument| {
@@ -248,8 +300,17 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
 }
 
 fn is_file_compile_option(argument: &str) -> bool {
-    argument == "--compile"
+    long_option_matches_or_abbreviates(argument, "--compile")
         || (argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains('C'))
+}
+
+fn short_option_cluster_contains(argument: &str, option: char) -> bool {
+    argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains(option)
+}
+
+fn long_option_matches_or_abbreviates(argument: &str, full_option: &str) -> bool {
+    let name = argument.split_once('=').map_or(argument, |(name, _)| name);
+    name.starts_with("--") && name.len() > 2 && full_option.starts_with(name)
 }
 
 fn classify_hard_rejection(

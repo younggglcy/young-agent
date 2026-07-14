@@ -227,6 +227,10 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
             "git grep --open-files-in-pager=less approval",
             "executes a helper",
         ),
+        (
+            "git grep --open-files-in=less approval",
+            "executes a helper",
+        ),
         ("git diff --ext-diff", "executes a helper"),
         (
             "cargo test --config build.rustc-wrapper=./wrapper",
@@ -234,7 +238,12 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
         ),
         ("find . -fprint report.txt", "mutate workspace files"),
         ("file --compile -m magic", "mutate workspace files"),
+        ("file --comp -m magic", "mutate workspace files"),
         ("file -Cm magic", "mutate workspace files"),
+        ("rg -z needle archive.gz", "executes a helper"),
+        ("rg -iz needle archive.gz", "executes a helper"),
+        ("rg --search-zip needle archive.gz", "executes a helper"),
+        ("cargo clippy --fix", "mutate workspace files"),
         (
             "find . -fprintf report.txt '%p\\n'",
             "mutate workspace files",
@@ -253,6 +262,36 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
         assert!(
             reason.contains(expected_reason_fragment),
             "approval reason '{reason}' should describe command: {command}",
+        );
+    }
+}
+
+#[test]
+fn recursive_and_indirect_read_modes_require_approval() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+
+    for command in [
+        "rg -L needle .",
+        "rg --follow needle .",
+        "grep -R needle .",
+        "grep --dereference-recursive needle .",
+        "find -L . -name '*.rs'",
+        "find . -follow -name '*.rs'",
+        "file --files-from paths.txt",
+        "file -f paths.txt",
+        "wc --files0-from=paths.txt",
+        "find -files0-from paths.txt",
+        "ls -LR .",
+        "tail -F app.log",
+    ] {
+        assert!(
+            matches!(
+                policy.classify(&workspace, command),
+                CommandPolicyDecision::RequiresApproval { .. }
+            ),
+            "expected risky read mode to require approval: {command}",
         );
     }
 }
