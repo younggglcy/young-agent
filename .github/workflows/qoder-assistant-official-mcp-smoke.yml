@@ -24,6 +24,8 @@ jobs:
         id: qoder
         continue-on-error: true
         uses: younggglcy/qoder-action@codex/use-official-github-mcp
+        env:
+          ACTIONS_STEP_DEBUG: 'true'
         with:
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           flags: --model ultimate
@@ -34,7 +36,7 @@ jobs:
             THREAD_ID:official-mcp-assistant-smoke
             COMMENT_ID:0
             AUTHOR:${{ github.actor }}
-            BODY:请读取并概括当前测试 PR，确认使用官方 GitHub MCP 完成读取，并在最终回复中包含 [official-mcp-assistant-smoke]。
+            BODY:请读取并概括当前测试 PR，确认使用官方 GitHub MCP 完成读取，并在最终回复中包含 [official-mcp-assistant-smoke]。必须尝试发布一次最终评论；如果失败，最多重试一次，并在终端最终回复中完整写明工具返回的错误。
             URL:${{ github.event.pull_request.html_url }}
             IS_PR:true
             ISSUE_OR_PR_NUMBER:${{ github.event.pull_request.number }}
@@ -45,10 +47,18 @@ jobs:
         env:
           QODER_OUTPUT_FILE: ${{ steps.qoder.outputs.output_file }}
         run: |
-          echo "Current GitHub MCP entry:"
-          jq -S '.mcpServers.github // null' "${HOME}/.qoder.json"
-          echo "Temporary GitHub MCP entry from recovery journal:"
-          jq -S '.temporary_github // null' "${HOME}/.qoder-action-github-mcp-backup.json"
+          if [[ -f "${HOME}/.qoder.json" ]]; then
+            echo "Current GitHub MCP entry:"
+            jq -S '.mcpServers.github // null' "${HOME}/.qoder.json"
+          else
+            echo "Qoder configuration was restored and removed."
+          fi
+          if [[ -f "${HOME}/.qoder-action-github-mcp-backup.json" ]]; then
+            echo "Temporary GitHub MCP entry from recovery journal:"
+            jq -S '.temporary_github // null' "${HOME}/.qoder-action-github-mcp-backup.json"
+          else
+            echo "GitHub MCP recovery journal was consumed."
+          fi
 
           if [[ -n "${QODER_OUTPUT_FILE}" && -f "${QODER_OUTPUT_FILE}" ]]; then
             echo "GitHub MCP tool results:"
@@ -69,6 +79,12 @@ jobs:
               | select((.type // "") | test("function_result|tool_result"))
               | redact
             ' "${QODER_OUTPUT_FILE}"
+            echo "Qoder stream event shapes:"
+            jq -c '{
+              type,
+              subtype,
+              content_types: [.message.content[]? | .type]
+            }' "${QODER_OUTPUT_FILE}"
           fi
 
       - name: Preserve Qoder failure status
