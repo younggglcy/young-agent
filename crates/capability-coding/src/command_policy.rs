@@ -1,10 +1,14 @@
 use crate::workspace::CodingWorkspace;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use young_tool_runtime::ToolCall;
 
 pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_SIMPLE_COMMANDS: usize = 32;
 const MAX_POLICY_WORDS: usize = 256;
+const MAX_PATH_PROBE_CANDIDATES: usize = 256;
+const MAX_WORKSPACE_PATH_INSPECTIONS: usize = 256;
+const MAX_LOW_RISK_PRINTF_FORMAT_BYTES: usize = 1024;
 
 /// Result of classifying one concrete `run_command` invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,23 +44,24 @@ impl CommandApprovalPolicy {
     }
 
     pub fn classify(&self, workspace: &CodingWorkspace, command: &str) -> CommandPolicyDecision {
-        if command.trim().is_empty() {
-            return reject("command must not be empty");
-        }
         if command.len() > MAX_COMMAND_BYTES {
             return reject("command exceeds the 65536 bytes policy limit");
         }
+        if command.trim().is_empty() {
+            return reject("command must not be empty");
+        }
         let parsed = match ParsedShellCommand::parse(command) {
             Ok(parsed) => parsed,
-            Err(()) => return reject("command contains malformed shell syntax"),
+            Err(ShellParseError::Malformed) => {
+                return reject("command contains malformed shell syntax");
+            }
+            Err(ShellParseError::TooComplex) => {
+                return reject("command is too complex for the first-phase approval policy");
+            }
         };
-        if parsed.commands.len() > MAX_SIMPLE_COMMANDS
-            || parsed.commands.iter().map(Vec::len).sum::<usize>() > MAX_POLICY_WORDS
-        {
-            return reject("command is too complex for the first-phase approval policy");
-        }
+        let mut path_probes = PathProbeBudget::default();
         for words in &parsed.commands {
-            if let Some(decision) = classify_hard_rejection(workspace, words) {
+            if let Some(decision) = classify_hard_rejection(workspace, words, &mut path_probes) {
                 return decision;
             }
         }
@@ -76,7 +81,7 @@ impl CommandApprovalPolicy {
         }
 
         for words in &parsed.commands {
-            match classify_simple_command(workspace, words) {
+            match classify_simple_command(workspace, words, &mut path_probes) {
                 CommandPolicyDecision::Allow => {}
                 decision => return decision,
             }
@@ -85,17 +90,66 @@ impl CommandApprovalPolicy {
     }
 }
 
-fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> CommandPolicyDecision {
+fn classify_simple_command(
+    workspace: &CodingWorkspace,
+    words: &[String],
+    path_probes: &mut PathProbeBudget,
+) -> CommandPolicyDecision {
     let Some(program) = words.first().map(String::as_str) else {
         return reject("command contains malformed shell syntax");
     };
     let arguments = &words[1..];
 
-    if path_bearing_option_escapes(workspace, program, arguments) {
-        return requires_approval("command may access a path outside the workspace");
+    if program == "file" && file_may_execute_uncompress_helper(arguments) {
+        return requires_approval("command executes a helper while inspecting compressed files");
     }
-    if arguments_escape_workspace(workspace, arguments) {
-        return requires_approval("command may access a path outside the workspace");
+    if program == "git"
+        && arguments
+            .iter()
+            .any(|argument| long_option_matches_or_abbreviates(argument, "--output"))
+    {
+        return requires_approval("command may mutate workspace files");
+    }
+    if program == "git" && git_may_use_signature_verification(arguments) {
+        return requires_approval("command executes configured signature verification tooling");
+    }
+    if program == "git"
+        && arguments.iter().any(|argument| {
+            short_option_cluster_contains(argument, 'O')
+                || long_option_matches_or_abbreviates(argument, "--open-files-in-pager")
+                || long_option_matches_or_abbreviates(argument, "--ext-diff")
+                || long_option_matches_or_abbreviates(argument, "--textconv")
+        })
+    {
+        return requires_approval("command executes a helper configured by Git");
+    }
+    if program == "git"
+        && matches!(
+            arguments.first().map(String::as_str),
+            Some("status" | "diff" | "ls-files" | "grep")
+        )
+    {
+        return requires_approval(
+            "command may invoke Git's configured fsmonitor helper or start its daemon",
+        );
+    }
+    match classify_path_bearing_options(workspace, program, arguments, path_probes) {
+        PathClassification::WithinWorkspace => {}
+        PathClassification::EscapesWorkspace => {
+            return requires_approval("command may access a path outside the workspace");
+        }
+        PathClassification::BudgetExceeded => {
+            return requires_approval("command exceeds the workspace path inspection budget");
+        }
+    }
+    match classify_argument_paths(workspace, arguments, path_probes) {
+        PathClassification::WithinWorkspace => {}
+        PathClassification::EscapesWorkspace => {
+            return requires_approval("command may access a path outside the workspace");
+        }
+        PathClassification::BudgetExceeded => {
+            return requires_approval("command exceeds the workspace path inspection budget");
+        }
     }
     if matches!(
         words,
@@ -131,44 +185,6 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     {
         return requires_approval("command may mutate workspace files");
     }
-    if program == "git"
-        && arguments
-            .iter()
-            .any(|argument| long_option_matches_or_abbreviates(argument, "--output"))
-    {
-        return requires_approval("command may mutate workspace files");
-    }
-    if program == "git"
-        && arguments.iter().any(|argument| {
-            short_option_cluster_contains(argument, 'O')
-                || long_option_matches_or_abbreviates(argument, "--open-files-in-pager")
-                || long_option_matches_or_abbreviates(argument, "--ext-diff")
-                || long_option_matches_or_abbreviates(argument, "--textconv")
-        })
-    {
-        return requires_approval("command executes a helper configured by Git");
-    }
-    if program == "git"
-        && matches!(
-            arguments.first().map(String::as_str),
-            Some("diff" | "log" | "show")
-        )
-        && !git_patch_helpers_disabled(arguments)
-    {
-        return requires_approval(
-            "command executes a helper configured by Git unless explicitly disabled",
-        );
-    }
-    if program == "git"
-        && matches!(
-            arguments.first().map(String::as_str),
-            Some("status" | "diff")
-        )
-    {
-        return requires_approval(
-            "command may invoke Git's configured fsmonitor helper or start its daemon",
-        );
-    }
     if program == "cargo"
         && arguments
             .iter()
@@ -191,6 +207,11 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
         })
     {
         return requires_approval("command executes a helper while searching files");
+    }
+    if program == "rg" && arguments.first().map(String::as_str) != Some("--no-config") {
+        return requires_approval(
+            "command may execute a preprocessor from inherited configuration",
+        );
     }
     if (program == "rg"
         && arguments.iter().any(|argument| {
@@ -236,12 +257,15 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     {
         return requires_approval("command starts a long-running file monitor");
     }
-    if program == "printf"
-        && arguments.first().is_some_and(|argument| {
+    if program == "printf" {
+        if arguments.first().is_some_and(|argument| {
             argument == "-v" || (argument.starts_with("-v") && argument.len() > 2)
-        })
-    {
-        return requires_approval("command changes a shell variable");
+        }) {
+            return requires_approval("command changes a shell variable");
+        }
+        if printf_format_may_amplify_output(arguments) {
+            return requires_approval("command may amplify output without a fixed resource bound");
+        }
     }
     if program == "find"
         && arguments.iter().any(|argument| {
@@ -267,15 +291,7 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
 
     let allowed = match words {
         [program] if program == "pwd" => true,
-        [git, subcommand, ..]
-            if git == "git"
-                && matches!(
-                    subcommand.as_str(),
-                    "diff" | "log" | "show" | "rev-parse" | "ls-files" | "grep"
-                ) =>
-        {
-            true
-        }
+        [git, subcommand, ..] if git == "git" && subcommand == "rev-parse" => true,
         [git, branch, option]
             if git == "git" && branch == "branch" && option == "--show-current" =>
         {
@@ -331,13 +347,52 @@ fn is_file_compile_option(argument: &str) -> bool {
         || (argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains('C'))
 }
 
+fn file_may_execute_uncompress_helper(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        short_option_cluster_contains(argument, 'z')
+            || short_option_cluster_contains(argument, 'Z')
+            || long_option_matches_or_abbreviates(argument, "--uncompress")
+            || long_option_matches_or_abbreviates(argument, "--uncompress-noreport")
+    })
+}
+
 fn short_option_cluster_contains(argument: &str, option: char) -> bool {
     argument.starts_with('-') && !argument.starts_with("--") && argument[1..].contains(option)
 }
 
-fn git_patch_helpers_disabled(arguments: &[String]) -> bool {
-    arguments.iter().any(|argument| argument == "--no-textconv")
-        && arguments.iter().any(|argument| argument == "--no-ext-diff")
+fn git_may_use_signature_verification(arguments: &[String]) -> bool {
+    matches!(arguments.first().map(String::as_str), Some("log" | "show"))
+        || arguments.iter().any(|argument| {
+            long_option_matches_or_abbreviates(argument, "--show-signature")
+                || argument.as_bytes().windows(2).any(|window| window == b"%G")
+        })
+}
+
+fn printf_format_may_amplify_output(arguments: &[String]) -> bool {
+    let (format, operands) = match arguments {
+        [separator, format, operands @ ..] if separator == "--" => (format, operands),
+        [format, operands @ ..] => (format, operands),
+        [] => return false,
+    };
+    if format.len() > MAX_LOW_RISK_PRINTF_FORMAT_BYTES && operands.len() > 1 {
+        return true;
+    }
+    let mut in_directive = false;
+
+    for character in format.chars() {
+        if !in_directive {
+            in_directive = character == '%';
+            continue;
+        }
+        match character {
+            '%' => in_directive = false,
+            '*' => return true,
+            character if character.is_ascii_digit() => return true,
+            character if character.is_ascii_alphabetic() => in_directive = false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn long_option_matches_or_abbreviates(argument: &str, full_option: &str) -> bool {
@@ -345,60 +400,131 @@ fn long_option_matches_or_abbreviates(argument: &str, full_option: &str) -> bool
     name.starts_with("--") && name.len() > 2 && full_option.starts_with(name)
 }
 
-fn path_bearing_option_escapes(
-    workspace: &CodingWorkspace,
-    program: &str,
-    arguments: &[String],
-) -> bool {
-    match (program, arguments) {
-        ("rg" | "grep", arguments) => {
-            option_path_escapes(workspace, arguments, 'f', "--file", false)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathClassification {
+    WithinWorkspace,
+    EscapesWorkspace,
+    BudgetExceeded,
+}
+
+struct PathProbeBudget {
+    remaining_candidates: usize,
+    remaining_inspections: usize,
+    cached: HashMap<String, bool>,
+}
+
+impl Default for PathProbeBudget {
+    fn default() -> Self {
+        Self {
+            remaining_candidates: MAX_PATH_PROBE_CANDIDATES,
+            remaining_inspections: MAX_WORKSPACE_PATH_INSPECTIONS,
+            cached: HashMap::new(),
         }
-        ("git", [subcommand, arguments @ ..]) if subcommand == "grep" => {
-            option_path_escapes(workspace, arguments, 'f', "--file", false)
-        }
-        ("git", [subcommand, arguments @ ..]) if subcommand == "ls-files" => {
-            option_path_escapes(workspace, arguments, 'X', "--exclude-from", false)
-        }
-        ("file", arguments) => {
-            option_path_escapes(workspace, arguments, 'm', "--magic-file", true)
-                || option_path_escapes(workspace, arguments, 'M', "--magic-file", true)
-        }
-        _ => false,
     }
 }
 
-fn option_path_escapes(
+impl PathProbeBudget {
+    fn classify(&mut self, workspace: &CodingWorkspace, candidate: &str) -> PathClassification {
+        if let Some(escapes) = self.cached.get(candidate) {
+            return if *escapes {
+                PathClassification::EscapesWorkspace
+            } else {
+                PathClassification::WithinWorkspace
+            };
+        }
+        if self.remaining_candidates == 0 {
+            return PathClassification::BudgetExceeded;
+        }
+        self.remaining_candidates -= 1;
+        let Some(escapes) =
+            escapes_workspace(workspace, candidate, &mut self.remaining_inspections)
+        else {
+            return PathClassification::BudgetExceeded;
+        };
+        self.cached.insert(candidate.to_string(), escapes);
+        if escapes {
+            PathClassification::EscapesWorkspace
+        } else {
+            PathClassification::WithinWorkspace
+        }
+    }
+}
+
+fn classify_path_bearing_options(
+    workspace: &CodingWorkspace,
+    program: &str,
+    arguments: &[String],
+    path_probes: &mut PathProbeBudget,
+) -> PathClassification {
+    match (program, arguments) {
+        ("rg" | "grep", arguments) => {
+            classify_option_paths(workspace, arguments, &['f'], "--file", false, path_probes)
+        }
+        ("git", [subcommand, arguments @ ..]) if subcommand == "grep" => {
+            classify_option_paths(workspace, arguments, &['f'], "--file", false, path_probes)
+        }
+        ("git", [subcommand, arguments @ ..]) if subcommand == "ls-files" => classify_option_paths(
+            workspace,
+            arguments,
+            &['X'],
+            "--exclude-from",
+            false,
+            path_probes,
+        ),
+        ("file", arguments) => classify_option_paths(
+            workspace,
+            arguments,
+            &['m', 'M'],
+            "--magic-file",
+            true,
+            path_probes,
+        ),
+        _ => PathClassification::WithinWorkspace,
+    }
+}
+
+fn classify_option_paths(
     workspace: &CodingWorkspace,
     arguments: &[String],
-    short_option: char,
+    short_options: &[char],
     long_option: &str,
     colon_separated: bool,
-) -> bool {
+    path_probes: &mut PathProbeBudget,
+) -> PathClassification {
+    let mut values = Vec::new();
     for (index, argument) in arguments.iter().enumerate() {
-        let value = if is_exact_short_option(argument, short_option)
+        let value = if short_options
+            .iter()
+            .any(|option| is_exact_short_option(argument, *option))
             || long_option_matches_or_abbreviates(argument, long_option) && !argument.contains('=')
         {
             arguments.get(index + 1).map(String::as_str)
         } else if let Some((_, value)) = argument.split_once('=') {
             long_option_matches_or_abbreviates(argument, long_option).then_some(value)
         } else {
-            attached_short_option_value(argument, short_option)
+            attached_short_option_value(argument, short_options)
         };
-
-        if value.is_some_and(|value| {
-            if colon_separated {
-                value
-                    .split(':')
-                    .any(|path| escapes_workspace(workspace, path))
-            } else {
-                escapes_workspace(workspace, value)
-            }
-        }) {
-            return true;
+        if let Some(value) = value {
+            values.push(value);
         }
     }
-    false
+
+    if colon_separated {
+        for path in values.into_iter().flat_map(|value| value.split(':')) {
+            let classification = path_probes.classify(workspace, path);
+            if classification != PathClassification::WithinWorkspace {
+                return classification;
+            }
+        }
+    } else {
+        for path in values {
+            let classification = path_probes.classify(workspace, path);
+            if classification != PathClassification::WithinWorkspace {
+                return classification;
+            }
+        }
+    }
+    PathClassification::WithinWorkspace
 }
 
 fn is_exact_short_option(argument: &str, option: char) -> bool {
@@ -407,7 +533,7 @@ fn is_exact_short_option(argument: &str, option: char) -> bool {
         .is_some_and(|argument| argument.len() == option.len_utf8() && argument.starts_with(option))
 }
 
-fn attached_short_option_value(argument: &str, option: char) -> Option<&str> {
+fn attached_short_option_value<'a>(argument: &'a str, options: &[char]) -> Option<&'a str> {
     if !argument.starts_with('-') || argument.starts_with("--") {
         return None;
     }
@@ -415,7 +541,9 @@ fn attached_short_option_value(argument: &str, option: char) -> Option<&str> {
         .char_indices()
         .skip(1)
         .find_map(|(index, character)| {
-            (character == option).then_some(index + character.len_utf8())
+            options
+                .contains(&character)
+                .then_some(index + character.len_utf8())
         })?;
     (option_index < argument.len()).then_some(&argument[option_index..])
 }
@@ -423,6 +551,7 @@ fn attached_short_option_value(argument: &str, option: char) -> Option<&str> {
 fn classify_hard_rejection(
     workspace: &CodingWorkspace,
     words: &[String],
+    path_probes: &mut PathProbeBudget,
 ) -> Option<CommandPolicyDecision> {
     let program = words.first()?;
     let arguments = &words[1..];
@@ -436,14 +565,24 @@ fn classify_hard_rejection(
     {
         return Some(reject("command targets the filesystem root"));
     }
-    if program == "cd"
-        && arguments
+    if program == "cd" {
+        match arguments
             .first()
-            .is_some_and(|path| escapes_workspace(workspace, path))
-    {
-        return Some(reject(
-            "command changes its working directory outside the workspace",
-        ));
+            .map_or(PathClassification::WithinWorkspace, |path| {
+                path_probes.classify(workspace, path)
+            }) {
+            PathClassification::WithinWorkspace => {}
+            PathClassification::EscapesWorkspace => {
+                return Some(reject(
+                    "command changes its working directory outside the workspace",
+                ));
+            }
+            PathClassification::BudgetExceeded => {
+                return Some(requires_approval(
+                    "command exceeds the workspace path inspection budget",
+                ));
+            }
+        }
     }
     None
 }
@@ -554,10 +693,17 @@ enum Quote {
     Double,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellParseError {
+    Malformed,
+    TooComplex,
+}
+
 impl ParsedShellCommand {
-    fn parse(command: &str) -> Result<Self, ()> {
+    fn parse(command: &str) -> Result<Self, ShellParseError> {
         let mut parsed = Self::default();
         let mut words = Vec::new();
+        let mut word_count = 0;
         let mut word = String::new();
         let mut word_started = false;
         let mut quote = Quote::None;
@@ -642,11 +788,11 @@ impl ParsedShellCommand {
                         break;
                     }
                     '>' | '<' => {
-                        push_word(&mut words, &mut word, &mut word_started);
+                        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
                         parsed.has_redirection = true;
                     }
                     '&' => {
-                        push_word(&mut words, &mut word, &mut word_started);
+                        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
                         if characters.peek() == Some(&'&') {
                             characters.next();
                             push_command(&mut parsed.commands, &mut words)?;
@@ -658,22 +804,30 @@ impl ParsedShellCommand {
                         }
                     }
                     '|' => {
-                        push_word(&mut words, &mut word, &mut word_started);
+                        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
                         if characters.peek() == Some(&'|') {
                             characters.next();
                         }
                         push_command(&mut parsed.commands, &mut words)?;
                         requires_following_command = true;
                     }
-                    ';' | '\n' => {
-                        push_word(&mut words, &mut word, &mut word_started);
+                    ';' => {
+                        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
+                        if words.is_empty() {
+                            return Err(ShellParseError::Malformed);
+                        }
+                        push_command(&mut parsed.commands, &mut words)?;
+                        requires_following_command = false;
+                    }
+                    '\n' => {
+                        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
                         if !words.is_empty() {
                             push_command(&mut parsed.commands, &mut words)?;
                         }
                         requires_following_command = false;
                     }
                     ' ' | '\t' => {
-                        push_word(&mut words, &mut word, &mut word_started);
+                        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
                     }
                     _ => {
                         word.push(character);
@@ -684,41 +838,65 @@ impl ParsedShellCommand {
         }
 
         if quote != Quote::None {
-            return Err(());
+            return Err(ShellParseError::Malformed);
         }
-        push_word(&mut words, &mut word, &mut word_started);
+        push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
         if !words.is_empty() {
             push_command(&mut parsed.commands, &mut words)?;
             requires_following_command = false;
         }
         if parsed.commands.is_empty() || requires_following_command {
-            return Err(());
+            return Err(ShellParseError::Malformed);
         }
         Ok(parsed)
     }
 }
 
-fn push_word(words: &mut Vec<String>, word: &mut String, word_started: &mut bool) {
+fn push_word(
+    words: &mut Vec<String>,
+    word: &mut String,
+    word_started: &mut bool,
+    word_count: &mut usize,
+) -> Result<(), ShellParseError> {
     if *word_started {
+        if *word_count >= MAX_POLICY_WORDS {
+            return Err(ShellParseError::TooComplex);
+        }
         words.push(std::mem::take(word));
         *word_started = false;
+        *word_count += 1;
     }
+    Ok(())
 }
 
-fn push_command(commands: &mut Vec<Vec<String>>, words: &mut Vec<String>) -> Result<(), ()> {
+fn push_command(
+    commands: &mut Vec<Vec<String>>,
+    words: &mut Vec<String>,
+) -> Result<(), ShellParseError> {
     if words.is_empty() {
-        return Err(());
+        return Err(ShellParseError::Malformed);
+    }
+    if commands.len() >= MAX_SIMPLE_COMMANDS {
+        return Err(ShellParseError::TooComplex);
     }
     commands.push(std::mem::take(words));
     Ok(())
 }
 
 fn path_candidate(word: &str) -> Option<&str> {
-    let candidate = word.split_once('=').map_or(word, |(_, value)| value);
+    let candidate = if word.starts_with("--") {
+        word.split_once('=').map_or(word, |(_, value)| value)
+    } else {
+        word
+    };
     (!candidate.is_empty() && candidate != "." && !candidate.starts_with('-')).then_some(candidate)
 }
 
-fn arguments_escape_workspace(workspace: &CodingWorkspace, arguments: &[String]) -> bool {
+fn classify_argument_paths(
+    workspace: &CodingWorkspace,
+    arguments: &[String],
+    path_probes: &mut PathProbeBudget,
+) -> PathClassification {
     let mut positional_only = false;
     for argument in arguments {
         if argument == "--" && !positional_only {
@@ -730,23 +908,30 @@ fn arguments_escape_workspace(workspace: &CodingWorkspace, arguments: &[String])
         } else {
             path_candidate(argument)
         };
-        if candidate.is_some_and(|path| escapes_workspace(workspace, path)) {
-            return true;
+        if let Some(path) = candidate {
+            let classification = path_probes.classify(workspace, path);
+            if classification != PathClassification::WithinWorkspace {
+                return classification;
+            }
         }
     }
-    false
+    PathClassification::WithinWorkspace
 }
 
-fn escapes_workspace(workspace: &CodingWorkspace, candidate: &str) -> bool {
+fn escapes_workspace(
+    workspace: &CodingWorkspace,
+    candidate: &str,
+    remaining_inspections: &mut usize,
+) -> Option<bool> {
     if candidate.starts_with('~') {
-        return true;
+        return Some(true);
     }
     let path = Path::new(candidate);
     if path
         .components()
         .any(|component| component == Component::ParentDir)
     {
-        return true;
+        return Some(true);
     }
 
     let resolved = if path.is_absolute() {
@@ -755,14 +940,12 @@ fn escapes_workspace(workspace: &CodingWorkspace, candidate: &str) -> bool {
         workspace.context().root().join(path)
     };
     if path.is_absolute() && !path.starts_with(workspace.context().root()) {
-        return true;
+        return Some(true);
     }
 
-    path_escapes_workspace_with(
-        workspace.context().root(),
-        &resolved,
-        &mut inspect_workspace_path,
-    )
+    path_escapes_workspace_with(workspace.context().root(), &resolved, &mut |path| {
+        inspect_workspace_path(path, remaining_inspections)
+    })
 }
 
 enum PathInspection {
@@ -772,32 +955,45 @@ enum PathInspection {
     Inaccessible,
 }
 
-fn inspect_workspace_path(path: &Path) -> PathInspection {
+fn inspect_workspace_path(
+    path: &Path,
+    remaining_inspections: &mut usize,
+) -> Option<PathInspection> {
+    if *remaining_inspections == 0 {
+        return None;
+    }
+    *remaining_inspections -= 1;
     match path.symlink_metadata() {
-        Ok(metadata) if metadata.file_type().is_symlink() => match path.canonicalize() {
-            Ok(resolved) => PathInspection::Symlink(resolved),
-            Err(_) => PathInspection::Inaccessible,
-        },
-        Ok(_) => PathInspection::Existing,
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if *remaining_inspections == 0 {
+                return None;
+            }
+            *remaining_inspections -= 1;
+            Some(match path.canonicalize() {
+                Ok(resolved) => PathInspection::Symlink(resolved),
+                Err(_) => PathInspection::Inaccessible,
+            })
+        }
+        Ok(_) => Some(PathInspection::Existing),
         Err(error)
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
             ) =>
         {
-            PathInspection::Missing
+            Some(PathInspection::Missing)
         }
-        Err(_) => PathInspection::Inaccessible,
+        Err(_) => Some(PathInspection::Inaccessible),
     }
 }
 
 fn path_escapes_workspace_with(
     root: &Path,
     resolved: &Path,
-    inspect: &mut impl FnMut(&Path) -> PathInspection,
-) -> bool {
+    inspect: &mut impl FnMut(&Path) -> Option<PathInspection>,
+) -> Option<bool> {
     let Ok(relative) = resolved.strip_prefix(root) else {
-        return true;
+        return Some(true);
     };
     let mut current = root.to_path_buf();
 
@@ -806,22 +1002,22 @@ fn path_escapes_workspace_with(
             if component == Component::CurDir {
                 continue;
             }
-            return true;
+            return Some(true);
         };
         current.push(component);
-        match inspect(&current) {
-            PathInspection::Missing => return false,
+        match inspect(&current)? {
+            PathInspection::Missing => return Some(false),
             PathInspection::Existing => {}
             PathInspection::Symlink(resolved) => {
                 if !resolved.starts_with(root) {
-                    return true;
+                    return Some(true);
                 }
                 current = resolved;
             }
-            PathInspection::Inaccessible => return true,
+            PathInspection::Inaccessible => return Some(true),
         }
     }
-    false
+    Some(false)
 }
 
 fn requires_approval(reason: &str) -> CommandPolicyDecision {
@@ -853,10 +1049,10 @@ mod tests {
 
         let escaped = path_escapes_workspace_with(root, &candidate, &mut |_| {
             inspections += 1;
-            PathInspection::Missing
+            Some(PathInspection::Missing)
         });
 
-        assert!(!escaped);
+        assert_eq!(escaped, Some(false));
         assert_eq!(inspections, 1);
     }
 }

@@ -367,6 +367,45 @@ fn call_dependent_policy_can_reject_before_the_executor_runs() {
 }
 
 #[test]
+fn call_dependent_policy_rejects_empty_reasons_before_execution() {
+    let cases = [
+        (
+            "empty approval reason",
+            FakeToolHandler::requiring_approval(" ", []),
+        ),
+        ("empty rejection reason", FakeToolHandler::rejecting("", [])),
+    ];
+
+    for (case, handler) in cases {
+        let mut definition = read_file_definition();
+        definition.approval_policy = ToolApprovalPolicy::CallDependent;
+        let mut runtime = ToolRuntime::default();
+        runtime
+            .register(definition, handler)
+            .expect("tool registers");
+
+        let result = runtime.dispatch(
+            ToolCall {
+                id: ToolCallId::new(case),
+                tool_name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            },
+            ToolExecutionAuthorization::NotRequired,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let ToolOutput::Failure { error, .. } = result.output else {
+            panic!("invalid call-dependent policy must fail closed: {case}");
+        };
+        assert_eq!(error.code, "invalid_tool_policy", "case: {case}");
+        assert!(
+            error.message.contains("reason must not be empty"),
+            "case: {case}"
+        );
+    }
+}
+
+#[test]
 fn dispatch_cannot_bypass_a_required_approval() {
     let mut definition = read_file_definition();
     definition.approval_policy = ToolApprovalPolicy::RequiresApproval {

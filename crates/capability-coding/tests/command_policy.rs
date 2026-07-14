@@ -15,7 +15,7 @@ fn low_risk_read_and_validation_commands_are_allowed() {
         "cargo test --workspace",
         "cargo clippy --workspace --all-targets",
         "cargo fmt --all -- --check",
-        "rg approval src tests",
+        "rg --no-config approval src tests",
     ] {
         assert_eq!(
             policy.classify(&workspace, command),
@@ -40,12 +40,24 @@ fn side_effecting_and_uncertain_commands_require_an_informative_approval() {
         ("sleep 30 &", "background"),
         ("printf -v PATH .", "shell variable"),
         ("printf -vPATH .", "shell variable"),
+        ("printf '%1000000000s' x", "amplify output"),
+        ("printf '%*s' 1000000000 x", "amplify output"),
+        ("printf -- '%1000000000s' x", "amplify output"),
         ("git status --short", "fsmonitor"),
+        ("git ls-files /definitely-outside-workspace", "fsmonitor"),
+        (
+            "git grep approval /definitely-outside-workspace",
+            "fsmonitor",
+        ),
         (
             "git diff --no-textconv --no-ext-diff -- Cargo.toml",
             "fsmonitor",
         ),
         ("curl https://example.com", "not classified as low-risk"),
+        (
+            "rg approval src tests",
+            "preprocessor from inherited configuration",
+        ),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
             policy.classify(&workspace, command)
@@ -72,6 +84,11 @@ fn explicit_cross_workspace_access_requires_approval() {
     for command in [
         "cat ../outside.txt".to_string(),
         format!("cat {}", outside.display()),
+        format!("cat {}=ignored", outside.display()),
+        format!(
+            "cargo test --target-dir {}=ignored",
+            container.path().join("outside-target").display()
+        ),
         "cat ~young/.ssh/config".to_string(),
     ] {
         let CommandPolicyDecision::RequiresApproval { reason } =
@@ -146,10 +163,12 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         .expect("capability workspace resolves");
     let policy = CommandApprovalPolicy;
     let oversized = "x".repeat(64 * 1024 + 1);
+    let oversized_whitespace = " ".repeat(64 * 1024 + 1);
 
     for (command, expected_reason_fragment) in [
         ("", "must not be empty"),
         (oversized.as_str(), "65536 bytes"),
+        (oversized_whitespace.as_str(), "65536 bytes"),
         ("sudo rm -rf target", "privilege elevation"),
         ("/usr/bin/sudo rm -rf target", "privilege elevation"),
         ("rm -rf /", "filesystem root"),
@@ -158,6 +177,8 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         ("rm -rf /tmp/../*", "filesystem root"),
         ("cd ..", "outside the workspace"),
         ("echo 'unterminated", "malformed shell syntax"),
+        ("; pwd", "malformed shell syntax"),
+        ("pwd;;pwd", "malformed shell syntax"),
     ] {
         let CommandPolicyDecision::Reject { reason } = policy.classify(&workspace, command) else {
             panic!("expected command to be rejected: {command}");
@@ -236,7 +257,7 @@ fn composed_read_and_validation_commands_remain_low_risk() {
     let policy = CommandApprovalPolicy;
 
     for command in [
-        "rg approval src tests | head -n 20",
+        "rg --no-config approval src tests | head -n 20",
         "cargo test --workspace || cargo check --workspace",
         "printf '%s\\n' ready; pwd",
         "git branch --show-current",
@@ -261,9 +282,33 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
 
     for (command, expected_reason_fragment) in [
         ("git diff --output=diff.txt", "mutate workspace files"),
-        ("git diff -- Cargo.toml", "executes a helper"),
-        ("git log -p", "executes a helper"),
-        ("git show HEAD", "executes a helper"),
+        ("git diff -- Cargo.toml", "fsmonitor"),
+        ("git log -p", "signature verification"),
+        (
+            "git log -p --author --no-textconv --no-ext-diff",
+            "signature verification",
+        ),
+        (
+            "git log -p -- --no-textconv --no-ext-diff",
+            "signature verification",
+        ),
+        (
+            "git log --no-textconv --no-ext-diff -p --show-signature",
+            "signature verification",
+        ),
+        (
+            "git log --no-textconv --no-ext-diff --format='%G?'",
+            "signature verification",
+        ),
+        (
+            "git log --no-textconv --no-ext-diff",
+            "signature verification",
+        ),
+        (
+            "git show --no-textconv --no-ext-diff HEAD",
+            "signature verification",
+        ),
+        ("git show HEAD", "signature verification"),
         ("git grep -O less approval", "executes a helper"),
         ("git grep -Oless approval", "executes a helper"),
         (
@@ -283,6 +328,13 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
         ("file --compile -m magic", "mutate workspace files"),
         ("file --comp -m magic", "mutate workspace files"),
         ("file -Cm magic", "mutate workspace files"),
+        ("file -z archive.zst", "executes a helper"),
+        ("file -iZ archive.zst", "executes a helper"),
+        ("file --uncompress archive.zst", "executes a helper"),
+        (
+            "file --uncompress-noreport archive.zst",
+            "executes a helper",
+        ),
         ("rg -z needle archive.gz", "executes a helper"),
         ("rg -iz needle archive.gz", "executes a helper"),
         ("rg --search-zip needle archive.gz", "executes a helper"),
@@ -349,8 +401,6 @@ fn path_bearing_options_cannot_hide_cross_workspace_inputs() {
         "rg -f/etc/patterns needle",
         "rg --file=/etc/patterns needle",
         "grep -nf/etc/patterns needle",
-        "git grep -f/etc/patterns needle",
-        "git ls-files -X/etc/ignore",
         "file -m/etc/magic Cargo.toml",
         "file -M/etc/magic Cargo.toml",
         "file -m Cargo.toml:/etc/magic Cargo.toml",
@@ -366,16 +416,161 @@ fn path_bearing_options_cannot_hide_cross_workspace_inputs() {
 }
 
 #[test]
-fn policy_work_is_bounded_for_overly_complex_shell_input() {
+fn magic_file_path_lists_have_a_bounded_classification_budget() {
     let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
         .expect("capability workspace resolves");
     let policy = CommandApprovalPolicy;
-    let command = format!("rg needle {}", vec!["missing-file"; 257].join(" "));
-
-    let CommandPolicyDecision::Reject { reason } = policy.classify(&workspace, &command) else {
-        panic!("overly complex command should be rejected before path classification");
+    let paths = |range: std::ops::Range<usize>| {
+        range
+            .map(|index| format!("missing-{index}"))
+            .collect::<Vec<_>>()
+            .join(":")
     };
-    assert!(reason.contains("too complex"), "{reason}");
+    let at_limit = format!("file -m{} Cargo.toml", paths(0..255));
+    let over_limit = format!(
+        "file -m{} Cargo.toml; file -m{} Cargo.toml",
+        paths(0..128),
+        paths(128..256),
+    );
+
+    assert_eq!(
+        policy.classify(&workspace, &at_limit),
+        CommandPolicyDecision::Allow,
+    );
+    let CommandPolicyDecision::RequiresApproval { reason } =
+        policy.classify(&workspace, &over_limit)
+    else {
+        panic!("an oversized magic-file path list must fail closed");
+    };
+    assert!(reason.contains("path inspection budget"), "{reason}");
+}
+
+#[test]
+fn shared_deep_prefixes_cannot_multiply_workspace_path_inspections() {
+    let directory = TestDirectory::new("deep-path-probe-budget");
+    let relative = (0..128)
+        .map(|index| format!("d{index}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    std::fs::create_dir_all(directory.path().join(&relative))
+        .expect("deep workspace fixture is created");
+    let workspace = CodingWorkspace::resolve(directory.path()).expect("workspace resolves");
+    let policy = CommandApprovalPolicy;
+    let command = format!("file -m{relative}/missing-a:{relative}/missing-b missing-input");
+
+    let CommandPolicyDecision::RequiresApproval { reason } = policy.classify(&workspace, &command)
+    else {
+        panic!("component-level path probes must share one classification budget");
+    };
+    assert!(reason.contains("path inspection budget"), "{reason}");
+}
+
+#[test]
+fn printf_format_reuse_has_a_bounded_low_risk_literal() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+    let at_limit = format!("printf 'missing/{}%s' a b", "x".repeat(1014));
+    let over_limit = format!("printf 'missing/{}%s' a b", "x".repeat(1015));
+
+    assert_eq!(
+        policy.classify(&workspace, &at_limit),
+        CommandPolicyDecision::Allow,
+    );
+    let CommandPolicyDecision::RequiresApproval { reason } =
+        policy.classify(&workspace, &over_limit)
+    else {
+        panic!("a reusable large printf format must require approval");
+    };
+    assert!(reason.contains("amplify output"), "{reason}");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn rg_no_config_disables_an_inherited_preprocessor() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    if Command::new("rg").arg("--version").output().is_err() {
+        return;
+    }
+
+    let directory = TestDirectory::new("rg-no-config");
+    let helper = directory.path().join("preprocessor.sh");
+    let marker = directory.path().join("preprocessor-ran");
+    let config = directory.path().join("ripgreprc");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\n: > '{}'\ncat \"$1\"\n", marker.display()),
+    )
+    .expect("preprocessor fixture is written");
+    let mut permissions = std::fs::metadata(&helper)
+        .expect("preprocessor metadata is available")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&helper, permissions).expect("preprocessor is executable");
+    std::fs::write(&config, format!("--pre={}\n", helper.display()))
+        .expect("ripgrep config fixture is written");
+    std::fs::write(directory.path().join("input.txt"), "needle\n")
+        .expect("search fixture is written");
+
+    let configured = Command::new("rg")
+        .args(["needle", "input.txt"])
+        .current_dir(directory.path())
+        .env("RIPGREP_CONFIG_PATH", &config)
+        .status()
+        .expect("configured ripgrep runs");
+    assert!(configured.success());
+    assert!(
+        marker.exists(),
+        "fixture must prove the config executes a helper"
+    );
+    std::fs::remove_file(&marker).expect("marker is reset");
+
+    let protected = Command::new("rg")
+        .args(["--no-config", "needle", "input.txt"])
+        .current_dir(directory.path())
+        .env("RIPGREP_CONFIG_PATH", &config)
+        .status()
+        .expect("protected ripgrep runs");
+    assert!(protected.success());
+    assert!(
+        !marker.exists(),
+        "--no-config must suppress the inherited helper"
+    );
+}
+
+#[test]
+fn commands_at_the_complexity_limits_remain_classifiable() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+    let thirty_two_commands = vec!["pwd"; 32].join("; ");
+    let two_hundred_fifty_six_words = format!("printf {}", vec!["''"; 255].join(" "));
+
+    for command in [thirty_two_commands, two_hundred_fifty_six_words] {
+        assert_eq!(
+            policy.classify(&workspace, &command),
+            CommandPolicyDecision::Allow,
+            "a command exactly at a complexity limit should remain allowed",
+        );
+    }
+}
+
+#[test]
+fn commands_above_each_complexity_limit_are_rejected() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+    let thirty_three_commands = vec!["pwd"; 33].join("; ");
+    let two_hundred_fifty_seven_words = format!("printf {}", vec!["''"; 256].join(" "));
+
+    for command in [thirty_three_commands, two_hundred_fifty_seven_words] {
+        let CommandPolicyDecision::Reject { reason } = policy.classify(&workspace, &command) else {
+            panic!("a command above a complexity limit must be rejected");
+        };
+        assert!(reason.contains("too complex"), "{reason}");
+    }
 }
 
 #[test]

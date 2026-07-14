@@ -41,6 +41,8 @@ pub enum ToolExecutionAuthorization {
 }
 
 /// Dynamic policy result for one concrete call to a `CallDependent` tool.
+/// Approval and rejection reasons must contain non-whitespace text; the Tool
+/// Runtime rejects an invalid dynamic result before emitting an approval.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolCallPolicy {
     Allow,
@@ -106,6 +108,19 @@ impl PreparedToolCall {
     ) -> Self {
         match policy {
             ToolCallPolicy::Allow => Self::ready(dispatcher_identity, call),
+            ToolCallPolicy::RequiresApproval { reason } | ToolCallPolicy::Reject { reason }
+                if reason.trim().is_empty() =>
+            {
+                Self::rejected(
+                    dispatcher_identity,
+                    call,
+                    ToolError {
+                        code: "invalid_tool_policy".to_string(),
+                        message: "call-dependent policy reason must not be empty".to_string(),
+                        retryable: false,
+                    },
+                )
+            }
             ToolCallPolicy::RequiresApproval { reason } => {
                 Self::requiring_approval(dispatcher_identity, call, reason)
             }

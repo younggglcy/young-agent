@@ -2151,7 +2151,7 @@ fn detect_git_worktree(
     root_dir: &Dir,
     root_path: &Path,
 ) -> Result<Option<GitWorktreeContext>, CodingWorkspaceError> {
-    let mut command = git_probe_command();
+    let mut command = git_probe_command(root_path);
     #[cfg(unix)]
     bind_process_working_directory(&mut command, root_dir)
         .map_err(CodingWorkspaceError::BindGitProbe)?;
@@ -2193,29 +2193,7 @@ fn detect_git_worktree(
     }))
 }
 
-fn git_probe_command() -> Command {
-    const REPOSITORY_ENVIRONMENT: &[&str] = &[
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_CONFIG",
-        "GIT_CONFIG_PARAMETERS",
-        "GIT_CONFIG_COUNT",
-        "GIT_IMPLICIT_WORK_TREE",
-        "GIT_GRAFT_FILE",
-        "GIT_NO_REPLACE_OBJECTS",
-        "GIT_REPLACE_REF_BASE",
-        "GIT_INTERNAL_SUPER_PREFIX",
-        "GIT_SHALLOW_FILE",
-        "GIT_QUARANTINE_PATH",
-        "GIT_PREFIX",
-        "GIT_CEILING_DIRECTORIES",
-        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    ];
-
+fn git_probe_command(workspace_root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .args([
@@ -2226,9 +2204,13 @@ fn git_probe_command() -> Command {
             "--git-common-dir",
         ])
         .env("LC_ALL", "C");
-    for name in REPOSITORY_ENVIRONMENT {
-        command.env_remove(name);
-    }
+    let inherited_path = std::env::var_os("PATH");
+    crate::command::configure_command_environment(
+        &mut command,
+        workspace_root,
+        inherited_path.as_deref(),
+        &["git"],
+    );
     command
 }
 
@@ -2513,7 +2495,7 @@ mod tests {
 
     #[test]
     fn git_probe_clears_repository_environment_overrides() {
-        let command = git_probe_command();
+        let command = git_probe_command(std::path::Path::new("/workspace"));
         let environment = command.get_envs().collect::<Vec<_>>();
 
         for name in [

@@ -2,6 +2,7 @@
 
 mod command;
 mod command_policy;
+mod git_environment;
 pub mod manifest;
 mod patch;
 mod read;
