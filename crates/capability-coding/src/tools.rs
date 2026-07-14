@@ -1,27 +1,34 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use young_tool_runtime::{
-    CapabilityManifestError, ToolCall, ToolError, ToolHandler, ToolOutput, ToolRegistrationError,
-    ToolRuntime,
+    CapabilityManifestError, ToolCall, ToolHandler, ToolOutput, ToolRegistrationError, ToolRuntime,
 };
 
 use crate::manifest::coding_manifest;
+use crate::workspace::CodingWorkspace;
+
+const BUILTIN_TOOL_NAMES: [&str; 4] = ["read_file", "search_files", "apply_patch", "run_command"];
 
 pub fn register_builtin_coding_capability(
     runtime: &mut ToolRuntime,
+    workspace: CodingWorkspace,
 ) -> Result<(), CodingCapabilityRegistrationError> {
     let manifest = coding_manifest().map_err(CodingCapabilityRegistrationError::Manifest)?;
     let definitions = manifest
         .into_tool_definitions()
         .map_err(CodingCapabilityRegistrationError::Manifest)?;
 
-    // Preflight the complete built-in pack so a duplicate cannot leave a
-    // partially registered capability behind.
+    // Validate the entire built-in pack before registering any handler so a
+    // stale manifest or duplicate cannot leave a partially registered pack.
     for definition in &definitions {
+        if !BUILTIN_TOOL_NAMES.contains(&definition.name.as_str()) {
+            return Err(CodingCapabilityRegistrationError::UnsupportedManifestTool {
+                name: definition.name.clone(),
+            });
+        }
         if runtime.lookup(&definition.name).is_some() {
             return Err(CodingCapabilityRegistrationError::Registration(
                 ToolRegistrationError::DuplicateTool {
@@ -32,36 +39,47 @@ pub fn register_builtin_coding_capability(
     }
 
     for definition in definitions {
-        let tool_name = definition.name.clone();
+        let handler = BuiltinCodingTool::new(&definition.name, workspace.clone());
         runtime
-            .register(definition, UnimplementedCodingTool { tool_name })
+            .register(definition, handler)
             .map_err(CodingCapabilityRegistrationError::Registration)?;
     }
     Ok(())
 }
 
-struct UnimplementedCodingTool {
-    tool_name: String,
+enum BuiltinCodingTool {
+    ReadFile(CodingWorkspace),
+    SearchFiles(CodingWorkspace),
+    ApplyPatch(CodingWorkspace),
+    RunCommand(CodingWorkspace),
 }
 
-impl ToolHandler for UnimplementedCodingTool {
+impl BuiltinCodingTool {
+    fn new(name: &str, workspace: CodingWorkspace) -> Self {
+        match name {
+            "read_file" => Self::ReadFile(workspace),
+            "search_files" => Self::SearchFiles(workspace),
+            "apply_patch" => Self::ApplyPatch(workspace),
+            "run_command" => Self::RunCommand(workspace),
+            _ => unreachable!("manifest tool names were preflighted"),
+        }
+    }
+}
+
+impl ToolHandler for BuiltinCodingTool {
     fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
-        // Phase-one stubs cannot perform side effects. Real call-dependent
-        // handlers must replace this explicit classification in their issue.
-        None
+        match self {
+            Self::RunCommand(_) => Some(crate::command::APPROVAL_REASON.to_string()),
+            Self::ReadFile(_) | Self::SearchFiles(_) | Self::ApplyPatch(_) => None,
+        }
     }
 
-    fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
-        ToolOutput::Failure {
-            error: ToolError {
-                code: "tool_not_implemented".to_string(),
-                message: format!(
-                    "coding tool '{}' is declared but not implemented",
-                    self.tool_name
-                ),
-                retryable: false,
-            },
-            extensions: BTreeMap::new(),
+    fn execute(&mut self, call: &ToolCall, cancellation: Arc<AtomicBool>) -> ToolOutput {
+        match self {
+            Self::ReadFile(workspace) => crate::read::execute(workspace, call, &cancellation),
+            Self::SearchFiles(workspace) => crate::search::execute(workspace, call, &cancellation),
+            Self::ApplyPatch(workspace) => crate::patch::execute(workspace, call, &cancellation),
+            Self::RunCommand(workspace) => crate::command::execute(workspace, call, &cancellation),
         }
     }
 }
@@ -69,6 +87,7 @@ impl ToolHandler for UnimplementedCodingTool {
 #[derive(Debug)]
 pub enum CodingCapabilityRegistrationError {
     Manifest(CapabilityManifestError),
+    UnsupportedManifestTool { name: String },
     Registration(ToolRegistrationError),
 }
 
@@ -77,6 +96,12 @@ impl fmt::Display for CodingCapabilityRegistrationError {
         match self {
             Self::Manifest(error) => {
                 write!(formatter, "coding capability manifest failed: {error}")
+            }
+            Self::UnsupportedManifestTool { name } => {
+                write!(
+                    formatter,
+                    "coding capability manifest declares unsupported tool '{name}'"
+                )
             }
             Self::Registration(error) => {
                 write!(formatter, "coding capability registration failed: {error}")
@@ -90,6 +115,7 @@ impl Error for CodingCapabilityRegistrationError {
         match self {
             Self::Manifest(error) => Some(error),
             Self::Registration(error) => Some(error),
+            Self::UnsupportedManifestTool { .. } => None,
         }
     }
 }

@@ -2,7 +2,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde_json::json;
-use young_capability_coding::{coding_manifest, register_builtin_coding_capability};
+use young_capability_coding::{
+    coding_manifest, register_builtin_coding_capability, CodingWorkspace,
+};
 use young_tool_runtime::{
     ToolApprovalPolicy, ToolCall, ToolCallId, ToolExecutionAuthorization, ToolOutput, ToolRuntime,
     ToolSafetyClass,
@@ -52,10 +54,12 @@ fn coding_capability_loads_its_embedded_builtin_manifest() {
 }
 
 #[test]
-fn coding_capability_registers_initial_tools_with_explicit_stubs() {
+fn coding_capability_registers_implementations_for_a_selected_workspace() {
     let mut runtime = ToolRuntime::default();
+    let workspace =
+        CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR")).expect("workspace resolves");
 
-    register_builtin_coding_capability(&mut runtime).expect("capability registers");
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
 
     assert_eq!(runtime.len(), 4);
     for name in ["read_file", "search_files", "apply_patch", "run_command"] {
@@ -65,7 +69,7 @@ fn coding_capability_registers_initial_tools_with_explicit_stubs() {
     let call = ToolCall {
         id: ToolCallId::new("call-read"),
         tool_name: "read_file".to_string(),
-        arguments: json!({ "path": "README.md" }),
+        arguments: json!({ "path": "Cargo.toml" }),
     };
     let result = runtime.dispatch(
         call.clone(),
@@ -74,13 +78,11 @@ fn coding_capability_registers_initial_tools_with_explicit_stubs() {
     );
 
     assert_eq!(result.call_id, call.id);
-    let ToolOutput::Failure { error, .. } = result.output else {
-        panic!("issue #7 owns the real coding tool implementations");
+    let ToolOutput::Success { content, .. } = result.output else {
+        panic!("read_file should use its real implementation");
     };
-    assert_eq!(error.code, "tool_not_implemented");
-    assert_eq!(
-        error.message,
-        "coding tool 'read_file' is declared but not implemented"
-    );
-    assert!(!error.retryable);
+    let [young_tool_runtime::ToolContent::Text { text }] = content.as_slice() else {
+        panic!("read_file should return one text content item");
+    };
+    assert!(text.contains("name = \"young-capability-coding\""));
 }

@@ -26,7 +26,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "search_files"
-description = "Search file contents inside the workspace boundary."
+description = "Search for literal text inside UTF-8 workspace files."
 safety_class = "always_allow"
 
 [tools.input_schema]
@@ -47,7 +47,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "apply_patch"
-description = "Apply a patch to files inside the workspace boundary."
+description = "Apply a unified diff to UTF-8 files inside the workspace boundary; displaced originals are reported in a search- and Git-ignored recovery namespace until the caller removes them."
 safety_class = "requires_approval"
 safety_reason = "patching mutates workspace files"
 
@@ -66,7 +66,7 @@ protocol_version = "reserved"
 
 [[tools]]
 name = "run_command"
-description = "Run a command inside the workspace boundary."
+description = "Run an unmodified shell command in a workspace-bound foreground process group; request termination of tracked background and same-group residuals when the foreground shell exits, and confirm inherited tracking-token closure before reaping the leader. Descendants that deliberately close tracking descriptors, detach, or change credentials remain outside the portable tracking contract."
 safety_class = "call_dependent"
 
 [tools.input_schema]

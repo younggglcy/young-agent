@@ -6,10 +6,22 @@ repository.workspace = true
 description = "Built-in Coding Capability boundary for the Agent Kernel."
 
 [dependencies]
-young-tool-runtime = { path = "../tool-runtime" }
-
-[dev-dependencies]
+blake3.workspace = true
+cap-std.workspace = true
+command-group.workspace = true
+getrandom.workspace = true
 serde_json.workspace = true
+young-tool-runtime = { path = "../tool-runtime" }
+young-platform-process.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+cap-fs-ext.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+exacl.workspace = true
 
 [lints]
 workspace = true

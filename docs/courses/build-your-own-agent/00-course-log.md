@@ -16,6 +16,11 @@
 | 6 | 沉淀协作规则 | `CONTRIBUTING.md`, `AGENTS.md`, `docs/lessons/` | 让人和 agent 都知道如何维护这个仓库，尤其是 PR 标题、文档位置和经验沉淀方式。 |
 | 7 | 补上可视化架构 | `docs/diagrams/` | 用图把长期架构和 agent harness 关系讲清楚，帮助读者跨过纯文字理解的门槛。 |
 | 8 | 开始课程化沉淀 | `docs/courses/` | 把 PRD、ADR、issues、代码和经验串成面向学习者的顺序材料。 |
+| 9 | 定义 Kernel 合同 | `crates/model-runtime/`, `crates/agent-runtime/`, `crates/tool-runtime/` | 先稳定 provider-neutral model、agent event 与 tool wire shape，再实现具体循环。 |
+| 10 | 建立 Canonical Event Log | `crates/event-store/` | 用 append-only JSONL、replay 与 corruption handling 把运行事实变成可恢复的唯一真相。 |
+| 11 | 跑通确定性 Agent Runtime | `crates/agent-runtime/src/runtime.rs` | 用 FakeModelClient 和 fake tools 验证 turn、tool call、approval、cancellation 与 terminal result。 |
+| 12 | 实现 Tool Runtime 与内置 manifest | `crates/tool-runtime/`, `crates/capability-coding/coding-capability.toml` | 区分声明、注册、审批分类和执行分发，不让 manifest 变成插件 runtime。 |
+| 13 | 建立本地 Workspace Boundary | `crates/capability-coding/src/workspace.rs`, `crates/capability-coding/tests/workspace_tools.rs` | 用 lexical 筛选与 directory capability 约束实际 read/search/patch 操作；command 以 handle-bound cwd 启动且取消覆盖进程组，完整事件输出有界，worktree context 可观察。 |
 
 ## 当前课程进度
 
