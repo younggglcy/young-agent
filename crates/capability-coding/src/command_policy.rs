@@ -1,5 +1,5 @@
 use crate::workspace::CodingWorkspace;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use young_tool_runtime::ToolCall;
 
 pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -672,7 +672,7 @@ impl ParsedShellCommand {
                         }
                         requires_following_command = false;
                     }
-                    character if character.is_whitespace() => {
+                    ' ' | '\t' => {
                         push_word(&mut words, &mut word, &mut word_started);
                     }
                     _ => {
@@ -758,23 +758,78 @@ fn escapes_workspace(workspace: &CodingWorkspace, candidate: &str) -> bool {
         return true;
     }
 
-    let mut existing_ancestor = resolved;
-    loop {
-        match existing_ancestor.canonicalize() {
-            Ok(resolved) => return !resolved.starts_with(workspace.context().root()),
+    path_escapes_workspace_with(
+        workspace.context().root(),
+        &resolved,
+        &mut inspect_workspace_path,
+    )
+}
+
+enum PathInspection {
+    Missing,
+    Existing,
+    Symlink(PathBuf),
+    Inaccessible,
+}
+
+fn inspect_workspace_path(path: &Path) -> PathInspection {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => match path.canonicalize() {
+            Ok(resolved) => PathInspection::Symlink(resolved),
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                 ) =>
             {
-                if !existing_ancestor.pop() {
+                PathInspection::Missing
+            }
+            Err(_) => PathInspection::Inaccessible,
+        },
+        Ok(_) => PathInspection::Existing,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            PathInspection::Missing
+        }
+        Err(_) => PathInspection::Inaccessible,
+    }
+}
+
+fn path_escapes_workspace_with(
+    root: &Path,
+    resolved: &Path,
+    inspect: &mut impl FnMut(&Path) -> PathInspection,
+) -> bool {
+    let Ok(relative) = resolved.strip_prefix(root) else {
+        return true;
+    };
+    let mut current = root.to_path_buf();
+
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            if component == Component::CurDir {
+                continue;
+            }
+            return true;
+        };
+        current.push(component);
+        match inspect(&current) {
+            PathInspection::Missing => return false,
+            PathInspection::Existing => {}
+            PathInspection::Symlink(resolved) => {
+                if !resolved.starts_with(root) {
                     return true;
                 }
+                current = resolved;
             }
-            Err(_) => return true,
+            PathInspection::Inaccessible => return true,
         }
     }
+    false
 }
 
 fn requires_approval(reason: &str) -> CommandPolicyDecision {
@@ -786,5 +841,30 @@ fn requires_approval(reason: &str) -> CommandPolicyDecision {
 fn reject(reason: &str) -> CommandPolicyDecision {
     CommandPolicyDecision::Reject {
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{path_escapes_workspace_with, PathInspection};
+    use std::path::Path;
+
+    #[test]
+    fn deep_missing_path_stops_at_its_first_missing_prefix() {
+        let root = Path::new("/workspace");
+        let candidate = root.join(
+            std::iter::repeat_n("missing", 128)
+                .collect::<Vec<_>>()
+                .join("/"),
+        );
+        let mut inspections = 0;
+
+        let escaped = path_escapes_workspace_with(root, &candidate, &mut |_| {
+            inspections += 1;
+            PathInspection::Missing
+        });
+
+        assert!(!escaped);
+        assert_eq!(inspections, 1);
     }
 }

@@ -337,3 +337,19 @@ fn policy_work_is_bounded_for_overly_complex_shell_input() {
     };
     assert!(reason.contains("too complex"), "{reason}");
 }
+
+#[test]
+fn non_posix_whitespace_does_not_change_the_program_identity() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+
+    for command in ["pwd\u{00a0}", "pwd\r", "pwd\u{000b}"] {
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, command)
+        else {
+            panic!("non-POSIX whitespace must remain part of the program name: {command:?}");
+        };
+        assert!(reason.contains("not classified as low-risk"), "{reason}");
+    }
+}
