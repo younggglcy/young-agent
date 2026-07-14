@@ -202,6 +202,35 @@ fn shell_composition_cannot_hide_a_risky_operation() {
 }
 
 #[test]
+fn unsupported_shell_syntax_fails_closed() {
+    let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
+        .expect("capability workspace resolves");
+    let policy = CommandApprovalPolicy;
+
+    for (command, expected_reason_fragment) in [
+        ("cat <<EOF\nhello\nEOF", "redirects input or output"),
+        ("cat <(pwd)", "redirects input or output"),
+        (
+            "MODE=check cargo test --workspace",
+            "not classified as low-risk",
+        ),
+        ("if true; then pwd; fi", "not classified as low-risk"),
+        ("for file in Cargo.toml; do cat \"$file\"; done", "dynamic"),
+        ("check() { pwd; }", "dynamic"),
+    ] {
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, command)
+        else {
+            panic!("unsupported shell syntax must not be allowed: {command}");
+        };
+        assert!(
+            reason.contains(expected_reason_fragment),
+            "approval reason '{reason}' should describe unsupported syntax: {command}",
+        );
+    }
+}
+
+#[test]
 fn composed_read_and_validation_commands_remain_low_risk() {
     let workspace = CodingWorkspace::resolve(env!("CARGO_MANIFEST_DIR"))
         .expect("capability workspace resolves");

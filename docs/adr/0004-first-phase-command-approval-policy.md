@@ -17,6 +17,13 @@ explicit cross-workspace paths. Malformed, over-limit, overly complex, privilege
 clearly root-targeting commands are rejected before execution. Safe shell composition is allowed
 only when every simple command is independently low-risk.
 
+The scanner recognizes only the lexical detail needed for that decision: POSIX space and tab word
+separation, single and double quotes, backslash escaping and line continuation, and composition by
+newline, `;`, `&&`, `||`, or `|`. It does not semantically interpret here-documents, process
+substitution, assignment prefixes, control structures, or shell function definitions. Those forms
+must fail closed as `RequiresApproval` or `Reject`; adding an automatically allowed shell form
+requires an explicit contract change plus classification and real-execution regression tests.
+
 This policy is an approval boundary, not a shell sandbox. Binding the child cwd to the workspace
 handle prevents cwd handoff races but does not make an approved shell incapable of accessing the
 rest of the host. A stronger filesystem or process isolation boundary remains future work.
