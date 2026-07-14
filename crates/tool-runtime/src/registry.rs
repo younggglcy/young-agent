@@ -125,8 +125,9 @@ pub enum ToolApprovalPolicy {
     RequiresApproval {
         reason: String,
     },
-    /// The concrete handler classifies each call through
-    /// [`ToolHandler::approval_reason`].
+    /// The concrete handler classifies each call through [`ToolHandler::classify`],
+    /// returning an explicit [`ToolCallPolicy`](crate::ToolCallPolicy) to allow,
+    /// require approval for, or reject that exact invocation.
     CallDependent,
     AlwaysReject {
         reason: String,
