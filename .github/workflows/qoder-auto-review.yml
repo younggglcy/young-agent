@@ -80,3 +80,17 @@ jobs:
       - name: Preserve Qoder failure status
         if: always() && steps.qoder.outcome != 'success'
         run: exit 1
+
+      - name: Assert final review is visible
+        if: steps.qoder.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/reviews" \
+            | jq -e --arg sha "${EXPECTED_HEAD_SHA}" 'any(.[];
+                .user.login == "qoderai[bot]"
+                and .commit_id == $sha
+                and .state == "COMMENTED"
+                and (.body | contains("## 👋 Review Summary"))
+              )'

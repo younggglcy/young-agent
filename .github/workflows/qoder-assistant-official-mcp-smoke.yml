@@ -90,3 +90,14 @@ jobs:
       - name: Preserve Qoder failure status
         if: always() && steps.qoder.outcome != 'success'
         run: exit 1
+
+      - name: Assert Assistant comment is visible
+        if: steps.qoder.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${{ github.event.pull_request.number }}/comments" \
+            | jq -e 'any(.[];
+                .user.login == "qoderai[bot]"
+                and (.body | contains("[official-mcp-assistant-smoke]"))
+              )'
