@@ -137,6 +137,9 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         ("sudo rm -rf target", "privilege elevation"),
         ("/usr/bin/sudo rm -rf target", "privilege elevation"),
         ("rm -rf /", "filesystem root"),
+        ("rm -rf /./", "filesystem root"),
+        ("/bin/rm -rf /", "filesystem root"),
+        ("rm -rf /tmp/../*", "filesystem root"),
         ("cd ..", "outside the workspace"),
         ("echo 'unterminated", "malformed shell syntax"),
     ] {
@@ -230,6 +233,7 @@ fn low_risk_programs_cannot_use_side_effecting_escape_hatches() {
             "executes configured tooling",
         ),
         ("find . -fprint report.txt", "mutate workspace files"),
+        ("file --compile -m magic", "mutate workspace files"),
         (
             "find . -fprintf report.txt '%p\\n'",
             "mutate workspace files",

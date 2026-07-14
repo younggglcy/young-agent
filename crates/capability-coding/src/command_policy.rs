@@ -55,6 +55,11 @@ impl CommandApprovalPolicy {
         {
             return reject("command is too complex for the first-phase approval policy");
         }
+        for words in &parsed.commands {
+            if let Some(decision) = classify_hard_rejection(workspace, words) {
+                return decision;
+            }
+        }
         if parsed.has_background {
             return requires_approval("command starts or manages a background process");
         }
@@ -86,23 +91,6 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     };
     let arguments = &words[1..];
 
-    if matches!(program_basename(program), "sudo" | "doas" | "su") {
-        return reject("command attempts privilege elevation");
-    }
-    if program == "rm"
-        && arguments
-            .iter()
-            .any(|argument| matches!(argument.as_str(), "/" | "/*"))
-    {
-        return reject("command targets the filesystem root");
-    }
-    if program == "cd"
-        && arguments
-            .first()
-            .is_some_and(|path| escapes_workspace(workspace, path))
-    {
-        return reject("command changes its working directory outside the workspace");
-    }
     if arguments
         .iter()
         .filter_map(|word| path_candidate(word))
@@ -161,6 +149,13 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
             .any(|argument| argument == "--config" || argument.starts_with("--config="))
     {
         return requires_approval("command executes configured tooling");
+    }
+    if program == "file"
+        && arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "-C" | "--compile"))
+    {
+        return requires_approval("command may mutate workspace files");
     }
     if program == "rg"
         && arguments
@@ -250,6 +245,61 @@ fn classify_simple_command(workspace: &CodingWorkspace, words: &[String]) -> Com
     } else {
         requires_approval("command is not classified as low-risk")
     }
+}
+
+fn classify_hard_rejection(
+    workspace: &CodingWorkspace,
+    words: &[String],
+) -> Option<CommandPolicyDecision> {
+    let program = words.first()?;
+    let arguments = &words[1..];
+    if matches!(program_basename(program), "sudo" | "doas" | "su") {
+        return Some(reject("command attempts privilege elevation"));
+    }
+    if program_basename(program) == "rm"
+        && arguments
+            .iter()
+            .any(|argument| targets_filesystem_root(argument))
+    {
+        return Some(reject("command targets the filesystem root"));
+    }
+    if program == "cd"
+        && arguments
+            .first()
+            .is_some_and(|path| escapes_workspace(workspace, path))
+    {
+        return Some(reject(
+            "command changes its working directory outside the workspace",
+        ));
+    }
+    None
+}
+
+fn targets_filesystem_root(argument: &str) -> bool {
+    let path = Path::new(argument);
+    if !path.is_absolute() {
+        return false;
+    }
+
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => depth = depth.saturating_sub(1),
+            Component::Normal(component) => {
+                let component = component.to_string_lossy();
+                if depth == 0
+                    && component
+                        .chars()
+                        .any(|character| matches!(character, '*' | '?' | '['))
+                {
+                    return true;
+                }
+                depth += 1;
+            }
+        }
+    }
+    depth == 0
 }
 
 fn is_safe_sed_read(arguments: &[String]) -> bool {
