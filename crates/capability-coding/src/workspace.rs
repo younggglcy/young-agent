@@ -1961,28 +1961,29 @@ fn has_extended_acl(file: &File) -> io::Result<bool> {
     }));
 }
 
-#[cfg(any(
-    target_vendor = "apple",
-    target_os = "linux",
-    target_os = "android",
-    target_os = "hurd"
-))]
+#[cfg(target_os = "linux")]
 fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
     let mut names = vec![0u8; 64 * 1024];
     let written = rustix::fs::flistxattr(file, &mut names).map_err(io::Error::from)?;
-    for name in names[..written]
+    Ok(written != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn file_has_extended_attributes(file: &File) -> io::Result<bool> {
+    let mut names = vec![0u8; 64 * 1024];
+    let written = rustix::fs::flistxattr(file, &mut names).map_err(io::Error::from)?;
+    Ok(names[..written]
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
-    {
-        #[cfg(target_os = "macos")]
-        if name == b"com.apple.provenance" {
-            // APFS attaches this OS-managed attribute to ordinary new files, including
-            // our staging file. It is not user-authored security metadata to preserve.
-            continue;
-        }
-        return Ok(true);
-    }
-    Ok(false)
+        .any(|name| {
+            if name == b"com.apple.provenance" {
+                // APFS attaches this OS-managed attribute to ordinary new files, including
+                // our staging file. It is not user-authored security metadata to preserve.
+                false
+            } else {
+                true
+            }
+        }))
 }
 
 impl fmt::Debug for CodingWorkspace {
