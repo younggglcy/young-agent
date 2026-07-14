@@ -776,14 +776,6 @@ fn inspect_workspace_path(path: &Path) -> PathInspection {
     match path.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_symlink() => match path.canonicalize() {
             Ok(resolved) => PathInspection::Symlink(resolved),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                PathInspection::Missing
-            }
             Err(_) => PathInspection::Inaccessible,
         },
         Ok(_) => PathInspection::Existing,

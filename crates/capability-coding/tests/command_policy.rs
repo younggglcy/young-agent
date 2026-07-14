@@ -93,6 +93,18 @@ fn explicit_cross_workspace_access_requires_approval() {
         };
         assert!(reason.contains("outside the workspace"), "{reason}");
 
+        std::os::unix::fs::symlink(
+            container.path().join("outside-missing"),
+            root.join("dangling-outside-link"),
+        )
+        .expect("dangling outside symlink is created");
+        let CommandPolicyDecision::RequiresApproval { reason } =
+            policy.classify(&workspace, "cat dangling-outside-link")
+        else {
+            panic!("an unresolved symlink must fail closed");
+        };
+        assert!(reason.contains("outside the workspace"), "{reason}");
+
         let CommandPolicyDecision::RequiresApproval { reason } =
             policy.classify(&workspace, "cat outside-link/not-created-yet")
         else {
