@@ -2392,9 +2392,90 @@ mod tests {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::git_probe_command;
     #[cfg(unix)]
     use super::CodingWorkspace;
+    use super::{git_probe_command, CodingWorkspaceError};
+
+    #[test]
+    fn workspace_errors_expose_stable_diagnostics_and_sources() {
+        let path = std::path::PathBuf::from("/workspace");
+        let cases = vec![
+            (
+                CodingWorkspaceError::ResolveRoot {
+                    path: path.clone(),
+                    source: std::io::Error::other("resolve failed"),
+                },
+                "failed to resolve workspace '/workspace': resolve failed",
+                true,
+            ),
+            (
+                CodingWorkspaceError::RootIsNotDirectory { path: path.clone() },
+                "workspace root '/workspace' is not a directory",
+                false,
+            ),
+            (
+                CodingWorkspaceError::OpenRoot {
+                    path: path.clone(),
+                    source: std::io::Error::other("open failed"),
+                },
+                "failed to open workspace root '/workspace': open failed",
+                true,
+            ),
+            (
+                CodingWorkspaceError::InspectOpenedRoot {
+                    path: path.clone(),
+                    source: std::io::Error::other("inspect failed"),
+                },
+                "failed to inspect opened workspace '/workspace': inspect failed",
+                true,
+            ),
+            (
+                CodingWorkspaceError::RootChanged { path },
+                "workspace path '/workspace' changed while it was being opened",
+                false,
+            ),
+            (
+                CodingWorkspaceError::BindGitProbe(std::io::Error::other("bind failed")),
+                "failed to bind git probe to workspace handle: bind failed",
+                true,
+            ),
+            (
+                CodingWorkspaceError::StartGitProbe(std::io::Error::other("start failed")),
+                "failed to start git worktree probe: start failed",
+                true,
+            ),
+            (
+                CodingWorkspaceError::GitProbeFailed {
+                    exit_code: Some(128),
+                    stderr: "fatal: probe failed\n".to_string(),
+                },
+                "git worktree probe failed with exit code Some(128): fatal: probe failed",
+                false,
+            ),
+            (
+                CodingWorkspaceError::GitOutputUtf8(
+                    String::from_utf8(vec![0xff]).expect_err("fixture is invalid UTF-8"),
+                ),
+                "git worktree probe returned invalid UTF-8:",
+                true,
+            ),
+            (
+                CodingWorkspaceError::UnexpectedGitOutput {
+                    stdout: "one-line-only".to_string(),
+                },
+                "git worktree probe returned unexpected output: \"one-line-only\"",
+                false,
+            ),
+        ];
+
+        for (error, expected_prefix, has_source) in cases {
+            assert!(
+                error.to_string().starts_with(expected_prefix),
+                "unexpected workspace diagnostic: {error}"
+            );
+            assert_eq!(std::error::Error::source(&error).is_some(), has_source);
+        }
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn replacement_metadata(

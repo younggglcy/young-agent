@@ -1,14 +1,15 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde_json::json;
 use young_tool_runtime::{
-    CapabilityRef, FakeToolHandler, McpCompatibility, ToolApprovalPolicy, ToolCall, ToolCallId,
-    ToolContent, ToolDefinition, ToolDispatcher, ToolExecutionAuthorization, ToolHandler,
-    ToolOutput, ToolRuntime,
+    CapabilityRef, FakeToolDispatcher, FakeToolHandler, McpCompatibility, ToolApprovalPolicy,
+    ToolCall, ToolCallId, ToolContent, ToolDefinition, ToolDispatcher, ToolExecutionAuthorization,
+    ToolHandler, ToolOutput, ToolRuntime,
 };
 
 fn read_file_definition() -> ToolDefinition {
@@ -28,6 +29,158 @@ fn read_file_definition() -> ToolDefinition {
         approval_policy: ToolApprovalPolicy::AlwaysAllow,
         mcp: None,
     }
+}
+
+#[test]
+fn runtime_inventory_and_registration_errors_are_observable() {
+    let mut runtime = ToolRuntime::default();
+    assert!(runtime.is_empty());
+    assert_eq!(runtime.len(), 0);
+    assert_eq!(runtime.definitions().len(), 0);
+
+    let mut invalid = read_file_definition();
+    invalid.description = "  ".to_string();
+    let invalid_error = runtime
+        .register(invalid, FakeToolHandler::default())
+        .expect_err("invalid definitions must fail before registration");
+    assert_eq!(
+        invalid_error.to_string(),
+        "invalid tool 'read_file': description must not be empty"
+    );
+    assert!(invalid_error.source().is_some());
+    assert!(runtime.is_empty());
+
+    let mut invalid_output_schema = read_file_definition();
+    invalid_output_schema.output_schema = Some(json!("not-an-object"));
+    let invalid_output_error = runtime
+        .register(invalid_output_schema, FakeToolHandler::default())
+        .expect_err("output schemas must be objects");
+    assert_eq!(
+        invalid_output_error.to_string(),
+        "invalid tool 'read_file': output_schema must be an object"
+    );
+    assert!(runtime.is_empty());
+
+    runtime
+        .register(read_file_definition(), FakeToolHandler::default())
+        .expect("valid definition registers");
+    assert_eq!(runtime.len(), 1);
+    assert_eq!(
+        runtime
+            .definitions()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read_file"]
+    );
+
+    let duplicate = runtime
+        .register(read_file_definition(), FakeToolHandler::default())
+        .expect_err("duplicate definitions must fail");
+    assert_eq!(
+        duplicate.to_string(),
+        "tool 'read_file' is already registered"
+    );
+    assert!(duplicate.source().is_none());
+}
+
+#[test]
+fn always_reject_and_call_dependent_allow_are_planned_without_execution() {
+    let mut rejected_definition = read_file_definition();
+    rejected_definition.name = "delete_file".to_string();
+    rejected_definition.approval_policy = ToolApprovalPolicy::AlwaysReject {
+        reason: "deletion is disabled".to_string(),
+    };
+    let mut runtime = ToolRuntime::default();
+    runtime
+        .register(rejected_definition, FakeToolHandler::default())
+        .expect("always-reject tool still registers");
+
+    let rejected = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-rejected"),
+            tool_name: "delete_file".to_string(),
+            arguments: json!({}),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Failure { error, extensions } = rejected.output else {
+        panic!("always-reject policy must fail before execution");
+    };
+    assert_eq!(error.code, "tool_rejected");
+    assert_eq!(error.message, "deletion is disabled");
+    assert!(extensions.is_empty());
+
+    let mut dependent_definition = read_file_definition();
+    dependent_definition.name = "inspect_file".to_string();
+    dependent_definition.approval_policy = ToolApprovalPolicy::CallDependent;
+    runtime
+        .register(dependent_definition, FakeToolHandler::default())
+        .expect("call-dependent tool registers");
+    let prepared = runtime.prepare(ToolCall {
+        id: ToolCallId::new("call-dependent-allow"),
+        tool_name: "inspect_file".to_string(),
+        arguments: json!({}),
+    });
+    assert_eq!(prepared.approval_reason(), None);
+}
+
+#[test]
+fn fake_handler_reports_remaining_outputs_and_fails_when_exhausted() {
+    let success = ToolOutput::Success {
+        content: vec![ToolContent::Text {
+            text: "first".to_string(),
+        }],
+        metadata: BTreeMap::new(),
+        extensions: BTreeMap::new(),
+    };
+    let call = ToolCall {
+        id: ToolCallId::new("call-fake"),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "README.md" }),
+    };
+    let mut handler = FakeToolHandler::new([success.clone()]);
+
+    assert_eq!(handler.remaining_outputs(), 1);
+    assert_eq!(
+        handler.execute(&call, Arc::new(AtomicBool::new(false))),
+        success
+    );
+    assert_eq!(handler.remaining_outputs(), 0);
+
+    let exhausted = handler.execute(&call, Arc::new(AtomicBool::new(false)));
+    let ToolOutput::Failure { error, extensions } = exhausted else {
+        panic!("an exhausted fake must fail closed");
+    };
+    assert_eq!(error.code, "fake_script_exhausted");
+    assert!(!error.retryable);
+    assert!(extensions.is_empty());
+    assert_eq!(handler.calls(), &[call.clone(), call]);
+}
+
+#[test]
+fn cloned_fake_dispatcher_rejects_a_plan_from_the_original_dispatcher() {
+    let call = ToolCall {
+        id: ToolCallId::new("call-clone"),
+        tool_name: "read_file".to_string(),
+        arguments: json!({ "path": "README.md" }),
+    };
+    let original = FakeToolDispatcher::default();
+    let prepared = original.prepare(call);
+    let mut cloned = original.clone();
+
+    assert_eq!(cloned.remaining_outputs(), 0);
+    let output = cloned.execute_prepared(
+        prepared,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let ToolOutput::Failure { error, extensions } = output else {
+        panic!("a prepared call must remain bound to its originating dispatcher");
+    };
+    assert_eq!(error.code, "invalid_prepared_tool_call");
+    assert!(extensions.is_empty());
+    assert!(cloned.calls().is_empty());
 }
 
 #[test]

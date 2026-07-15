@@ -127,3 +127,32 @@ pub(crate) fn failure(code: &str, message: impl Into<String>, retryable: bool) -
         extensions: BTreeMap::new(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{display_relative_path, finalize_output, truncate_utf8, MAX_OUTPUT_BYTES};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+    use young_tool_runtime::{ToolContent, ToolOutput};
+
+    #[test]
+    fn helper_boundaries_preserve_utf8_and_fail_closed_on_oversized_output() {
+        assert_eq!(truncate_utf8("éclair", 1), "");
+        assert_eq!(display_relative_path(Path::new(".")), ".");
+
+        let output = ToolOutput::Success {
+            content: vec![ToolContent::Text {
+                text: "x".repeat(MAX_OUTPUT_BYTES),
+            }],
+            metadata: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+        };
+        let ToolOutput::Failure { error, extensions } = finalize_output(output) else {
+            panic!("oversized output must fail closed");
+        };
+
+        assert_eq!(error.code, "output_too_large");
+        assert!(!error.retryable);
+        assert!(extensions.is_empty());
+    }
+}

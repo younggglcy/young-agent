@@ -13,7 +13,7 @@ use serde_json::json;
 use young_agent_runtime::{
     AgentEvent, AgentEventSink, AgentRuntime, AgentRuntimeError, ApprovalDecision, ApprovalRequest,
     EventDurability, EventSequence, RunControl, RunControlFlow, RunId, RunRequest, RunStatus,
-    RunStopToken, TerminalRunStatus,
+    RunStopToken, TerminalRunStatus, TurnId,
 };
 use young_event_store::JsonlEventStore;
 use young_model_runtime::{
@@ -21,8 +21,8 @@ use young_model_runtime::{
     ModelStreamEvent, ModelToolCallId, ScriptedModelTurn,
 };
 use young_tool_runtime::{
-    CapabilityRef, FakeToolDispatcher, ToolApprovalPolicy, ToolCall, ToolContent, ToolDefinition,
-    ToolError, ToolHandler, ToolOutput, ToolRuntime,
+    CapabilityRef, FakeToolDispatcher, ToolApprovalPolicy, ToolCall, ToolCallId, ToolContent,
+    ToolDefinition, ToolError, ToolHandler, ToolOutput, ToolResult, ToolRuntime,
 };
 
 struct TestLog {
@@ -64,6 +64,33 @@ fn run_request(run_id: &str) -> RunRequest {
         messages: vec![ModelMessage::user("Read README.md and summarize it.")],
         tools: Vec::new(),
         metadata: no_extensions(),
+    }
+}
+
+struct RequestRecordingModelClient {
+    inner: FakeModelClient,
+    requests: Vec<ModelRequest>,
+}
+
+impl RequestRecordingModelClient {
+    fn new(turns: impl IntoIterator<Item = ScriptedModelTurn>) -> Self {
+        Self {
+            inner: FakeModelClient::new(turns),
+            requests: Vec::new(),
+        }
+    }
+}
+
+impl ModelClient for RequestRecordingModelClient {
+    type Stream = std::vec::IntoIter<ModelStreamEvent>;
+
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancellation: Arc<AtomicBool>,
+    ) -> Result<Self::Stream, ModelError> {
+        self.requests.push(request.clone());
+        self.inner.stream(request, cancellation)
     }
 }
 
@@ -184,6 +211,88 @@ impl fmt::Display for TestSinkError {
 }
 
 impl Error for TestSinkError {}
+
+#[test]
+fn runtime_errors_distinguish_reuse_and_indeterminate_persistence_boundaries() {
+    let errors: Vec<(AgentRuntimeError<TestSinkError>, &str, bool)> = vec![
+        (
+            AgentRuntimeError::RuntimeAlreadyUsed {
+                run_id: RunId::new("run-used"),
+            },
+            "AgentRuntime already started Agent Run 'run-used' and cannot own another timeline",
+            false,
+        ),
+        (
+            AgentRuntimeError::StopTokenAlreadyBound {
+                run_id: RunId::new("run-bound"),
+            },
+            "RunStopToken is already bound to Agent Run 'run-bound'",
+            false,
+        ),
+        (
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                sequence: EventSequence::new(3),
+                event: Box::new(AgentEvent::ToolResult {
+                    run_id: RunId::new("run-001"),
+                    turn_id: TurnId::new("turn-001"),
+                    result: ToolResult {
+                        call_id: ToolCallId::new("tool-call-001"),
+                        output: ToolOutput::Success {
+                            content: Vec::new(),
+                            metadata: BTreeMap::new(),
+                            extensions: BTreeMap::new(),
+                        },
+                    },
+                    event_sequence: None,
+                    extensions: no_extensions(),
+                }),
+                durability: EventDurability::Durable,
+                source: TestSinkError,
+            },
+            "tool execution completed but persistence of Agent Event sequence 3 containing its result is indeterminate",
+            true,
+        ),
+        (
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                sequence: EventSequence::new(4),
+                event: Box::new(AgentEvent::RunFinished {
+                    run_id: RunId::new("run-001"),
+                    status: TerminalRunStatus::Completed {
+                        final_message: "done".to_string(),
+                    },
+                    event_sequence: None,
+                    extensions: no_extensions(),
+                }),
+                durability: EventDurability::Durable,
+                source: TestSinkError,
+            },
+            "terminal status was chosen but persistence of Agent Event sequence 4 containing RunFinished is indeterminate",
+            true,
+        ),
+        (
+            AgentRuntimeError::EventPersistenceIndeterminate {
+                sequence: EventSequence::new(5),
+                event: Box::new(AgentEvent::RunStarted {
+                    run_id: RunId::new("run-001"),
+                    event_sequence: None,
+                    extensions: no_extensions(),
+                }),
+                durability: EventDurability::Buffered,
+                source: TestSinkError,
+            },
+            "persistence of Agent Event sequence 5 is indeterminate",
+            true,
+        ),
+    ];
+
+    for (error, expected_prefix, has_source) in errors {
+        assert!(
+            error.to_string().starts_with(expected_prefix),
+            "unexpected runtime diagnostic: {error}"
+        );
+        assert_eq!(error.source().is_some(), has_source);
+    }
+}
 
 #[derive(Clone)]
 struct FailOnceOnToolResultSink {
@@ -444,8 +553,8 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
         ]),
     ]);
     let tools = FakeToolDispatcher::new([ToolOutput::Success {
-        content: vec![ToolContent::Text {
-            text: "# young-agent".to_string(),
+        content: vec![ToolContent::Json {
+            value: json!({ "document": "# young-agent" }),
         }],
         metadata: no_extensions(),
         extensions: no_extensions(),
@@ -474,6 +583,132 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
         .expect("tool call should replay")
         .result()
         .is_some());
+}
+
+#[test]
+fn assistant_text_is_preserved_when_the_same_turn_also_requests_a_tool() {
+    let log = TestLog::new("assistant-text-with-tool-call");
+    let store = JsonlEventStore::new(log.path());
+    let model = RequestRecordingModelClient::new([
+        ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "I will inspect the file first.".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("model-call-with-text"),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+        ScriptedModelTurn::events([
+            ModelStreamEvent::TextDelta {
+                delta: "Done.".to_string(),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("stop".to_string()),
+                extensions: no_extensions(),
+            },
+        ]),
+    ]);
+    let tools = FakeToolDispatcher::new([ToolOutput::Success {
+        content: vec![ToolContent::Text {
+            text: "# young-agent".to_string(),
+        }],
+        metadata: no_extensions(),
+        extensions: no_extensions(),
+    }]);
+    let mut runtime = AgentRuntime::new(model, tools, store);
+
+    runtime
+        .run(run_request("run-assistant-text-with-tool"))
+        .expect("run should complete");
+
+    let second_request = &runtime.model_client().requests[1];
+    assert!(matches!(
+        second_request.messages.get(1),
+        Some(ModelMessage::Assistant {
+            content: Some(text),
+            tool_calls,
+        }) if text == "I will inspect the file first." && tool_calls.len() == 1
+    ));
+}
+
+#[test]
+fn incomplete_model_stream_fails_the_run_with_a_durable_error() {
+    let log = TestLog::new("incomplete-model-stream");
+    let store = JsonlEventStore::new(log.path());
+    let model = FakeModelClient::new([ScriptedModelTurn::events([
+        ModelStreamEvent::Started {
+            request_id: None,
+            extensions: no_extensions(),
+        },
+        ModelStreamEvent::TextDelta {
+            delta: "partial".to_string(),
+            extensions: no_extensions(),
+        },
+    ])]);
+    let mut runtime = AgentRuntime::new(model, FakeToolDispatcher::default(), store.clone());
+
+    let outcome = runtime
+        .run(run_request("run-incomplete-model-stream"))
+        .expect("protocol failure is represented as a terminal run outcome");
+
+    assert!(matches!(outcome.status(), TerminalRunStatus::Failed { .. }));
+    let events = store.read_all().expect("timeline should remain readable");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error { error, .. } if error.code == "model_stream_incomplete"
+    )));
+}
+
+#[test]
+fn turn_limit_terminates_an_agent_that_never_stops_requesting_tools() {
+    const MAX_TURNS: usize = 128;
+    let log = TestLog::new("turn-limit");
+    let store = JsonlEventStore::new(log.path());
+    let model_turns = (1..=MAX_TURNS).map(|turn| {
+        ScriptedModelTurn::events([
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new(format!("model-call-{turn:03}")),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+                extensions: no_extensions(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: Some("tool_calls".to_string()),
+                extensions: no_extensions(),
+            },
+        ])
+    });
+    let tool_outputs = (1..=MAX_TURNS).map(|_| ToolOutput::Success {
+        content: Vec::new(),
+        metadata: no_extensions(),
+        extensions: no_extensions(),
+    });
+    let mut runtime = AgentRuntime::new(
+        FakeModelClient::new(model_turns),
+        FakeToolDispatcher::new(tool_outputs),
+        store.clone(),
+    );
+
+    let outcome = runtime
+        .run(run_request("run-turn-limit"))
+        .expect("safety limit should become a terminal outcome");
+
+    assert!(matches!(outcome.status(), TerminalRunStatus::Failed { .. }));
+    assert_eq!(runtime.model_client().request_count(), MAX_TURNS);
+    assert_eq!(runtime.tool_dispatcher().calls().len(), MAX_TURNS);
+    assert!(store.read_all().unwrap().iter().any(|event| matches!(
+        event,
+        AgentEvent::Error { error, .. } if error.code == "turn_limit_reached"
+    )));
 }
 
 #[test]

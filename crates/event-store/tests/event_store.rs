@@ -7,9 +7,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use young_agent_runtime::{
-    AgentEvent, AgentEventSink, EventDurability, EventSequence, RunStatus, TerminalRunStatus,
+    AgentEvent, AgentEventSink, EventDurability, EventSequence, RunId, RunStatus,
+    TerminalRunStatus, TurnId,
 };
-use young_event_store::{EventStoreError, JsonlEventStore, ReplayCompatibility, ReplayError};
+use young_event_store::{
+    replay_events, replay_events_with_compatibility, EventStoreError, JsonlEventStore,
+    ReplayCompatibility, ReplayError,
+};
+use young_tool_runtime::execution::ToolCallId;
 
 struct TestLog {
     path: PathBuf,
@@ -101,6 +106,744 @@ fn approval_result_events(decision: Value, output: Value) -> Vec<AgentEvent> {
             }
         })),
     ]
+}
+
+fn run_started(run_id: &str) -> AgentEvent {
+    agent_event(json!({ "type": "run_started", "run_id": run_id }))
+}
+
+fn turn_started(run_id: &str, turn_id: &str) -> AgentEvent {
+    agent_event(json!({
+        "type": "turn_started",
+        "run_id": run_id,
+        "turn_id": turn_id
+    }))
+}
+
+fn tool_call_requested(run_id: &str, turn_id: &str, call_id: &str, tool_name: &str) -> AgentEvent {
+    agent_event(json!({
+        "type": "tool_call_requested",
+        "run_id": run_id,
+        "turn_id": turn_id,
+        "model_tool_call_id": format!("model-{call_id}"),
+        "call": {
+            "id": call_id,
+            "tool_name": tool_name,
+            "arguments": { "path": "README.md" }
+        }
+    }))
+}
+
+fn approval_requested(
+    run_id: &str,
+    turn_id: &str,
+    approval_id: &str,
+    call_id: &str,
+    tool_name: &str,
+) -> AgentEvent {
+    agent_event(json!({
+        "type": "approval_requested",
+        "run_id": run_id,
+        "turn_id": turn_id,
+        "request": {
+            "id": approval_id,
+            "call": {
+                "id": call_id,
+                "tool_name": tool_name,
+                "arguments": { "path": "README.md" }
+            },
+            "reason": "approval required"
+        }
+    }))
+}
+
+fn approval_resolved(run_id: &str, turn_id: &str, approval_id: &str) -> AgentEvent {
+    agent_event(json!({
+        "type": "approval_resolved",
+        "run_id": run_id,
+        "turn_id": turn_id,
+        "approval_id": approval_id,
+        "decision": { "decision": "approve" }
+    }))
+}
+
+fn successful_tool_result(run_id: &str, turn_id: &str, call_id: &str) -> AgentEvent {
+    agent_event(json!({
+        "type": "tool_result",
+        "run_id": run_id,
+        "turn_id": turn_id,
+        "result": {
+            "call_id": call_id,
+            "output": { "status": "success", "content": [] }
+        }
+    }))
+}
+
+#[test]
+fn replay_errors_expose_actionable_diagnostics() {
+    let call_id = || ToolCallId::new("tool-call-001");
+    let turn_id = || TurnId::new("turn-001");
+    let cases = vec![
+        (
+            ReplayError::EmptyLog,
+            "cannot replay an empty Event Log".to_string(),
+        ),
+        (
+            ReplayError::FirstEventIsNotRunStarted,
+            "Event Log event 1 must be run_started".to_string(),
+        ),
+        (
+            ReplayError::DuplicateRunStarted { event_number: 2 },
+            "Event Log event 2 starts an already-started run".to_string(),
+        ),
+        (
+            ReplayError::MismatchedRunId {
+                event_number: 3,
+                expected: RunId::new("run-expected"),
+                found: RunId::new("run-found"),
+            },
+            "Event Log event 3 belongs to run 'run-found' instead of 'run-expected'".to_string(),
+        ),
+        (
+            ReplayError::DuplicateTurnStarted {
+                event_number: 4,
+                turn_id: turn_id(),
+            },
+            "Event Log event 4 repeats turn_started for turn 'turn-001'".to_string(),
+        ),
+        (
+            ReplayError::EventForUnknownTurn {
+                event_number: 5,
+                turn_id: turn_id(),
+            },
+            "Event Log event 5 belongs to turn 'turn-001' before that turn started".to_string(),
+        ),
+        (
+            ReplayError::EventForInactiveTurn {
+                event_number: 6,
+                expected: TurnId::new("turn-active"),
+                found: TurnId::new("turn-inactive"),
+            },
+            "Event Log event 6 flows back to inactive turn 'turn-inactive' while turn 'turn-active' is active".to_string(),
+        ),
+        (
+            ReplayError::TurnStartedWithUnresolvedToolCalls {
+                event_number: 7,
+                turn_id: turn_id(),
+                call_ids: vec![call_id(), ToolCallId::new("tool-call-002")],
+            },
+            "Event Log event 7 starts turn 'turn-001' while 2 tool call(s) remain unresolved".to_string(),
+        ),
+        (
+            ReplayError::MismatchedToolLifecycleTurn {
+                event_number: 8,
+                call_id: call_id(),
+                expected: TurnId::new("turn-origin"),
+                found: TurnId::new("turn-other"),
+            },
+            "Event Log event 8 places tool call 'tool-call-001' on turn 'turn-other' instead of its originating turn 'turn-origin'".to_string(),
+        ),
+        (
+            ReplayError::EventAfterRunFinished { event_number: 9 },
+            "Event Log event 9 appears after run_finished".to_string(),
+        ),
+        (
+            ReplayError::DuplicateToolCall {
+                event_number: 10,
+                call_id: call_id(),
+            },
+            "Event Log event 10 repeats tool call 'tool-call-001'".to_string(),
+        ),
+        (
+            ReplayError::ApprovalForUnknownToolCall {
+                event_number: 11,
+                call_id: call_id(),
+            },
+            "Event Log event 11 has an approval request for unknown tool call 'tool-call-001'"
+                .to_string(),
+        ),
+        (
+            ReplayError::ResultForUnknownToolCall {
+                event_number: 12,
+                call_id: call_id(),
+            },
+            "Event Log event 12 has a result for unknown tool call 'tool-call-001'".to_string(),
+        ),
+        (
+            ReplayError::ApprovalCallMismatch {
+                event_number: 13,
+                call_id: call_id(),
+            },
+            "Event Log event 13 changes the approved payload for tool call 'tool-call-001'"
+                .to_string(),
+        ),
+        (
+            ReplayError::ApprovalAfterToolResult {
+                event_number: 14,
+                call_id: call_id(),
+            },
+            "Event Log event 14 requests approval for tool call 'tool-call-001' after it already has a result".to_string(),
+        ),
+        (
+            ReplayError::DuplicateApproval {
+                event_number: 15,
+                call_id: call_id(),
+            },
+            "Event Log event 15 repeats approval for tool call 'tool-call-001'".to_string(),
+        ),
+        (
+            ReplayError::DuplicateApprovalId {
+                event_number: 16,
+                approval_id: "approval-001".to_string(),
+            },
+            "Event Log event 16 repeats approval id 'approval-001'".to_string(),
+        ),
+        (
+            ReplayError::ResolutionForUnknownApproval {
+                event_number: 17,
+                approval_id: "approval-001".to_string(),
+            },
+            "Event Log event 17 resolves unknown approval 'approval-001'".to_string(),
+        ),
+        (
+            ReplayError::DuplicateApprovalResolution {
+                event_number: 18,
+                approval_id: "approval-001".to_string(),
+            },
+            "Event Log event 18 repeats resolution for approval 'approval-001'".to_string(),
+        ),
+        (
+            ReplayError::ApprovalResolutionAfterToolResult {
+                event_number: 19,
+                approval_id: "approval-001".to_string(),
+            },
+            "Event Log event 19 resolves approval 'approval-001' after its tool call already has a result".to_string(),
+        ),
+        (
+            ReplayError::ToolResultBeforeApprovalResolution {
+                event_number: 20,
+                call_id: call_id(),
+            },
+            "Event Log event 20 records a result before approval for tool call 'tool-call-001' was resolved".to_string(),
+        ),
+        (
+            ReplayError::InvalidApprovalDenialResult {
+                event_number: 21,
+                call_id: call_id(),
+            },
+            "Event Log event 21 records an invalid approval-denial result for tool call 'tool-call-001'"
+                .to_string(),
+        ),
+        (
+            ReplayError::MixedApprovalLogFormats { event_number: 22 },
+            "Event Log event 22 mixes legacy approvals without resolutions and modern ApprovalResolved events".to_string(),
+        ),
+        (
+            ReplayError::LegacyCompatibilityForSequencedLog { event_number: 23 },
+            "Event Log event 23 is sequenced and cannot use pre-ApprovalResolved compatibility"
+                .to_string(),
+        ),
+        (
+            ReplayError::TerminalWithUnresolvedToolCalls {
+                event_number: 24,
+                call_ids: vec![call_id(), ToolCallId::new("tool-call-002")],
+            },
+            "Event Log event 24 finishes successfully or with failure while 2 tool call(s) remain unresolved".to_string(),
+        ),
+        (
+            ReplayError::DuplicateToolResult {
+                event_number: 25,
+                call_id: call_id(),
+            },
+            "Event Log event 25 repeats the result for tool call 'tool-call-001'".to_string(),
+        ),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn replay_rejects_duplicate_and_unmatched_lifecycle_events() {
+    assert!(matches!(
+        replay_events(Vec::new()),
+        Err(ReplayError::EmptyLog)
+    ));
+    assert!(matches!(
+        replay_events(vec![turn_started("run-001", "turn-001")]),
+        Err(ReplayError::FirstEventIsNotRunStarted)
+    ));
+    assert!(matches!(
+        replay_events(vec![run_started("run-001"), run_started("run-001")]),
+        Err(ReplayError::DuplicateRunStarted { event_number: 2 })
+    ));
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            agent_event(json!({
+                "type": "run_finished",
+                "run_id": "run-001",
+                "status": { "status": "completed", "final_message": "done" }
+            })),
+            agent_event(json!({
+                "type": "error",
+                "run_id": "run-001",
+                "error": {
+                    "code": "late",
+                    "message": "must not follow completion",
+                    "recoverable": false
+                }
+            })),
+        ]),
+        Err(ReplayError::EventAfterRunFinished { event_number: 3 })
+    ));
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            turn_started("run-001", "turn-001"),
+        ]),
+        Err(ReplayError::DuplicateTurnStarted {
+            event_number: 3,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+            tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+        ]),
+        Err(ReplayError::DuplicateToolCall {
+            event_number: 4,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            approval_requested(
+                "run-001",
+                "turn-001",
+                "approval-001",
+                "unknown-call",
+                "read_file",
+            ),
+        ]),
+        Err(ReplayError::ApprovalForUnknownToolCall {
+            event_number: 3,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+            approval_requested(
+                "run-001",
+                "turn-001",
+                "approval-001",
+                "call-001",
+                "search_files",
+            ),
+        ]),
+        Err(ReplayError::ApprovalCallMismatch {
+            event_number: 4,
+            ..
+        })
+    ));
+
+    let approved_call = || {
+        vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+            approval_requested(
+                "run-001",
+                "turn-001",
+                "approval-001",
+                "call-001",
+                "read_file",
+            ),
+        ]
+    };
+    let mut duplicate_approval = approved_call();
+    duplicate_approval.push(approval_requested(
+        "run-001",
+        "turn-001",
+        "approval-002",
+        "call-001",
+        "read_file",
+    ));
+    assert!(matches!(
+        replay_events(duplicate_approval),
+        Err(ReplayError::DuplicateApproval {
+            event_number: 5,
+            ..
+        })
+    ));
+
+    let mut duplicate_approval_id = approved_call();
+    duplicate_approval_id.push(tool_call_requested(
+        "run-001",
+        "turn-001",
+        "call-002",
+        "read_file",
+    ));
+    duplicate_approval_id.push(approval_requested(
+        "run-001",
+        "turn-001",
+        "approval-001",
+        "call-002",
+        "read_file",
+    ));
+    assert!(matches!(
+        replay_events(duplicate_approval_id),
+        Err(ReplayError::DuplicateApprovalId {
+            event_number: 6,
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            approval_resolved("run-001", "turn-001", "unknown-approval"),
+        ]),
+        Err(ReplayError::ResolutionForUnknownApproval {
+            event_number: 3,
+            ..
+        })
+    ));
+    let mut duplicate_resolution = approved_call();
+    duplicate_resolution.push(approval_resolved("run-001", "turn-001", "approval-001"));
+    duplicate_resolution.push(approval_resolved("run-001", "turn-001", "approval-001"));
+    assert!(matches!(
+        replay_events(duplicate_resolution),
+        Err(ReplayError::DuplicateApprovalResolution {
+            event_number: 6,
+            ..
+        })
+    ));
+
+    assert!(matches!(
+        replay_events(vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            successful_tool_result("run-001", "turn-001", "unknown-call"),
+        ]),
+        Err(ReplayError::ResultForUnknownToolCall {
+            event_number: 3,
+            ..
+        })
+    ));
+    let mut duplicate_result = vec![
+        run_started("run-001"),
+        turn_started("run-001", "turn-001"),
+        tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+        successful_tool_result("run-001", "turn-001", "call-001"),
+    ];
+    duplicate_result.push(successful_tool_result("run-001", "turn-001", "call-001"));
+    assert!(matches!(
+        replay_events(duplicate_result),
+        Err(ReplayError::DuplicateToolResult {
+            event_number: 5,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn replay_keeps_tool_lifecycle_events_on_their_originating_turn() {
+    let completed_call = || {
+        vec![
+            run_started("run-001"),
+            turn_started("run-001", "turn-001"),
+            tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+            successful_tool_result("run-001", "turn-001", "call-001"),
+            turn_started("run-001", "turn-002"),
+        ]
+    };
+
+    let mut mismatched_approval = completed_call();
+    mismatched_approval.push(approval_requested(
+        "run-001",
+        "turn-002",
+        "approval-late",
+        "call-001",
+        "read_file",
+    ));
+    assert!(matches!(
+        replay_events(mismatched_approval),
+        Err(ReplayError::MismatchedToolLifecycleTurn {
+            event_number: 6,
+            ..
+        })
+    ));
+
+    let mut resolved_call = vec![
+        run_started("run-001"),
+        turn_started("run-001", "turn-001"),
+        tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+        approval_requested(
+            "run-001",
+            "turn-001",
+            "approval-001",
+            "call-001",
+            "read_file",
+        ),
+        approval_resolved("run-001", "turn-001", "approval-001"),
+        successful_tool_result("run-001", "turn-001", "call-001"),
+        turn_started("run-001", "turn-002"),
+    ];
+    resolved_call.push(approval_resolved("run-001", "turn-002", "approval-001"));
+    assert!(matches!(
+        replay_events(resolved_call),
+        Err(ReplayError::MismatchedToolLifecycleTurn {
+            event_number: 8,
+            ..
+        })
+    ));
+
+    let mut mismatched_result = completed_call();
+    mismatched_result.push(successful_tool_result("run-001", "turn-002", "call-001"));
+    assert!(matches!(
+        replay_events(mismatched_result),
+        Err(ReplayError::MismatchedToolLifecycleTurn {
+            event_number: 6,
+            ..
+        })
+    ));
+
+    let mut mixed_legacy = vec![
+        run_started("run-001"),
+        turn_started("run-001", "turn-001"),
+        tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+        approval_requested(
+            "run-001",
+            "turn-001",
+            "approval-001",
+            "call-001",
+            "read_file",
+        ),
+        approval_resolved("run-001", "turn-001", "approval-001"),
+        successful_tool_result("run-001", "turn-001", "call-001"),
+        tool_call_requested("run-001", "turn-001", "call-002", "read_file"),
+        approval_requested(
+            "run-001",
+            "turn-001",
+            "approval-002",
+            "call-002",
+            "read_file",
+        ),
+    ];
+    mixed_legacy.push(successful_tool_result("run-001", "turn-001", "call-002"));
+    assert!(matches!(
+        replay_events_with_compatibility(
+            mixed_legacy,
+            ReplayCompatibility::LegacyApprovalWithoutResolution,
+        ),
+        Err(ReplayError::ToolResultBeforeApprovalResolution {
+            event_number: 9,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn store_identity_durable_io_and_replay_entrypoints_are_observable() {
+    let log = TestLog::new("durable-public-api");
+    let store = JsonlEventStore::new(log.path());
+    let cloned = store.clone();
+    let other = JsonlEventStore::new(log.path().with_extension("other.jsonl"));
+
+    assert_eq!(store.path(), log.path());
+    assert_eq!(store, cloned);
+    assert_ne!(store, other);
+    assert!(format!("{store:?}").contains("JsonlEventStore"));
+
+    let started = agent_event(json!({ "type": "run_started", "run_id": "run-001" }));
+    let finished = agent_event(json!({
+        "type": "run_finished",
+        "run_id": "run-001",
+        "status": { "status": "completed", "final_message": "done" }
+    }));
+    store
+        .append_durable(&started)
+        .expect("first durable append succeeds");
+    store
+        .append_durable(&finished)
+        .expect("second durable append reuses the validated handle");
+    assert_eq!(
+        store
+            .repair_truncated_tail()
+            .expect("committed log is intact"),
+        0
+    );
+    assert_eq!(
+        store
+            .replay_with_compatibility(ReplayCompatibility::Strict)
+            .expect("strict replay succeeds")
+            .terminal_status(),
+        Some(&TerminalRunStatus::Completed {
+            final_message: "done".to_string(),
+        })
+    );
+    assert_eq!(
+        store
+            .replay_for_recovery()
+            .expect("recovery replay succeeds")
+            .events()
+            .len(),
+        2
+    );
+
+    let empty = TestLog::new("empty-repair");
+    std::fs::write(empty.path(), []).expect("empty log is created");
+    assert_eq!(
+        JsonlEventStore::new(empty.path())
+            .repair_truncated_tail()
+            .expect("empty log needs no repair"),
+        0
+    );
+}
+
+#[test]
+fn missing_and_empty_logs_fail_closed_at_each_public_entrypoint() {
+    let missing = TestLog::new("missing-entrypoints");
+    let missing_store = JsonlEventStore::new(missing.path());
+    assert!(matches!(
+        missing_store.read_all(),
+        Err(EventStoreError::OpenForRead { .. })
+    ));
+    assert!(matches!(
+        missing_store.repair_truncated_tail(),
+        Err(EventStoreError::OpenForRepair { .. })
+    ));
+
+    let empty = TestLog::new("empty-entrypoints");
+    std::fs::write(empty.path(), []).expect("empty log is created");
+    let empty_store = JsonlEventStore::new(empty.path());
+    for error in [
+        empty_store.replay().expect_err("empty replay must fail"),
+        empty_store
+            .replay_with_compatibility(ReplayCompatibility::Strict)
+            .expect_err("empty compatibility replay must fail"),
+        empty_store
+            .replay_for_recovery()
+            .expect_err("empty recovery replay must fail"),
+    ] {
+        assert!(matches!(
+            error,
+            EventStoreError::Replay {
+                source: ReplayError::EmptyLog,
+                ..
+            }
+        ));
+    }
+}
+
+#[test]
+fn append_and_read_paths_reject_external_corruption() {
+    let missing_parent = TestLog::new("append-missing-parent");
+    let nested_path = missing_parent
+        .path()
+        .with_extension("missing")
+        .join("events.jsonl");
+    let error = JsonlEventStore::new(&nested_path)
+        .append(&run_started("run-001"))
+        .expect_err("append must not invent a missing parent directory");
+    assert!(matches!(
+        error,
+        EventStoreError::OpenForAppend { path, .. } if path == nested_path
+    ));
+
+    let corrupted_tail = TestLog::new("cached-invalid-tail");
+    let store = JsonlEventStore::new(corrupted_tail.path());
+    store
+        .append(&run_started("run-001"))
+        .expect("initial event should append");
+    std::fs::write(corrupted_tail.path(), b"{not-json}\n")
+        .expect("external corruption fixture should write");
+    let error = store
+        .append(&turn_started("run-001", "turn-001"))
+        .expect_err("cached append state must re-decode the final committed record");
+    assert!(matches!(
+        error,
+        EventStoreError::DecodeRecord { line: 1, .. }
+    ));
+
+    for (name, sequences, expected_line, expected, found) in [
+        ("first-sequence", vec![2], 1, Some(1), Some(2)),
+        ("later-gap", vec![1, 3], 2, Some(2), Some(3)),
+    ] {
+        let log = TestLog::new(name);
+        let records = sequences
+            .into_iter()
+            .enumerate()
+            .map(|(index, sequence)| {
+                let event = if index == 0 {
+                    run_started("run-001")
+                } else {
+                    turn_started("run-001", "turn-001")
+                };
+                serde_json::to_string(&event.with_event_sequence(EventSequence::new(sequence)))
+                    .expect("fixture should serialize")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(log.path(), records).expect("sequence fixture should write");
+
+        let error = JsonlEventStore::new(log.path())
+            .read_all()
+            .expect_err("invalid physical sequence must fail closed");
+        assert!(matches!(
+            error,
+            EventStoreError::InvalidEventSequence {
+                line,
+                expected: actual_expected,
+                found: actual_found,
+                ..
+            } if line == expected_line
+                && actual_expected.map(EventSequence::as_u64) == expected
+                && actual_found.map(EventSequence::as_u64) == found
+        ));
+    }
+}
+
+#[test]
+fn reconciliation_rejects_legacy_history_and_sequence_gaps() {
+    let legacy = TestLog::new("reconcile-legacy");
+    let legacy_store = JsonlEventStore::new(legacy.path());
+    let started = agent_event(json!({ "type": "run_started", "run_id": "run-001" }));
+    legacy_store
+        .append(&started)
+        .expect("legacy event should append");
+    assert!(matches!(
+        legacy_store.reconcile(
+            EventSequence::new(2),
+            &turn_started_event(),
+            EventDurability::Buffered,
+        ),
+        Err(EventStoreError::ReconciliationConflict { persisted, .. }) if persisted.len() == 1
+    ));
+
+    let missing = TestLog::new("reconcile-gap");
+    let missing_store = JsonlEventStore::new(missing.path());
+    assert!(matches!(
+        missing_store.reconcile(
+            EventSequence::new(2),
+            &started,
+            EventDurability::Buffered,
+        ),
+        Err(EventStoreError::ReconciliationConflict { persisted, .. }) if persisted.is_empty()
+    ));
 }
 
 #[test]
@@ -1482,6 +2225,79 @@ fn durable_event_reconciliation_rejects_a_later_exact_duplicate() {
             event.with_event_sequence(EventSequence::new(2)),
         ]
     );
+}
+
+#[test]
+fn durable_reconciliation_detects_every_kernel_owned_event_identity() {
+    let cases = [
+        (
+            "tool-call",
+            tool_call_requested("run-001", "turn-001", "call-001", "read_file"),
+        ),
+        (
+            "approval-request",
+            approval_requested(
+                "run-001",
+                "turn-001",
+                "approval-001",
+                "call-001",
+                "read_file",
+            ),
+        ),
+        (
+            "tool-result",
+            successful_tool_result("run-001", "turn-001", "call-001"),
+        ),
+        (
+            "run-finished",
+            agent_event(json!({
+                "type": "run_finished",
+                "run_id": "run-001",
+                "status": { "status": "completed", "final_message": "done" }
+            })),
+        ),
+    ];
+
+    for (name, event) in cases {
+        let log = TestLog::new(&format!("reconcile-identity-{name}"));
+        let mut store = JsonlEventStore::new(log.path());
+        <JsonlEventStore as AgentEventSink>::append_durable(
+            &mut store,
+            EventSequence::new(1),
+            &event,
+        )
+        .expect("fixture event should commit");
+
+        let error = store
+            .reconcile(EventSequence::new(2), &event, EventDurability::Durable)
+            .expect_err("a durable identity cannot move to another sequence");
+
+        assert!(matches!(
+            error,
+            EventStoreError::ReconciliationConflict {
+                sequence,
+                persisted,
+                ..
+            } if sequence == EventSequence::new(2) && persisted.len() == 1
+        ));
+    }
+
+    let log = TestLog::new("reconcile-unrelated-events");
+    let mut store = JsonlEventStore::new(log.path());
+    <JsonlEventStore as AgentEventSink>::append_durable(
+        &mut store,
+        EventSequence::new(1),
+        &run_started("run-001"),
+    )
+    .expect("run start should commit");
+    store
+        .reconcile(
+            EventSequence::new(2),
+            &turn_started("run-001", "turn-001"),
+            EventDurability::Durable,
+        )
+        .expect("unrelated consecutive events should reconcile normally");
+    assert_eq!(store.read_all().unwrap().len(), 2);
 }
 
 #[test]

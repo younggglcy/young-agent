@@ -906,3 +906,163 @@ impl Error for EventStoreError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use young_agent_runtime::RunId;
+
+    fn io_error() -> io::Error {
+        io::Error::other("boom")
+    }
+
+    fn json_error() -> serde_json::Error {
+        serde_json::from_str::<AgentEvent>("not-json").expect_err("fixture should be invalid JSON")
+    }
+
+    fn run_started() -> AgentEvent {
+        AgentEvent::RunStarted {
+            run_id: RunId::new("run-001"),
+            event_sequence: None,
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn event_store_errors_expose_paths_context_and_sources() {
+        let path = PathBuf::from("/tmp/run.jsonl");
+        let cases = vec![
+            (
+                EventStoreError::Encode {
+                    path: path.clone(),
+                    source: json_error(),
+                },
+                "failed to encode Agent Event for '/tmp/run.jsonl'",
+                true,
+            ),
+            (
+                EventStoreError::OpenForAppend {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to open Event Log '/tmp/run.jsonl' for append: boom",
+                true,
+            ),
+            (
+                EventStoreError::InspectForAppend {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to inspect Event Log '/tmp/run.jsonl' before append: boom",
+                true,
+            ),
+            (
+                EventStoreError::OpenForRepair {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to open Event Log '/tmp/run.jsonl' for tail repair: boom",
+                true,
+            ),
+            (
+                EventStoreError::RepairTail {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to repair truncated tail in Event Log '/tmp/run.jsonl': boom",
+                true,
+            ),
+            (
+                EventStoreError::UnterminatedLog { path: path.clone() },
+                "cannot append to Event Log '/tmp/run.jsonl': existing record is not terminated by a newline",
+                false,
+            ),
+            (
+                EventStoreError::Append {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to append to Event Log '/tmp/run.jsonl': boom",
+                true,
+            ),
+            (
+                EventStoreError::OpenForRead {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to open Event Log '/tmp/run.jsonl' for reading: boom",
+                true,
+            ),
+            (
+                EventStoreError::LockForRead {
+                    path: path.clone(),
+                    source: io_error(),
+                },
+                "failed to lock Event Log '/tmp/run.jsonl' for reading: boom",
+                true,
+            ),
+            (
+                EventStoreError::ReadRecord {
+                    path: path.clone(),
+                    line: 3,
+                    source: io_error(),
+                },
+                "failed to read Event Log '/tmp/run.jsonl' at line 3: boom",
+                true,
+            ),
+            (
+                EventStoreError::DecodeRecord {
+                    path: path.clone(),
+                    line: 4,
+                    source: json_error(),
+                },
+                "failed to decode Agent Event in '/tmp/run.jsonl' at line 4",
+                true,
+            ),
+            (
+                EventStoreError::TruncatedRecord {
+                    path: path.clone(),
+                    line: 5,
+                },
+                "truncated Agent Event in '/tmp/run.jsonl' at line 5: record is not terminated by a newline",
+                false,
+            ),
+            (
+                EventStoreError::InvalidEventSequence {
+                    path: path.clone(),
+                    line: 6,
+                    expected: Some(EventSequence::new(2)),
+                    found: Some(EventSequence::new(3)),
+                },
+                "invalid Agent Event sequence in '/tmp/run.jsonl' at line 6: expected Some(EventSequence(2)), found Some(EventSequence(3))",
+                false,
+            ),
+            (
+                EventStoreError::Replay {
+                    path: path.clone(),
+                    source: ReplayError::EmptyLog,
+                },
+                "failed to replay Event Log '/tmp/run.jsonl': cannot replay an empty Event Log",
+                true,
+            ),
+            (
+                EventStoreError::ReconciliationConflict {
+                    path,
+                    sequence: EventSequence::new(7),
+                    persisted: vec![run_started()],
+                    attempted: Box::new(run_started()),
+                },
+                "Agent Event sequence 7 or its durable lifecycle identity has conflicting records in '/tmp/run.jsonl'",
+                false,
+            ),
+        ];
+
+        for (error, expected_prefix, has_source) in cases {
+            assert!(
+                error.to_string().starts_with(expected_prefix),
+                "unexpected diagnostic: {error}"
+            );
+            assert_eq!(error.source().is_some(), has_source);
+        }
+    }
+}
