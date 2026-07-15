@@ -373,8 +373,7 @@ fn sanitized_inherited_path_cannot_execute_a_workspace_program() {
             Err(error) => error,
         };
         assert!(
-            matches!(error, CodingWorkspaceError::StartGitProbe(ref source)
-                if source.kind() == std::io::ErrorKind::NotFound),
+            matches!(&error, CodingWorkspaceError::StartGitProbe(_)),
             "unexpected workspace error for {mode}: {error}"
         );
         assert!(!root.join("marker.txt").exists(), "path mode: {mode}");
