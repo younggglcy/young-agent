@@ -4,6 +4,10 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use young_tool_runtime::ToolCall;
 
+pub(crate) const LOW_RISK_EXTERNAL_PROGRAMS: &[&str] = &[
+    "git", "cargo", "rg", "ls", "cat", "grep", "head", "tail", "wc", "stat", "file", "find", "sed",
+];
+
 const MAX_SIMPLE_COMMANDS: usize = 32;
 const MAX_POLICY_WORDS: usize = 256;
 const MAX_PATH_PROBE_CANDIDATES: usize = 256;
@@ -264,22 +268,7 @@ fn classify_simple_command(
             return requires_approval("command may amplify output without a fixed resource bound");
         }
     }
-    if program == "find"
-        && arguments.iter().any(|argument| {
-            matches!(
-                argument.as_str(),
-                "-delete"
-                    | "-exec"
-                    | "-execdir"
-                    | "-ok"
-                    | "-okdir"
-                    | "-fprint"
-                    | "-fprint0"
-                    | "-fprintf"
-                    | "-fls"
-            )
-        })
-    {
+    if program == "find" && find_may_mutate_or_execute(arguments) {
         return requires_approval("command may mutate workspace files or execute a helper");
     }
     if program == "sed" && !is_safe_sed_read(arguments) {
@@ -288,6 +277,27 @@ fn classify_simple_command(
 
     let allowed = match words {
         [program] if program == "pwd" => true,
+        [command, flag, _program] if command == "command" && flag == "-v" => true,
+        [program, ..] if matches!(program.as_str(), "echo" | "printf" | "true" | "false") => true,
+        _ => false,
+    } || is_low_risk_external_command(words);
+
+    if allowed {
+        CommandPolicyDecision::Allow
+    } else {
+        requires_approval("command is not classified as low-risk")
+    }
+}
+
+fn is_low_risk_external_command(words: &[String]) -> bool {
+    let Some(program) = words.first().map(String::as_str) else {
+        return false;
+    };
+    if !LOW_RISK_EXTERNAL_PROGRAMS.contains(&program) {
+        return false;
+    }
+
+    match words {
         [git, subcommand, ..] if git == "git" && subcommand == "rev-parse" => true,
         [git, branch, option]
             if git == "git" && branch == "branch" && option == "--show-current" =>
@@ -307,36 +317,27 @@ fn classify_simple_command(
         {
             true
         }
-        [command, flag, _program] if command == "command" && flag == "-v" => true,
-        [program, arguments @ ..] if program == "sed" && is_safe_sed_read(arguments) => true,
-        [program, ..]
-            if matches!(
-                program.as_str(),
-                "rg" | "ls"
-                    | "cat"
-                    | "grep"
-                    | "head"
-                    | "tail"
-                    | "wc"
-                    | "stat"
-                    | "file"
-                    | "find"
-                    | "echo"
-                    | "printf"
-                    | "true"
-                    | "false"
-            ) =>
-        {
-            true
-        }
+        [sed, arguments @ ..] if sed == "sed" && is_safe_sed_read(arguments) => true,
+        [program, ..] if !matches!(program.as_str(), "git" | "cargo" | "sed") => true,
         _ => false,
-    };
-
-    if allowed {
-        CommandPolicyDecision::Allow
-    } else {
-        requires_approval("command is not classified as low-risk")
     }
+}
+
+fn find_may_mutate_or_execute(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-fls"
+        )
+    })
 }
 
 fn is_file_compile_option(argument: &str) -> bool {
@@ -550,16 +551,13 @@ fn classify_hard_rejection(
     words: &[String],
     path_probes: &mut PathProbeBudget,
 ) -> Option<CommandPolicyDecision> {
-    let program = words.first()?;
-    let arguments = &words[1..];
+    let invocation = unwrap_transparent_command_wrappers(words);
+    let program = invocation.first()?;
+    let arguments = &invocation[1..];
     if matches!(program_basename(program), "sudo" | "doas" | "su") {
         return Some(reject("command attempts privilege elevation"));
     }
-    if program_basename(program) == "rm"
-        && arguments
-            .iter()
-            .any(|argument| targets_filesystem_root(argument))
-    {
+    if command_mutates_filesystem_root(program, arguments) {
         return Some(reject("command targets the filesystem root"));
     }
     if program == "cd" {
@@ -582,6 +580,111 @@ fn classify_hard_rejection(
         }
     }
     None
+}
+
+fn unwrap_transparent_command_wrappers(mut words: &[String]) -> &[String] {
+    const MAX_TRANSPARENT_WRAPPER_DEPTH: usize = 4;
+
+    for _ in 0..MAX_TRANSPARENT_WRAPPER_DEPTH {
+        let Some(program) = words.first() else {
+            return words;
+        };
+        let argument_index = match program_basename(program) {
+            "command" => command_wrapped_program_index(words),
+            "exec" => exec_wrapped_program_index(words),
+            "env" => env_wrapped_program_index(words),
+            _ => return words,
+        };
+        let Some(argument_index) = argument_index else {
+            return words;
+        };
+        words = &words[argument_index..];
+    }
+    words
+}
+
+fn command_wrapped_program_index(words: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while let Some(argument) = words.get(index) {
+        match argument.as_str() {
+            "--" => return (index + 1 < words.len()).then_some(index + 1),
+            "-p" => index += 1,
+            "-v" | "-V" => return None,
+            _ if argument.starts_with('-') => return None,
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
+fn exec_wrapped_program_index(words: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while let Some(argument) = words.get(index) {
+        match argument.as_str() {
+            "--" => return (index + 1 < words.len()).then_some(index + 1),
+            "-a" => index = index.checked_add(2)?,
+            _ if argument.starts_with('-')
+                && argument[1..]
+                    .chars()
+                    .all(|option| matches!(option, 'c' | 'l')) =>
+            {
+                index += 1;
+            }
+            _ if argument.starts_with('-') => return None,
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
+fn env_wrapped_program_index(words: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while let Some(argument) = words.get(index) {
+        match argument.as_str() {
+            "--" => return (index + 1 < words.len()).then_some(index + 1),
+            "-i" | "--ignore-environment" | "-0" | "--null" => index += 1,
+            "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" => {
+                index = index.checked_add(2)?;
+            }
+            "-S" | "--split-string" => return None,
+            _ if argument.starts_with("--unset=")
+                || argument.starts_with("--chdir=")
+                || argument.starts_with("--argv0=") =>
+            {
+                index += 1;
+            }
+            _ if argument.starts_with('-') => return None,
+            _ if is_shell_assignment(argument) => index += 1,
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
+fn is_shell_assignment(word: &str) -> bool {
+    let Some((name, _value)) = word.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn command_mutates_filesystem_root(program: &str, arguments: &[String]) -> bool {
+    if !arguments
+        .iter()
+        .any(|argument| targets_filesystem_root(argument))
+    {
+        return false;
+    }
+
+    match program_basename(program) {
+        "rm" | "chmod" | "chown" => true,
+        "find" => find_may_mutate_or_execute(arguments),
+        _ => false,
+    }
 }
 
 fn targets_filesystem_root(argument: &str) -> bool {

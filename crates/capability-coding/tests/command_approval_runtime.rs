@@ -179,6 +179,23 @@ fn run_denied_command(root: &Path, run_id: &str, command: &str) -> JsonlEventSto
 }
 
 fn run_rejected_call(directory: &TestDirectory, run_id: &str, arguments: Value) -> JsonlEventStore {
+    run_rejected_call_inner(directory, run_id, arguments, false)
+}
+
+fn run_rejected_call_with_approval_available(
+    directory: &TestDirectory,
+    run_id: &str,
+    arguments: Value,
+) -> JsonlEventStore {
+    run_rejected_call_inner(directory, run_id, arguments, true)
+}
+
+fn run_rejected_call_inner(
+    directory: &TestDirectory,
+    run_id: &str,
+    arguments: Value,
+    approval_available: bool,
+) -> JsonlEventStore {
     let workspace = CodingWorkspace::resolve(directory.path()).expect("workspace resolves");
     let mut tools = ToolRuntime::default();
     register_builtin_coding_capability(&mut tools, workspace).expect("capability registers");
@@ -209,9 +226,15 @@ fn run_rejected_call(directory: &TestDirectory, run_id: &str, arguments: Value) 
     let store = JsonlEventStore::new(directory.path().join("run.jsonl"));
     let mut runtime = AgentRuntime::new(model, tools, store.clone());
 
-    runtime
-        .run(run_request(run_id))
-        .expect("rejected command should remain a replayable run");
+    if approval_available {
+        runtime
+            .run_with_control(run_request(run_id), &mut ApprovingControl)
+            .expect("rejected command should not consume available approval");
+    } else {
+        runtime
+            .run(run_request(run_id))
+            .expect("rejected command should remain a replayable run");
+    }
 
     store
 }
@@ -641,6 +664,28 @@ fn rejected_command_is_not_executed_and_replays_without_approval_events() {
 
     assert!(!directory.path().join("marker.txt").exists());
     assert_replayed_rejection(&store, "privilege-elevation", "privilege elevation");
+}
+
+#[test]
+fn root_targeting_command_cannot_execute_even_when_approval_is_available() {
+    let directory = TestDirectory::new("root-targeting");
+    let fake_find = directory.path().join("find");
+    std::fs::write(&fake_find, "#!/bin/sh\n: > marker.txt\n")
+        .expect("fake find executable is written");
+    let mut permissions = std::fs::metadata(&fake_find)
+        .expect("fake find metadata is available")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_find, permissions).expect("fake find is executable");
+
+    let store = run_rejected_call_with_approval_available(
+        &directory,
+        "root-targeting",
+        json!({ "command": "./find / -delete" }),
+    );
+
+    assert!(!directory.path().join("marker.txt").exists());
+    assert_replayed_rejection(&store, "root-targeting", "filesystem root");
 }
 
 #[test]

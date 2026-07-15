@@ -23,6 +23,7 @@ use std::cell::Cell;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
 use crate::command_input::parse_run_command_arguments;
+use crate::command_policy::LOW_RISK_EXTERNAL_PROGRAMS;
 use crate::tool_support::{
     failure, finalize_output, truncate_json_string, MAX_OUTPUT_BYTES,
     MAX_TOOL_CONTENT_SERIALIZED_BYTES,
@@ -43,9 +44,6 @@ const INITIAL_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_COMMAND_PATH_ENTRIES: usize = 64;
 const UNAVAILABLE_COMMAND_PATH: &str = "/dev/null";
-const LOW_RISK_EXTERNAL_PROGRAMS: &[&str] = &[
-    "git", "cargo", "rg", "ls", "cat", "grep", "head", "tail", "wc", "stat", "file", "find", "sed",
-];
 const COMMAND_ENVIRONMENT_BLOCKLIST: &[&str] = &[
     "BASH_ENV",
     "ENV",
