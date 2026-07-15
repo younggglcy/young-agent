@@ -26,6 +26,7 @@ use young_tool_runtime::{ToolContent, ToolOutput, ToolRuntime};
 
 struct DenyingControl;
 struct BlankReasonDenyingControl;
+struct OversizedReasonDenyingControl;
 struct ApprovingControl;
 
 impl RunControl for DenyingControl {
@@ -56,6 +57,22 @@ impl RunControl for BlankReasonDenyingControl {
     ) -> ApprovalDecision {
         ApprovalDecision::Deny {
             reason: " \t ".to_string(),
+        }
+    }
+}
+
+impl RunControl for OversizedReasonDenyingControl {
+    fn checkpoint(&mut self) -> RunControlFlow {
+        RunControlFlow::Continue
+    }
+
+    fn decide_approval(
+        &mut self,
+        _request: &ApprovalRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Deny {
+            reason: "\n\"界".repeat(700_000),
         }
     }
 }
@@ -338,6 +355,43 @@ fn blank_approval_denial_reason_is_normalized_before_it_is_persisted() {
     };
     assert_eq!(error.code, "approval_denied");
     assert_eq!(error.message, "approval denied without a reason");
+}
+
+#[test]
+fn oversized_approval_denial_reason_is_bounded_before_it_is_persisted() {
+    let directory = TestDirectory::new("oversized-denial-reason");
+    let store = run_denied_command_with_control(
+        directory.path(),
+        "run-command-oversized-denial-reason",
+        "touch marker.txt",
+        &mut OversizedReasonDenyingControl,
+    );
+
+    assert!(!directory.path().join("marker.txt").exists());
+    let replay = store.replay().expect("Event Log replays");
+    let tool_call = replay.tool_calls().next().expect("tool call replays");
+    let Some(ApprovalDecision::Deny { reason }) = tool_call.approval_decision() else {
+        panic!("denial decision replays");
+    };
+    assert!(reason.ends_with("… [truncated]"));
+    assert!(
+        serde_json::to_vec(reason)
+            .expect("bounded reason serializes")
+            .len()
+            <= 8 * 1024
+    );
+    let result = tool_call.result().expect("denied tool result replays");
+    let ToolOutput::Failure { error, .. } = &result.output else {
+        panic!("denied command must produce a failure result");
+    };
+    assert_eq!(error.code, "approval_denied");
+    assert_eq!(&error.message, reason);
+    assert!(
+        std::fs::metadata(directory.path().join("run.jsonl"))
+            .expect("Event Log metadata is available")
+            .len()
+            < 64 * 1024
+    );
 }
 
 #[test]

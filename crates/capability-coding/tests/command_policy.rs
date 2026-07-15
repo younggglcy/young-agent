@@ -177,6 +177,8 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         ("rm -rf /tmp/../*", "filesystem root"),
         ("find / -delete", "filesystem root"),
         ("/usr/bin/find / -delete", "filesystem root"),
+        ("pwd # harmless\nrm -rf /", "filesystem root"),
+        ("pwd # harmless\nsudo true", "privilege elevation"),
         ("touch /", "filesystem root"),
         ("mkdir /", "filesystem root"),
         ("cp payload /", "filesystem root"),
@@ -185,6 +187,7 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         ("chown -R root /", "filesystem root"),
         ("tee /", "filesystem root"),
         ("sed -i /", "filesystem root"),
+        ("sed --in-place '1d' /*", "filesystem root"),
         ("env rm -rf /", "filesystem root"),
         ("env -i rm -rf /", "filesystem root"),
         ("env -iv rm -rf /", "filesystem root"),
@@ -210,6 +213,9 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
         ("echo 'unterminated", "malformed shell syntax"),
         ("; pwd", "malformed shell syntax"),
         ("pwd;;pwd", "malformed shell syntax"),
+        ("pwd &&\n", "malformed shell syntax"),
+        ("pwd ||\n", "malformed shell syntax"),
+        ("pwd |\n", "malformed shell syntax"),
     ] {
         let CommandPolicyDecision::Reject { reason } = policy.classify(&workspace, command) else {
             panic!("expected command to be rejected: {command}");
@@ -219,6 +225,18 @@ fn malformed_and_clearly_unsafe_commands_are_rejected() {
             "rejection reason '{reason}' should describe command: {command}",
         );
     }
+
+    let hidden_complexity = format!(
+        "pwd # harmless\n{}",
+        std::iter::repeat_n("pwd", 33)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let CommandPolicyDecision::Reject { reason } = policy.classify(&workspace, &hidden_complexity)
+    else {
+        panic!("commands after a comment must still consume the complexity budget");
+    };
+    assert!(reason.contains("too complex"), "{reason}");
 }
 
 #[test]

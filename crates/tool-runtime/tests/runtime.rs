@@ -374,6 +374,10 @@ fn call_dependent_policy_rejects_empty_reasons_before_execution() {
             FakeToolHandler::requiring_approval(" ", []),
         ),
         ("empty rejection reason", FakeToolHandler::rejecting("", [])),
+        (
+            "oversized whitespace approval reason",
+            FakeToolHandler::requiring_approval(" ".repeat(3 * 1024 * 1024), []),
+        ),
     ];
 
     for (case, handler) in cases {
@@ -641,6 +645,60 @@ fn call_dependent_handler_is_classified_once_and_the_plan_is_reused() {
 
     assert_eq!(output, expected);
     assert_eq!(classifications.get(), 1);
+}
+
+#[test]
+fn dynamic_policy_reasons_are_bounded_before_the_plan_is_exposed() {
+    let oversized_reason = "\n\"界".repeat(700_000);
+
+    for (case, handler) in [
+        (
+            "approval",
+            FakeToolHandler::requiring_approval(oversized_reason.clone(), []),
+        ),
+        (
+            "rejection",
+            FakeToolHandler::rejecting(oversized_reason.clone(), []),
+        ),
+    ] {
+        let mut definition = read_file_definition();
+        definition.approval_policy = ToolApprovalPolicy::CallDependent;
+        let mut runtime = ToolRuntime::default();
+        runtime
+            .register(definition, handler)
+            .expect("tool registers");
+        let prepared = runtime.prepare(ToolCall {
+            id: ToolCallId::new(format!("call-{case}")),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        });
+
+        let reason = if case == "approval" {
+            prepared
+                .approval_reason()
+                .expect("approval reason is exposed")
+                .to_string()
+        } else {
+            let output = runtime.execute_prepared(
+                prepared,
+                ToolExecutionAuthorization::NotRequired,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ToolOutput::Failure { error, .. } = output else {
+                panic!("rejected policy produces a tool failure");
+            };
+            error.message
+        };
+
+        assert!(reason.ends_with("… [truncated]"), "case: {case}");
+        assert!(
+            serde_json::to_vec(&reason)
+                .expect("bounded reason serializes")
+                .len()
+                <= 8 * 1024,
+            "case: {case}"
+        );
+    }
 }
 
 #[test]

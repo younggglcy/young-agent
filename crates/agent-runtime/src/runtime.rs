@@ -10,8 +10,8 @@ use young_model_runtime::{
     ModelToolCall, ModelToolSpec,
 };
 use young_tool_runtime::{
-    ToolCall, ToolCallId, ToolContent, ToolDispatcher, ToolExecutionAuthorization, ToolOutput,
-    ToolResult,
+    bound_approval_reason, ToolCall, ToolCallId, ToolContent, ToolDispatcher,
+    ToolExecutionAuthorization, ToolOutput, ToolResult,
 };
 
 use crate::{
@@ -774,9 +774,16 @@ where
 
 fn normalize_approval_decision(decision: ApprovalDecision) -> ApprovalDecision {
     match decision {
-        ApprovalDecision::Deny { reason } if reason.trim().is_empty() => ApprovalDecision::Deny {
-            reason: EMPTY_APPROVAL_DENIAL_REASON.to_string(),
-        },
+        ApprovalDecision::Deny { reason } => {
+            let reason = bound_approval_reason(reason);
+            if reason.trim().is_empty() {
+                ApprovalDecision::Deny {
+                    reason: EMPTY_APPROVAL_DENIAL_REASON.to_string(),
+                }
+            } else {
+                ApprovalDecision::Deny { reason }
+            }
+        }
         decision => decision,
     }
 }

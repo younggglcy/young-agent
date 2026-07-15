@@ -6,8 +6,9 @@ pub mod manifest;
 pub mod registry;
 
 pub use execution::{
-    PreparedToolCall, ToolCall, ToolCallId, ToolCallPolicy, ToolContent, ToolDispatcher, ToolError,
-    ToolExecutionAuthorization, ToolHandler, ToolOutput, ToolResult,
+    bound_approval_reason, PreparedToolCall, ToolCall, ToolCallId, ToolCallPolicy, ToolContent,
+    ToolDispatcher, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput, ToolResult,
+    MAX_APPROVAL_REASON_SERIALIZED_BYTES,
 };
 pub use fake::{FakeToolDispatcher, FakeToolHandler};
 pub use manifest::{

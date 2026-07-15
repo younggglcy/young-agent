@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::execution::{
-    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    bound_approval_reason, normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
     ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
     ToolResult,
 };
@@ -258,7 +258,7 @@ impl ToolDispatcher for ToolRuntime {
                 call,
                 ToolError {
                     code: "tool_rejected".to_string(),
-                    message: reason.clone(),
+                    message: bound_approval_reason(reason.clone()),
                     retryable: false,
                 },
             ),

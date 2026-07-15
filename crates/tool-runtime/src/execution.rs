@@ -5,6 +5,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const MAX_APPROVAL_REASON_SERIALIZED_BYTES: usize = 8 * 1024;
+const APPROVAL_REASON_TRUNCATED_SUFFIX: &str = "… [truncated]";
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ToolCallId(String);
@@ -100,12 +103,73 @@ enum ToolExecutionDisposition {
     Reject { error: ToolError },
 }
 
+/// Bounds one user- or policy-provided approval reason before it crosses a
+/// persistence boundary. The limit applies to the serialized JSON string,
+/// including quotes and escapes, rather than only its raw UTF-8 length.
+pub fn bound_approval_reason(reason: String) -> String {
+    if reason.len() + 2 <= MAX_APPROVAL_REASON_SERIALIZED_BYTES
+        && serialized_json_string_bytes(&reason) <= MAX_APPROVAL_REASON_SERIALIZED_BYTES
+    {
+        return reason;
+    }
+
+    let content_budget = MAX_APPROVAL_REASON_SERIALIZED_BYTES
+        - 2
+        - serialized_json_string_content_bytes(APPROVAL_REASON_TRUNCATED_SUFFIX);
+    let mut content_bytes = 0usize;
+    let mut end = 0usize;
+    for (index, character) in reason.char_indices() {
+        let character_bytes = serialized_json_character_bytes(character);
+        if content_bytes + character_bytes > content_budget {
+            break;
+        }
+        content_bytes += character_bytes;
+        end = index + character.len_utf8();
+    }
+
+    let prefix = &reason[..end];
+    if prefix.trim().is_empty() {
+        return prefix.to_string();
+    }
+    let mut bounded = String::with_capacity(prefix.len() + APPROVAL_REASON_TRUNCATED_SUFFIX.len());
+    bounded.push_str(prefix);
+    bounded.push_str(APPROVAL_REASON_TRUNCATED_SUFFIX);
+    bounded
+}
+
+fn serialized_json_string_bytes(value: &str) -> usize {
+    2usize.saturating_add(serialized_json_string_content_bytes(value))
+}
+
+fn serialized_json_string_content_bytes(value: &str) -> usize {
+    value.chars().fold(0usize, |bytes, character| {
+        bytes.saturating_add(serialized_json_character_bytes(character))
+    })
+}
+
+fn serialized_json_character_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
 impl PreparedToolCall {
     pub(crate) fn classified(
         dispatcher_identity: ToolDispatcherIdentity,
         call: ToolCall,
         policy: ToolCallPolicy,
     ) -> Self {
+        let policy = match policy {
+            ToolCallPolicy::RequiresApproval { reason } => ToolCallPolicy::RequiresApproval {
+                reason: bound_approval_reason(reason),
+            },
+            ToolCallPolicy::Reject { reason } => ToolCallPolicy::Reject {
+                reason: bound_approval_reason(reason),
+            },
+            ToolCallPolicy::Allow => ToolCallPolicy::Allow,
+        };
         match policy {
             ToolCallPolicy::Allow => Self::ready(dispatcher_identity, call),
             ToolCallPolicy::RequiresApproval { reason } | ToolCallPolicy::Reject { reason }
@@ -153,7 +217,7 @@ impl PreparedToolCall {
             dispatcher_identity,
             call,
             disposition: ToolExecutionDisposition::RequiresApproval {
-                reason: reason.into(),
+                reason: bound_approval_reason(reason.into()),
             },
         }
     }

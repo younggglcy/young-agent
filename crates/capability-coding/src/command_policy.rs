@@ -747,9 +747,11 @@ fn command_mutates_filesystem_root(program: &str, arguments: &[String]) -> bool 
 fn known_filesystem_mutator(program: &str, arguments: &[String]) -> bool {
     match program_basename(program) {
         "touch" | "mkdir" | "cp" | "mv" | "chmod" | "chown" | "tee" => true,
-        "sed" => arguments
-            .iter()
-            .any(|argument| argument == "-i" || argument.starts_with("-i")),
+        "sed" => arguments.iter().any(|argument| {
+            argument == "-i"
+                || argument.starts_with("-i")
+                || long_option_matches_or_abbreviates(argument, "--in-place")
+        }),
         _ => false,
     }
 }
@@ -952,7 +954,15 @@ impl ParsedShellCommand {
                     }
                     '#' if !word_started => {
                         parsed.has_comment = true;
-                        break;
+                        let comment_ended_at_newline =
+                            characters.by_ref().any(|character| character == '\n');
+                        if comment_ended_at_newline {
+                            push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
+                            if !words.is_empty() {
+                                push_command(&mut parsed.commands, &mut words)?;
+                                requires_following_command = false;
+                            }
+                        }
                     }
                     '>' | '<' => {
                         push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
@@ -990,8 +1000,8 @@ impl ParsedShellCommand {
                         push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
                         if !words.is_empty() {
                             push_command(&mut parsed.commands, &mut words)?;
+                            requires_following_command = false;
                         }
-                        requires_following_command = false;
                     }
                     ' ' | '\t' => {
                         push_word(&mut words, &mut word, &mut word_started, &mut word_count)?;
