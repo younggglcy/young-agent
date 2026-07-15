@@ -25,6 +25,7 @@ use young_model_runtime::{
 use young_tool_runtime::{ToolContent, ToolOutput, ToolRuntime};
 
 struct DenyingControl;
+struct BlankReasonDenyingControl;
 struct ApprovingControl;
 
 impl RunControl for DenyingControl {
@@ -39,6 +40,22 @@ impl RunControl for DenyingControl {
     ) -> ApprovalDecision {
         ApprovalDecision::Deny {
             reason: "user denied workspace mutation".to_string(),
+        }
+    }
+}
+
+impl RunControl for BlankReasonDenyingControl {
+    fn checkpoint(&mut self) -> RunControlFlow {
+        RunControlFlow::Continue
+    }
+
+    fn decide_approval(
+        &mut self,
+        _request: &ApprovalRequest,
+        _cancellation: Arc<AtomicBool>,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Deny {
+            reason: " \t ".to_string(),
         }
     }
 }
@@ -141,6 +158,15 @@ fn run_unapproved_command_with_workspace(
 }
 
 fn run_denied_command(root: &Path, run_id: &str, command: &str) -> JsonlEventStore {
+    run_denied_command_with_control(root, run_id, command, &mut DenyingControl)
+}
+
+fn run_denied_command_with_control(
+    root: &Path,
+    run_id: &str,
+    command: &str,
+    control: &mut impl RunControl,
+) -> JsonlEventStore {
     let workspace = CodingWorkspace::resolve(root).expect("workspace resolves");
     let mut tools = ToolRuntime::default();
     register_builtin_coding_capability(&mut tools, workspace).expect("capability registers");
@@ -172,7 +198,7 @@ fn run_denied_command(root: &Path, run_id: &str, command: &str) -> JsonlEventSto
     let mut runtime = AgentRuntime::new(model, tools, store.clone());
 
     runtime
-        .run_with_control(run_request(run_id), &mut DenyingControl)
+        .run_with_control(run_request(run_id), control)
         .expect("denied command should remain a replayable run");
 
     store
@@ -286,6 +312,32 @@ fn denied_mutating_command_is_not_executed_and_replays_its_decision() {
     };
     assert_eq!(error.code, "approval_denied");
     assert_eq!(error.message, "user denied workspace mutation");
+}
+
+#[test]
+fn blank_approval_denial_reason_is_normalized_before_it_is_persisted() {
+    let directory = TestDirectory::new("blank-denial-reason");
+    let store = run_denied_command_with_control(
+        directory.path(),
+        "run-command-blank-denial-reason",
+        "touch marker.txt",
+        &mut BlankReasonDenyingControl,
+    );
+
+    assert!(!directory.path().join("marker.txt").exists());
+    let replay = store.replay().expect("Event Log replays");
+    let tool_call = replay.tool_calls().next().expect("tool call replays");
+    assert!(matches!(
+        tool_call.approval_decision(),
+        Some(ApprovalDecision::Deny { reason })
+            if reason == "approval denied without a reason"
+    ));
+    let result = tool_call.result().expect("denied tool result replays");
+    let ToolOutput::Failure { error, .. } = &result.output else {
+        panic!("denied command must produce a failure result");
+    };
+    assert_eq!(error.code, "approval_denied");
+    assert_eq!(error.message, "approval denied without a reason");
 }
 
 #[test]
@@ -504,6 +556,79 @@ fn inherited_git_location_environment_cannot_redirect_allowed_commands() {
     );
     assert!(!trace_marker.exists());
     assert!(!trace2_marker.exists());
+}
+
+#[test]
+fn inherited_cargo_execution_environment_cannot_inject_helpers_or_output() {
+    const CHILD_ROOT: &str = "YOUNG_AGENT_CARGO_ENV_CHILD_ROOT";
+    const TEST_NAME: &str = "inherited_cargo_execution_environment_cannot_inject_helpers_or_output";
+
+    if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        let root = PathBuf::from(root);
+        let container = root.parent().expect("workspace has a parent fixture");
+        let marker = container.join("rustc-wrapper-ran");
+        let external_target = container.join("external-target");
+        let store = run_unapproved_command(
+            &root,
+            "run-command-cargo-environment",
+            "cargo check --quiet",
+        );
+
+        let replay = store.replay().expect("Event Log replays");
+        assert_eq!(replay.approvals().len(), 0);
+        let tool_call = replay.tool_calls().next().expect("tool call replays");
+        assert!(matches!(
+            tool_call.result().expect("tool result replays").output,
+            ToolOutput::Success { .. }
+        ));
+        assert!(!marker.exists(), "inherited RUSTC_WRAPPER must be removed");
+        assert!(
+            !external_target.exists(),
+            "inherited CARGO_TARGET_DIR must be removed"
+        );
+        assert!(root.join("target").exists());
+        return;
+    }
+
+    let container = TestDirectory::new("cargo-execution-environment");
+    let root = container.path().join("workspace");
+    std::fs::create_dir_all(root.join("src")).expect("Cargo fixture source is created");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"cargo-environment-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("Cargo fixture manifest is written");
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
+        .expect("Cargo fixture source is written");
+    let wrapper = container.path().join("rustc-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexec \"$@\"\n",
+            container.path().join("rustc-wrapper-ran").display()
+        ),
+    )
+    .expect("rustc wrapper fixture is written");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("rustc wrapper metadata is available")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("rustc wrapper is executable");
+
+    let output = Command::new(std::env::current_exe().expect("test binary path resolves"))
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(CHILD_ROOT, &root)
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("CARGO_TARGET_DIR", container.path().join("external-target"))
+        .output()
+        .expect("isolated Cargo environment test child runs");
+
+    assert!(
+        output.status.success(),
+        "Cargo environment child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]

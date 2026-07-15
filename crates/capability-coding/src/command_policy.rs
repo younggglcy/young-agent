@@ -169,14 +169,7 @@ fn classify_simple_command(
     {
         return requires_approval("command performs a destructive workspace operation");
     }
-    if matches!(
-        program,
-        "touch" | "mkdir" | "cp" | "mv" | "chmod" | "chown" | "tee"
-    ) || (program == "sed"
-        && arguments
-            .iter()
-            .any(|argument| argument == "-i" || argument.starts_with("-i")))
-    {
+    if known_filesystem_mutator(program, arguments) {
         return requires_approval("command may mutate workspace files");
     }
     if matches!(words, [cargo, operation, arguments @ ..]
@@ -745,9 +738,18 @@ fn command_mutates_filesystem_root(program: &str, arguments: &[String]) -> bool 
         return false;
     }
 
+    let program = program_basename(program);
+    program == "rm"
+        || known_filesystem_mutator(program, arguments)
+        || program == "find" && find_may_mutate_or_execute(arguments)
+}
+
+fn known_filesystem_mutator(program: &str, arguments: &[String]) -> bool {
     match program_basename(program) {
-        "rm" | "chmod" | "chown" => true,
-        "find" => find_may_mutate_or_execute(arguments),
+        "touch" | "mkdir" | "cp" | "mv" | "chmod" | "chown" | "tee" => true,
+        "sed" => arguments
+            .iter()
+            .any(|argument| argument == "-i" || argument.starts_with("-i")),
         _ => false,
     }
 }

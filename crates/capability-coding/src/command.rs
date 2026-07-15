@@ -43,6 +43,8 @@ const MAX_COMMAND_PROCESSING_PANICS: u8 = 8;
 const INITIAL_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_COMMAND_PATH_ENTRIES: usize = 64;
+const MAX_COMMAND_PATH_COMPONENTS: usize = MAX_COMMAND_PATH_ENTRIES * 2;
+const MAX_COMMAND_PATH_BYTES: usize = 64 * 1024;
 const UNAVAILABLE_COMMAND_PATH: &str = "/dev/null";
 const COMMAND_ENVIRONMENT_BLOCKLIST: &[&str] = &[
     "BASH_ENV",
@@ -53,6 +55,22 @@ const COMMAND_ENVIRONMENT_BLOCKLIST: &[&str] = &[
     "BASHOPTS",
     "PS4",
     "BASH_XTRACEFD",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTDOC",
+    "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
 ];
 
 #[cfg(all(test, unix))]
@@ -594,6 +612,7 @@ pub(crate) fn configure_command_environment(
         if key_text.starts_with("BASH_FUNC_")
             || key_text.starts_with("LD_")
             || key_text.starts_with("DYLD_")
+            || cargo_target_environment_key_executes_code(&key_text)
             || value_text.trim_start().starts_with("() {")
         {
             command.env_remove(key);
@@ -609,10 +628,16 @@ fn sanitized_command_path(
     let Some(inherited_path) = inherited_path else {
         return unavailable_command_path();
     };
+    if inherited_path.as_encoded_bytes().len() > MAX_COMMAND_PATH_BYTES {
+        return unavailable_command_path();
+    }
     let mut raw_entries = HashSet::new();
     let mut resolved_entries = HashSet::new();
     let mut safe_entries = Vec::new();
-    for entry in std::env::split_paths(inherited_path) {
+    for (index, entry) in std::env::split_paths(inherited_path).enumerate() {
+        if index >= MAX_COMMAND_PATH_COMPONENTS {
+            return unavailable_command_path();
+        }
         if !raw_entries.insert(entry.clone()) {
             continue;
         }
@@ -637,6 +662,11 @@ fn sanitized_command_path(
         return unavailable_command_path();
     }
     std::env::join_paths(safe_entries).unwrap_or_else(|_| unavailable_command_path())
+}
+
+fn cargo_target_environment_key_executes_code(key: &str) -> bool {
+    key.starts_with("CARGO_TARGET_")
+        && (key.ends_with("_LINKER") || key.ends_with("_RUNNER") || key.ends_with("_RUSTFLAGS"))
 }
 
 fn unavailable_command_path() -> OsString {
@@ -1936,6 +1966,37 @@ mod tests {
             (0..MAX_COMMAND_PATH_ENTRIES).map(|index| container.join(format!("missing-{index}"))),
         );
         let inherited_path = std::env::join_paths(entries).expect("fixture PATH joins");
+
+        let path = sanitized_command_path(
+            workspace.context().root(),
+            Some(inherited_path.as_os_str()),
+            LOW_RISK_EXTERNAL_PROGRAMS,
+        );
+
+        assert_eq!(path, OsString::from("/dev/null"));
+        std::fs::remove_dir_all(container).expect("command path fixtures are removed");
+    }
+
+    #[test]
+    fn command_path_fails_closed_when_total_entry_budget_is_exhausted() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let container = std::env::temp_dir().join(format!(
+            "young-capability-coding-command-path-total-budget-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = container.join("workspace");
+        let safe_bin = container.join("safe-bin");
+        std::fs::create_dir_all(&root).expect("workspace fixture is created");
+        std::fs::create_dir(&safe_bin).expect("safe bin fixture is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let inherited_path = std::env::join_paths(std::iter::repeat_n(
+            safe_bin.as_path(),
+            MAX_COMMAND_PATH_ENTRIES * 2 + 1,
+        ))
+        .expect("fixture PATH joins");
 
         let path = sanitized_command_path(
             workspace.context().root(),
