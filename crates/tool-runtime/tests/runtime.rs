@@ -50,6 +50,17 @@ fn runtime_inventory_and_registration_errors_are_observable() {
     assert!(invalid_error.source().is_some());
     assert!(runtime.is_empty());
 
+    let mut invalid_output_schema = read_file_definition();
+    invalid_output_schema.output_schema = Some(json!("not-an-object"));
+    let invalid_output_error = runtime
+        .register(invalid_output_schema, FakeToolHandler::default())
+        .expect_err("output schemas must be objects");
+    assert_eq!(
+        invalid_output_error.to_string(),
+        "invalid tool 'read_file': output_schema must be an object"
+    );
+    assert!(runtime.is_empty());
+
     runtime
         .register(read_file_definition(), FakeToolHandler::default())
         .expect("valid definition registers");

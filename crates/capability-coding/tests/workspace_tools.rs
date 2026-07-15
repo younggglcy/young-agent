@@ -195,6 +195,20 @@ fn read_file_runs_through_the_tool_runtime_and_exposes_workspace_metadata() {
     assert_eq!(metadata["workspace"]["root"], json!(expected_root));
     assert!(metadata["workspace"]["git_worktree"].is_null());
     assert!(extensions.is_empty());
+
+    let cancelled = runtime.dispatch(
+        ToolCall {
+            id: ToolCallId::new("call-read-cancelled"),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        },
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let ToolOutput::Failure { error, .. } = cancelled.output else {
+        panic!("cancelled read must fail before opening the file");
+    };
+    assert_eq!(error.code, "tool_cancelled");
 }
 
 #[test]

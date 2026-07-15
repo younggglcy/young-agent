@@ -553,8 +553,8 @@ fn scripted_run_executes_a_fake_tool_and_persists_the_completed_timeline() {
         ]),
     ]);
     let tools = FakeToolDispatcher::new([ToolOutput::Success {
-        content: vec![ToolContent::Text {
-            text: "# young-agent".to_string(),
+        content: vec![ToolContent::Json {
+            value: json!({ "document": "# young-agent" }),
         }],
         metadata: no_extensions(),
         extensions: no_extensions(),
