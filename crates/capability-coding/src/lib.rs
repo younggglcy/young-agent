@@ -1,6 +1,7 @@
 #![doc = "Built-in Coding Capability boundary for the Agent Kernel."]
 
 mod command;
+mod command_input;
 mod command_policy;
 mod git_environment;
 pub mod manifest;

@@ -674,6 +674,18 @@ fn malformed_run_command_arguments_replay_as_rejections_without_approval_events(
 }
 
 #[test]
+fn oversized_run_command_replays_as_rejection_without_approval_events() {
+    let directory = TestDirectory::new("oversized-command");
+    let store = run_rejected_call(
+        &directory,
+        "oversized-command",
+        json!({ "command": "x".repeat(64 * 1024 + 1) }),
+    );
+
+    assert_replayed_rejection(&store, "oversized-command", "65536 bytes policy limit");
+}
+
+#[test]
 fn malformed_shell_syntax_replays_as_rejection_without_approval_events() {
     for (case, command) in [
         ("leading-semicolon", "; pwd"),

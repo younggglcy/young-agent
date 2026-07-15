@@ -22,9 +22,9 @@ use serde_json::json;
 use std::cell::Cell;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
-use crate::command_policy::MAX_COMMAND_BYTES;
+use crate::command_input::parse_run_command_arguments;
 use crate::tool_support::{
-    failure, finalize_output, truncate_json_string, ToolArguments, MAX_OUTPUT_BYTES,
+    failure, finalize_output, truncate_json_string, MAX_OUTPUT_BYTES,
     MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
@@ -74,20 +74,12 @@ pub(crate) fn execute(
     call: &ToolCall,
     cancellation: &AtomicBool,
 ) -> ToolOutput {
-    let arguments = match ToolArguments::parse(&call.arguments, &["command"]) {
-        Ok(arguments) => arguments,
-        Err(output) => return output,
-    };
-    let command = match arguments.required_string("command") {
-        Ok(command) if command.len() <= MAX_COMMAND_BYTES => command,
-        Ok(_) => {
-            return failure(
-                "command_too_large",
-                format!("command exceeds {MAX_COMMAND_BYTES} bytes"),
-                false,
-            )
-        }
-        Err(output) => return output,
+    // CallDependent preparation normally rejects invalid input before this
+    // function runs. Re-validate the same contract here so future wiring
+    // changes cannot make the executor a weaker boundary than the policy.
+    let command = match parse_run_command_arguments(&call.arguments) {
+        Ok(command) => command,
+        Err(error) => return failure("tool_rejected", error.reason(), false),
     };
     let outcome = match run_shell_command(workspace, command, cancellation, MAX_OUTPUT_BYTES) {
         Ok(outcome) => outcome,

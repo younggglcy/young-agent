@@ -1,9 +1,9 @@
+use crate::command_input::{parse_run_command_arguments, validate_run_command_text};
 use crate::workspace::CodingWorkspace;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use young_tool_runtime::ToolCall;
 
-pub(crate) const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_SIMPLE_COMMANDS: usize = 32;
 const MAX_POLICY_WORDS: usize = 256;
 const MAX_PATH_PROBE_CANDIDATES: usize = 256;
@@ -28,28 +28,25 @@ impl CommandApprovalPolicy {
         workspace: &CodingWorkspace,
         call: &ToolCall,
     ) -> CommandPolicyDecision {
-        let Some(arguments) = call.arguments.as_object() else {
-            return reject("run_command arguments must be an object");
+        let command = match parse_run_command_arguments(&call.arguments) {
+            Ok(command) => command,
+            Err(error) => return reject(error.reason()),
         };
-        let Some(command) = arguments
-            .get("command")
-            .and_then(|command| command.as_str())
-        else {
-            return reject("run_command requires a string 'command' argument");
-        };
-        if arguments.len() != 1 {
-            return reject("run_command does not accept unknown arguments");
-        }
-        self.classify(workspace, command)
+        self.classify_validated(workspace, command)
     }
 
     pub fn classify(&self, workspace: &CodingWorkspace, command: &str) -> CommandPolicyDecision {
-        if command.len() > MAX_COMMAND_BYTES {
-            return reject("command exceeds the 65536 bytes policy limit");
+        if let Err(error) = validate_run_command_text(command) {
+            return reject(error.reason());
         }
-        if command.trim().is_empty() {
-            return reject("command must not be empty");
-        }
+        self.classify_validated(workspace, command)
+    }
+
+    fn classify_validated(
+        &self,
+        workspace: &CodingWorkspace,
+        command: &str,
+    ) -> CommandPolicyDecision {
         let parsed = match ParsedShellCommand::parse(command) {
             Ok(parsed) => parsed,
             Err(ShellParseError::Malformed) => {
