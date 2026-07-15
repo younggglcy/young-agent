@@ -21,6 +21,7 @@
 | 11 | 跑通确定性 Agent Runtime | `crates/agent-runtime/src/runtime.rs` | 用 FakeModelClient 和 fake tools 验证 turn、tool call、approval、cancellation 与 terminal result。 |
 | 12 | 实现 Tool Runtime 与内置 manifest | `crates/tool-runtime/`, `crates/capability-coding/coding-capability.toml` | 区分声明、注册、审批分类和执行分发，不让 manifest 变成插件 runtime。 |
 | 13 | 建立本地 Workspace Boundary | `crates/capability-coding/src/workspace.rs`, `crates/capability-coding/tests/workspace_tools.rs` | 用 lexical 筛选与 directory capability 约束实际 read/search/patch 操作；command 以 handle-bound cwd 启动且取消覆盖进程组，完整事件输出有界，worktree context 可观察。 |
+| 14 | 接入 Command Approval Policy | `crates/capability-coding/src/command_policy.rs`, `crates/tool-runtime/src/execution.rs` | 把命令分类成 allow、requires approval、reject；让审批提示、决定与实际执行绑定同一个 prepared ToolCall，并把决定写入 Canonical Event Log。 |
 
 ## 当前课程进度
 

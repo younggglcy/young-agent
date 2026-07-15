@@ -795,6 +795,9 @@ dependencies = [
  "getrandom",
  "rustix",
  "serde_json",
+ "young-agent-runtime",
+ "young-event-store",
+ "young-model-runtime",
  "young-platform-process",
  "young-tool-runtime",
 ]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::execution::{
-    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    bound_approval_reason, normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
     ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
     ToolResult,
 };
@@ -125,8 +125,9 @@ pub enum ToolApprovalPolicy {
     RequiresApproval {
         reason: String,
     },
-    /// The concrete handler classifies each call through
-    /// [`ToolHandler::approval_reason`].
+    /// The concrete handler classifies each call through [`ToolHandler::classify`],
+    /// returning an explicit [`ToolCallPolicy`](crate::ToolCallPolicy) to allow,
+    /// require approval for, or reject that exact invocation.
     CallDependent,
     AlwaysReject {
         reason: String,
@@ -248,18 +249,16 @@ impl ToolDispatcher for ToolRuntime {
             ToolApprovalPolicy::RequiresApproval { reason } => {
                 PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason.clone())
             }
-            ToolApprovalPolicy::CallDependent => match tool.handler.approval_reason(&call) {
-                Some(reason) => {
-                    PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
-                }
-                None => PreparedToolCall::ready(self.dispatcher_identity, call),
-            },
+            ToolApprovalPolicy::CallDependent => {
+                let policy = tool.handler.classify(&call);
+                PreparedToolCall::classified(self.dispatcher_identity, call, policy)
+            }
             ToolApprovalPolicy::AlwaysReject { reason } => PreparedToolCall::rejected(
                 self.dispatcher_identity,
                 call,
                 ToolError {
                     code: "tool_rejected".to_string(),
-                    message: reason.clone(),
+                    message: bound_approval_reason(reason.clone()),
                     retryable: false,
                 },
             ),

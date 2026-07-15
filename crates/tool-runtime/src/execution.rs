@@ -5,6 +5,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const MAX_APPROVAL_REASON_SERIALIZED_BYTES: usize = 8 * 1024;
+const APPROVAL_REASON_TRUNCATED_SUFFIX: &str = "… [truncated]";
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ToolCallId(String);
@@ -38,6 +41,16 @@ pub struct ToolCall {
 pub enum ToolExecutionAuthorization {
     NotRequired,
     ApprovalGranted { call_id: ToolCallId },
+}
+
+/// Dynamic policy result for one concrete call to a `CallDependent` tool.
+/// Approval and rejection reasons must contain non-whitespace text; the Tool
+/// Runtime rejects an invalid dynamic result before emitting an approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolCallPolicy {
+    Allow,
+    RequiresApproval { reason: String },
+    Reject { reason: String },
 }
 
 impl ToolExecutionAuthorization {
@@ -90,7 +103,103 @@ enum ToolExecutionDisposition {
     Reject { error: ToolError },
 }
 
+/// Bounds one user- or policy-provided approval reason before it crosses a
+/// persistence boundary. The limit applies to the serialized JSON string,
+/// including quotes and escapes, rather than only its raw UTF-8 length.
+pub fn bound_approval_reason(reason: String) -> String {
+    if reason.len() + 2 <= MAX_APPROVAL_REASON_SERIALIZED_BYTES
+        && serialized_json_string_bytes(&reason) <= MAX_APPROVAL_REASON_SERIALIZED_BYTES
+    {
+        return reason;
+    }
+
+    let content_budget = MAX_APPROVAL_REASON_SERIALIZED_BYTES
+        - 2
+        - serialized_json_string_content_bytes(APPROVAL_REASON_TRUNCATED_SUFFIX);
+    let mut content_bytes = 0usize;
+    let mut end = 0usize;
+    for (index, character) in reason.char_indices() {
+        let character_bytes = serialized_json_character_bytes(character);
+        if content_bytes + character_bytes > content_budget {
+            break;
+        }
+        content_bytes += character_bytes;
+        end = index + character.len_utf8();
+    }
+
+    let prefix = &reason[..end];
+    if prefix.trim().is_empty() {
+        return prefix.to_string();
+    }
+    let mut bounded = String::with_capacity(prefix.len() + APPROVAL_REASON_TRUNCATED_SUFFIX.len());
+    bounded.push_str(prefix);
+    bounded.push_str(APPROVAL_REASON_TRUNCATED_SUFFIX);
+    bounded
+}
+
+fn serialized_json_string_bytes(value: &str) -> usize {
+    2usize.saturating_add(serialized_json_string_content_bytes(value))
+}
+
+fn serialized_json_string_content_bytes(value: &str) -> usize {
+    value.chars().fold(0usize, |bytes, character| {
+        bytes.saturating_add(serialized_json_character_bytes(character))
+    })
+}
+
+fn serialized_json_character_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
 impl PreparedToolCall {
+    pub(crate) fn classified(
+        dispatcher_identity: ToolDispatcherIdentity,
+        call: ToolCall,
+        policy: ToolCallPolicy,
+    ) -> Self {
+        let policy = match policy {
+            ToolCallPolicy::RequiresApproval { reason } => ToolCallPolicy::RequiresApproval {
+                reason: bound_approval_reason(reason),
+            },
+            ToolCallPolicy::Reject { reason } => ToolCallPolicy::Reject {
+                reason: bound_approval_reason(reason),
+            },
+            ToolCallPolicy::Allow => ToolCallPolicy::Allow,
+        };
+        match policy {
+            ToolCallPolicy::Allow => Self::ready(dispatcher_identity, call),
+            ToolCallPolicy::RequiresApproval { reason } | ToolCallPolicy::Reject { reason }
+                if reason.trim().is_empty() =>
+            {
+                Self::rejected(
+                    dispatcher_identity,
+                    call,
+                    ToolError {
+                        code: "invalid_tool_policy".to_string(),
+                        message: "call-dependent policy reason must not be empty".to_string(),
+                        retryable: false,
+                    },
+                )
+            }
+            ToolCallPolicy::RequiresApproval { reason } => {
+                Self::requiring_approval(dispatcher_identity, call, reason)
+            }
+            ToolCallPolicy::Reject { reason } => Self::rejected(
+                dispatcher_identity,
+                call,
+                ToolError {
+                    code: "tool_rejected".to_string(),
+                    message: reason,
+                    retryable: false,
+                },
+            ),
+        }
+    }
+
     pub(crate) fn ready(dispatcher_identity: ToolDispatcherIdentity, call: ToolCall) -> Self {
         Self {
             dispatcher_identity,
@@ -108,7 +217,7 @@ impl PreparedToolCall {
             dispatcher_identity,
             call,
             disposition: ToolExecutionDisposition::RequiresApproval {
-                reason: reason.into(),
+                reason: bound_approval_reason(reason.into()),
             },
         }
     }
@@ -179,10 +288,9 @@ impl PreparedToolCall {
 /// Internal seam implemented by one concrete registered tool adapter.
 pub trait ToolHandler {
     /// Classifies a call only when its definition uses a call-dependent policy.
-    /// Every handler must make the allow decision explicit so changing a
-    /// definition to `CallDependent` cannot silently inherit a fail-open
-    /// default.
-    fn approval_reason(&self, call: &ToolCall) -> Option<String>;
+    /// Every handler must make allow, approval, and rejection explicit so
+    /// changing a definition to `CallDependent` cannot fail open.
+    fn classify(&self, call: &ToolCall) -> ToolCallPolicy;
 
     /// Executes one invocation. Implementations that can block on external
     /// work must observe `cancellation` and return promptly once it is set;

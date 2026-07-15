@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(all(test, unix))]
 use std::sync::atomic::AtomicU64;
@@ -20,8 +22,10 @@ use serde_json::json;
 use std::cell::Cell;
 use young_tool_runtime::{ToolCall, ToolContent, ToolOutput};
 
+use crate::command_input::parse_run_command_arguments;
+use crate::command_policy::LOW_RISK_EXTERNAL_PROGRAMS;
 use crate::tool_support::{
-    failure, finalize_output, truncate_json_string, ToolArguments, MAX_OUTPUT_BYTES,
+    failure, finalize_output, truncate_json_string, MAX_OUTPUT_BYTES,
     MAX_TOOL_CONTENT_SERIALIZED_BYTES,
 };
 use crate::workspace::CodingWorkspace;
@@ -38,7 +42,36 @@ const MAX_COMMAND_SUPERVISION_SLOTS: usize = 64;
 const MAX_COMMAND_PROCESSING_PANICS: u8 = 8;
 const INITIAL_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(10);
 const MAX_PROCESSING_PANIC_BACKOFF: Duration = Duration::from_millis(250);
-const MAX_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_PATH_ENTRIES: usize = 64;
+const MAX_COMMAND_PATH_COMPONENTS: usize = MAX_COMMAND_PATH_ENTRIES * 2;
+const MAX_COMMAND_PATH_BYTES: usize = 64 * 1024;
+const UNAVAILABLE_COMMAND_PATH: &str = "/dev/null";
+const COMMAND_ENVIRONMENT_BLOCKLIST: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "CDPATH",
+    "IFS",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "BASH_XTRACEFD",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTDOC",
+    "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTC",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTDOC",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+];
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -52,28 +85,17 @@ thread_local! {
     static LAST_SUPERVISED_COMMAND_ID: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
-pub(crate) const APPROVAL_REASON: &str =
-    "command execution requires approval until a command safety policy is configured";
-
 pub(crate) fn execute(
     workspace: &CodingWorkspace,
     call: &ToolCall,
     cancellation: &AtomicBool,
 ) -> ToolOutput {
-    let arguments = match ToolArguments::parse(&call.arguments, &["command"]) {
-        Ok(arguments) => arguments,
-        Err(output) => return output,
-    };
-    let command = match arguments.required_string("command") {
-        Ok(command) if command.len() <= MAX_COMMAND_BYTES => command,
-        Ok(_) => {
-            return failure(
-                "command_too_large",
-                format!("command exceeds {MAX_COMMAND_BYTES} bytes"),
-                false,
-            )
-        }
-        Err(output) => return output,
+    // CallDependent preparation normally rejects invalid input before this
+    // function runs. Re-validate the same contract here so future wiring
+    // changes cannot make the executor a weaker boundary than the policy.
+    let command = match parse_run_command_arguments(&call.arguments) {
+        Ok(command) => command,
+        Err(error) => return failure("tool_rejected", error.reason(), false),
     };
     let outcome = match run_shell_command(workspace, command, cancellation, MAX_OUTPUT_BYTES) {
         Ok(outcome) => outcome,
@@ -336,10 +358,16 @@ fn run_shell_command(
     }
     ensure_process_tracking_supported()?;
     let mut process = shell_command(command);
-    let supervision_permit = prepare_command_supervision()?;
     workspace
         .bind_command_working_directory(&mut process)
         .map_err(CommandError::WorkspaceChanged)?;
+    let inherited_path = std::env::var_os("PATH");
+    configure_command_environment(
+        &mut process,
+        workspace.context().root(),
+        inherited_path.as_deref(),
+        LOW_RISK_EXTERNAL_PROGRAMS,
+    );
     configure_command_security(&mut process);
     process
         .stdin(Stdio::null())
@@ -347,6 +375,10 @@ fn run_shell_command(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     let (process, descendant_token) = DescendantToken::prepare(process)?;
+    if cancellation.load(Ordering::Relaxed) {
+        return Err(CommandError::Cancelled);
+    }
+    let supervision_permit = prepare_command_supervision()?;
     #[cfg(unix)]
     let child = process.spawn_group();
     #[cfg(not(unix))]
@@ -558,6 +590,108 @@ fn prepare_command_supervision_with(
 
 fn configure_command_security(command: &mut Command) {
     young_platform_process::block_exec_privilege_gain(command);
+}
+
+pub(crate) fn configure_command_environment(
+    command: &mut Command,
+    workspace_root: &Path,
+    inherited_path: Option<&OsStr>,
+    protected_programs: &[&str],
+) {
+    crate::git_environment::remove_inherited_git_execution_context(command);
+    command.env(
+        "PATH",
+        sanitized_command_path(workspace_root, inherited_path, protected_programs),
+    );
+    for key in COMMAND_ENVIRONMENT_BLOCKLIST {
+        command.env_remove(key);
+    }
+    for (key, value) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        let value_text = value.to_string_lossy();
+        if key_text.starts_with("BASH_FUNC_")
+            || key_text.starts_with("LD_")
+            || key_text.starts_with("DYLD_")
+            || cargo_target_environment_key_executes_code(&key_text)
+            || value_text.trim_start().starts_with("() {")
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
+fn sanitized_command_path(
+    workspace_root: &Path,
+    inherited_path: Option<&OsStr>,
+    protected_programs: &[&str],
+) -> OsString {
+    let Some(inherited_path) = inherited_path else {
+        return unavailable_command_path();
+    };
+    if inherited_path.as_encoded_bytes().len() > MAX_COMMAND_PATH_BYTES {
+        return unavailable_command_path();
+    }
+    let mut raw_entries = HashSet::new();
+    let mut resolved_entries = HashSet::new();
+    let mut safe_entries = Vec::new();
+    for (index, entry) in std::env::split_paths(inherited_path).enumerate() {
+        if index >= MAX_COMMAND_PATH_COMPONENTS {
+            return unavailable_command_path();
+        }
+        if !raw_entries.insert(entry.clone()) {
+            continue;
+        }
+        if raw_entries.len() > MAX_COMMAND_PATH_ENTRIES {
+            return unavailable_command_path();
+        }
+        if !entry.is_absolute() {
+            continue;
+        }
+        let Ok(resolved) = entry.canonicalize() else {
+            continue;
+        };
+        if resolved.starts_with(workspace_root)
+            || !resolved_entries.insert(resolved.clone())
+            || path_entry_resolves_workspace_program(&resolved, workspace_root, protected_programs)
+        {
+            continue;
+        }
+        safe_entries.push(resolved);
+    }
+    if safe_entries.is_empty() {
+        return unavailable_command_path();
+    }
+    std::env::join_paths(safe_entries).unwrap_or_else(|_| unavailable_command_path())
+}
+
+fn cargo_target_environment_key_executes_code(key: &str) -> bool {
+    key.starts_with("CARGO_TARGET_")
+        && (key.ends_with("_LINKER") || key.ends_with("_RUNNER") || key.ends_with("_RUSTFLAGS"))
+}
+
+fn unavailable_command_path() -> OsString {
+    OsString::from(UNAVAILABLE_COMMAND_PATH)
+}
+
+fn path_entry_resolves_workspace_program(
+    path_entry: &Path,
+    workspace_root: &Path,
+    protected_programs: &[&str],
+) -> bool {
+    protected_programs
+        .iter()
+        .any(|program| match path_entry.join(program).canonicalize() {
+            Ok(program_path) => program_path.starts_with(workspace_root),
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(_) => true,
+        })
 }
 
 fn terminate_command_group(child: &mut GroupChild) -> Result<(), CommandError> {
@@ -1714,7 +1848,9 @@ impl fmt::Display for CommandError {
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
+    use std::ffi::OsString;
     use std::io::{Cursor, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
     use std::process::Stdio;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1726,18 +1862,151 @@ mod tests {
 
     use super::{
         cleanup_process_group, command_leader_terminal, command_supervisor,
-        drain_streams_after_reap, next_exit_poll_interval, poll_streams_once,
-        prepare_command_supervision, prepare_command_supervision_with, run_shell_command,
-        shell_command, supervise_live_command, supervise_live_command_with, CapturedStream,
-        CommandCleanupState, CommandError, CommandProcess, CommandSupervisor, DescendantToken,
-        SupervisorAdmissionHealth, SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
+        configure_command_environment, drain_streams_after_reap, next_exit_poll_interval,
+        poll_streams_once, prepare_command_supervision, prepare_command_supervision_with,
+        run_shell_command, sanitized_command_path, shell_command, supervise_live_command,
+        supervise_live_command_with, CapturedStream, CommandCleanupState, CommandError,
+        CommandProcess, CommandSupervisor, DescendantToken, SupervisorAdmissionHealth,
+        SupervisorWorkerState, COMMAND_GROUP_TERMINATION_ATTEMPTS,
         INJECT_GROUP_KILL_WRAPPER_FAILURE, INJECT_NEXT_FULL_GROUP_KILL_FAILURE,
         INJECT_NEXT_OUTPUT_CONFIGURATION_FAILURE, INJECT_PERSISTENT_GROUP_KILL_FAILURE,
         INJECT_PERSISTENT_PARTIAL_GROUP_KILL_SUCCESS, LAST_SUPERVISED_COMMAND_ID,
-        LIVE_COMMAND_SUPERVISOR_HANDOFFS, MAX_COMMAND_PROCESSING_PANICS,
-        MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL, MAX_STREAM_READS_PER_TICK,
+        LIVE_COMMAND_SUPERVISOR_HANDOFFS, LOW_RISK_EXTERNAL_PROGRAMS, MAX_COMMAND_PATH_ENTRIES,
+        MAX_COMMAND_PROCESSING_PANICS, MAX_COMMAND_SUPERVISION_SLOTS, MAX_EXIT_POLL_INTERVAL,
+        MAX_STREAM_READS_PER_TICK,
     };
     use crate::workspace::CodingWorkspace;
+
+    #[test]
+    fn command_environment_cannot_resolve_allowlisted_programs_from_the_workspace() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let container = std::env::temp_dir().join(format!(
+            "young-capability-coding-command-path-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = container.join("workspace");
+        let safe_bin = container.join("safe-bin");
+        std::fs::create_dir_all(&root).expect("workspace fixture is created");
+        std::fs::create_dir(&safe_bin).expect("safe bin fixture is created");
+        let workspace_marker = root.join("workspace-rg-ran");
+        let safe_marker = root.join("safe-rg-ran");
+        let startup_marker = root.join("startup-ran");
+
+        for (path, marker) in [
+            (root.join("rg"), &workspace_marker),
+            (safe_bin.join("rg"), &safe_marker),
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\n[ -z \"${{BASH_ENV+x}}\" ] || exit 97\n: > '{}'\n",
+                    marker.display()
+                ),
+            )
+            .expect("command fixture is written");
+            let mut permissions = std::fs::metadata(&path)
+                .expect("command fixture metadata is available")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("command fixture is executable");
+        }
+        let startup = container.join("startup.sh");
+        std::fs::write(
+            &startup,
+            format!("#!/bin/sh\n: > '{}'\n", startup_marker.display()),
+        )
+        .expect("startup fixture is written");
+
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let inherited_path = std::env::join_paths(std::iter::once(root.as_path()).chain(
+            std::iter::repeat_n(safe_bin.as_path(), MAX_COMMAND_PATH_ENTRIES + 1),
+        ))
+        .expect("fixture PATH joins");
+        let mut process = shell_command("rg --no-config needle");
+        process.env("BASH_ENV", &startup);
+        workspace
+            .bind_command_working_directory(&mut process)
+            .expect("workspace cwd binds");
+        configure_command_environment(
+            &mut process,
+            workspace.context().root(),
+            Some(&inherited_path),
+            LOW_RISK_EXTERNAL_PROGRAMS,
+        );
+
+        let status = process.status().expect("configured shell runs");
+        assert!(status.success());
+        assert!(!workspace_marker.exists());
+        assert!(safe_marker.exists());
+        assert!(!startup_marker.exists());
+
+        std::fs::remove_dir_all(container).expect("command environment fixtures are removed");
+    }
+
+    #[test]
+    fn command_path_fails_closed_when_unique_entry_budget_is_exhausted() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let container = std::env::temp_dir().join(format!(
+            "young-capability-coding-command-path-budget-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = container.join("workspace");
+        let safe_bin = container.join("safe-bin");
+        std::fs::create_dir_all(&root).expect("workspace fixture is created");
+        std::fs::create_dir(&safe_bin).expect("safe bin fixture is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let mut entries = vec![safe_bin];
+        entries.extend(
+            (0..MAX_COMMAND_PATH_ENTRIES).map(|index| container.join(format!("missing-{index}"))),
+        );
+        let inherited_path = std::env::join_paths(entries).expect("fixture PATH joins");
+
+        let path = sanitized_command_path(
+            workspace.context().root(),
+            Some(inherited_path.as_os_str()),
+            LOW_RISK_EXTERNAL_PROGRAMS,
+        );
+
+        assert_eq!(path, OsString::from("/dev/null"));
+        std::fs::remove_dir_all(container).expect("command path fixtures are removed");
+    }
+
+    #[test]
+    fn command_path_fails_closed_when_total_entry_budget_is_exhausted() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let container = std::env::temp_dir().join(format!(
+            "young-capability-coding-command-path-total-budget-{}-{nonce}",
+            std::process::id()
+        ));
+        let root = container.join("workspace");
+        let safe_bin = container.join("safe-bin");
+        std::fs::create_dir_all(&root).expect("workspace fixture is created");
+        std::fs::create_dir(&safe_bin).expect("safe bin fixture is created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace resolves");
+        let inherited_path = std::env::join_paths(std::iter::repeat_n(
+            safe_bin.as_path(),
+            MAX_COMMAND_PATH_ENTRIES * 2 + 1,
+        ))
+        .expect("fixture PATH joins");
+
+        let path = sanitized_command_path(
+            workspace.context().root(),
+            Some(inherited_path.as_os_str()),
+            LOW_RISK_EXTERNAL_PROGRAMS,
+        );
+
+        assert_eq!(path, OsString::from("/dev/null"));
+        std::fs::remove_dir_all(container).expect("command path fixtures are removed");
+    }
 
     #[test]
     fn quiet_command_polling_backs_off_and_output_resets_it() {

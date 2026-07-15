@@ -1,49 +1,26 @@
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use common::TestDirectory;
 use serde_json::json;
 use young_capability_coding::{register_builtin_coding_capability, CodingWorkspace};
 use young_tool_runtime::{
     ToolCall, ToolCallId, ToolContent, ToolExecutionAuthorization, ToolOutput, ToolRuntime,
 };
 
-struct TestWorkspace {
-    root: PathBuf,
-}
+type TestWorkspace = TestDirectory;
 
-impl TestWorkspace {
-    fn new(name: &str) -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after the Unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "young-capability-coding-{name}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("test workspace is created");
-        Self { root }
-    }
-
-    fn path(&self) -> &Path {
-        &self.root
-    }
-
+impl TestDirectory {
     fn git(&self, arguments: &[&str]) {
-        run_git(&self.root, arguments);
-    }
-}
-
-impl Drop for TestWorkspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        run_git(self.path(), arguments);
     }
 }
 
@@ -1907,6 +1884,34 @@ fn run_command_executes_from_the_workspace_and_returns_structured_output() {
 }
 
 #[test]
+fn run_command_executes_low_risk_validation_without_approval() {
+    let test_workspace = TestWorkspace::new("run-command-low-risk");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let expected_root = workspace.context().root().display().to_string();
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-low-risk-command"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "pwd" }),
+    };
+
+    let result = runtime.dispatch(
+        call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success { content, .. } = result.output else {
+        panic!("low-risk command should execute without approval");
+    };
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("run_command should return structured JSON");
+    };
+    assert_eq!(value["stdout"], json!(format!("{expected_root}\n")));
+}
+
+#[test]
 fn run_command_captures_output_after_a_quiet_period() {
     let test_workspace = TestWorkspace::new("run-command-quiet-period");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
@@ -2032,13 +2037,14 @@ fn run_command_rejects_oversized_input_before_spawning_it() {
     let ToolOutput::Failure { error, .. } = result.output else {
         panic!("oversized command must fail");
     };
-    assert_eq!(error.code, "command_too_large");
+    assert_eq!(error.code, "tool_rejected");
+    assert!(error.message.contains("65536 bytes"));
     assert!(!error.retryable);
     assert!(!test_workspace.path().join("oversized-command-ran").exists());
 }
 
 #[test]
-fn run_command_requires_approval_until_command_policy_is_implemented() {
+fn run_command_requires_approval_for_workspace_mutation() {
     let test_workspace = TestWorkspace::new("command-approval");
     let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
     let mut runtime = ToolRuntime::default();
@@ -2058,10 +2064,7 @@ fn run_command_requires_approval_until_command_policy_is_implemented() {
         panic!("unapproved command must fail");
     };
     assert_eq!(error.code, "approval_required");
-    assert_eq!(
-        error.message,
-        "command execution requires approval until a command safety policy is configured"
-    );
+    assert_eq!(error.message, "command may mutate workspace files");
     assert!(!test_workspace.path().join("marker.txt").exists());
 }
 

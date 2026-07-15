@@ -8,8 +8,8 @@ use std::sync::Arc;
 use serde_json::json;
 use young_tool_runtime::{
     CapabilityRef, FakeToolDispatcher, FakeToolHandler, McpCompatibility, ToolApprovalPolicy,
-    ToolCall, ToolCallId, ToolContent, ToolDefinition, ToolDispatcher, ToolExecutionAuthorization,
-    ToolHandler, ToolOutput, ToolRuntime,
+    ToolCall, ToolCallId, ToolCallPolicy, ToolContent, ToolDefinition, ToolDispatcher,
+    ToolExecutionAuthorization, ToolHandler, ToolOutput, ToolRuntime,
 };
 
 fn read_file_definition() -> ToolDefinition {
@@ -327,6 +327,89 @@ fn call_dependent_policy_delegates_to_the_registered_executor() {
 }
 
 #[test]
+fn call_dependent_policy_can_reject_before_the_executor_runs() {
+    let mut definition = read_file_definition();
+    definition.name = "run_command".to_string();
+    definition.approval_policy = ToolApprovalPolicy::CallDependent;
+    let unexpected = ToolOutput::Success {
+        content: vec![ToolContent::Text {
+            text: "must not execute".to_string(),
+        }],
+        metadata: BTreeMap::new(),
+        extensions: BTreeMap::new(),
+    };
+    let mut runtime = ToolRuntime::default();
+    runtime
+        .register(
+            definition,
+            FakeToolHandler::rejecting("command targets the filesystem root", [unexpected]),
+        )
+        .expect("tool registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-rejected"),
+        tool_name: "run_command".to_string(),
+        arguments: json!({ "command": "rm -rf /" }),
+    };
+
+    let result = runtime.dispatch(
+        call,
+        ToolExecutionAuthorization::NotRequired,
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Failure { error, extensions } = result.output else {
+        panic!("rejected call must fail before execution");
+    };
+    assert_eq!(error.code, "tool_rejected");
+    assert_eq!(error.message, "command targets the filesystem root");
+    assert!(!error.retryable);
+    assert!(extensions.is_empty());
+}
+
+#[test]
+fn call_dependent_policy_rejects_empty_reasons_before_execution() {
+    let cases = [
+        (
+            "empty approval reason",
+            FakeToolHandler::requiring_approval(" ", []),
+        ),
+        ("empty rejection reason", FakeToolHandler::rejecting("", [])),
+        (
+            "oversized whitespace approval reason",
+            FakeToolHandler::requiring_approval(" ".repeat(3 * 1024 * 1024), []),
+        ),
+    ];
+
+    for (case, handler) in cases {
+        let mut definition = read_file_definition();
+        definition.approval_policy = ToolApprovalPolicy::CallDependent;
+        let mut runtime = ToolRuntime::default();
+        runtime
+            .register(definition, handler)
+            .expect("tool registers");
+
+        let result = runtime.dispatch(
+            ToolCall {
+                id: ToolCallId::new(case),
+                tool_name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            },
+            ToolExecutionAuthorization::NotRequired,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let ToolOutput::Failure { error, .. } = result.output else {
+            panic!("invalid call-dependent policy must fail closed: {case}");
+        };
+        assert_eq!(error.code, "invalid_tool_policy", "case: {case}");
+        assert!(
+            error.message.contains("reason must not be empty"),
+            "case: {case}"
+        );
+    }
+}
+
+#[test]
 fn dispatch_cannot_bypass_a_required_approval() {
     let mut definition = read_file_definition();
     definition.approval_policy = ToolApprovalPolicy::RequiresApproval {
@@ -508,9 +591,11 @@ struct CountingHandler {
 }
 
 impl ToolHandler for CountingHandler {
-    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+    fn classify(&self, _call: &ToolCall) -> ToolCallPolicy {
         self.classifications.set(self.classifications.get() + 1);
-        Some("call-dependent approval".to_string())
+        ToolCallPolicy::RequiresApproval {
+            reason: "call-dependent approval".to_string(),
+        }
     }
 
     fn execute(&mut self, _call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
@@ -560,6 +645,60 @@ fn call_dependent_handler_is_classified_once_and_the_plan_is_reused() {
 
     assert_eq!(output, expected);
     assert_eq!(classifications.get(), 1);
+}
+
+#[test]
+fn dynamic_policy_reasons_are_bounded_before_the_plan_is_exposed() {
+    let oversized_reason = "\n\"界".repeat(700_000);
+
+    for (case, handler) in [
+        (
+            "approval",
+            FakeToolHandler::requiring_approval(oversized_reason.clone(), []),
+        ),
+        (
+            "rejection",
+            FakeToolHandler::rejecting(oversized_reason.clone(), []),
+        ),
+    ] {
+        let mut definition = read_file_definition();
+        definition.approval_policy = ToolApprovalPolicy::CallDependent;
+        let mut runtime = ToolRuntime::default();
+        runtime
+            .register(definition, handler)
+            .expect("tool registers");
+        let prepared = runtime.prepare(ToolCall {
+            id: ToolCallId::new(format!("call-{case}")),
+            tool_name: "read_file".to_string(),
+            arguments: json!({ "path": "README.md" }),
+        });
+
+        let reason = if case == "approval" {
+            prepared
+                .approval_reason()
+                .expect("approval reason is exposed")
+                .to_string()
+        } else {
+            let output = runtime.execute_prepared(
+                prepared,
+                ToolExecutionAuthorization::NotRequired,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ToolOutput::Failure { error, .. } = output else {
+                panic!("rejected policy produces a tool failure");
+            };
+            error.message
+        };
+
+        assert!(reason.ends_with("… [truncated]"), "case: {case}");
+        assert!(
+            serde_json::to_vec(&reason)
+                .expect("bounded reason serializes")
+                .len()
+                <= 8 * 1024,
+            "case: {case}"
+        );
+    }
 }
 
 #[test]

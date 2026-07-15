@@ -4,9 +4,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use young_tool_runtime::{
-    CapabilityManifestError, ToolCall, ToolHandler, ToolOutput, ToolRegistrationError, ToolRuntime,
+    CapabilityManifestError, ToolCall, ToolCallPolicy, ToolHandler, ToolOutput,
+    ToolRegistrationError, ToolRuntime,
 };
 
+use crate::command_policy::{CommandApprovalPolicy, CommandPolicyDecision};
 use crate::manifest::coding_manifest;
 use crate::workspace::CodingWorkspace;
 
@@ -67,10 +69,18 @@ impl BuiltinCodingTool {
 }
 
 impl ToolHandler for BuiltinCodingTool {
-    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
+    fn classify(&self, call: &ToolCall) -> ToolCallPolicy {
         match self {
-            Self::RunCommand(_) => Some(crate::command::APPROVAL_REASON.to_string()),
-            Self::ReadFile(_) | Self::SearchFiles(_) | Self::ApplyPatch(_) => None,
+            Self::RunCommand(workspace) => {
+                match CommandApprovalPolicy.classify_call(workspace, call) {
+                    CommandPolicyDecision::Allow => ToolCallPolicy::Allow,
+                    CommandPolicyDecision::RequiresApproval { reason } => {
+                        ToolCallPolicy::RequiresApproval { reason }
+                    }
+                    CommandPolicyDecision::Reject { reason } => ToolCallPolicy::Reject { reason },
+                }
+            }
+            Self::ReadFile(_) | Self::SearchFiles(_) | Self::ApplyPatch(_) => ToolCallPolicy::Allow,
         }
     }
 

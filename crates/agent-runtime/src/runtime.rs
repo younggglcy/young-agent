@@ -10,8 +10,8 @@ use young_model_runtime::{
     ModelToolCall, ModelToolSpec,
 };
 use young_tool_runtime::{
-    ToolCall, ToolCallId, ToolContent, ToolDispatcher, ToolExecutionAuthorization, ToolOutput,
-    ToolResult,
+    bound_approval_reason, ToolCall, ToolCallId, ToolContent, ToolDispatcher,
+    ToolExecutionAuthorization, ToolOutput, ToolResult,
 };
 
 use crate::{
@@ -20,6 +20,7 @@ use crate::{
 };
 
 const MAX_TURNS: usize = 128;
+const EMPTY_APPROVAL_DENIAL_REASON: &str = "approval denied without a reason";
 
 pub trait AgentEventSink {
     type Error;
@@ -585,7 +586,9 @@ where
                 unreachable!("approval_event is constructed as AgentEvent::ApprovalRequested")
             };
 
-            let decision = control.decide_approval(&approval, stop.cancellation_flag());
+            let decision = normalize_approval_decision(
+                control.decide_approval(&approval, stop.cancellation_flag()),
+            );
             if let Some(status) = stop.status() {
                 return self
                     .finish(run_id, status, stop)
@@ -766,6 +769,22 @@ where
         };
         self.emit_durable(&event)?;
         Ok(RunOutcome { status })
+    }
+}
+
+fn normalize_approval_decision(decision: ApprovalDecision) -> ApprovalDecision {
+    match decision {
+        ApprovalDecision::Deny { reason } => {
+            let reason = bound_approval_reason(reason);
+            if reason.trim().is_empty() {
+                ApprovalDecision::Deny {
+                    reason: EMPTY_APPROVAL_DENIAL_REASON.to_string(),
+                }
+            } else {
+                ApprovalDecision::Deny { reason }
+            }
+        }
+        decision => decision,
     }
 }
 

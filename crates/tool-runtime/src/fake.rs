@@ -3,15 +3,21 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::execution::{
-    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolDispatcher,
+    normalize_dispatcher_output, PreparedToolCall, ToolCall, ToolCallPolicy, ToolDispatcher,
     ToolDispatcherIdentity, ToolError, ToolExecutionAuthorization, ToolHandler, ToolOutput,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FakeToolHandler {
     outputs: VecDeque<ToolOutput>,
     calls: Vec<ToolCall>,
-    approval_reason: Option<String>,
+    policy: ToolCallPolicy,
+}
+
+impl Default for FakeToolHandler {
+    fn default() -> Self {
+        Self::new([])
+    }
 }
 
 impl FakeToolHandler {
@@ -19,7 +25,7 @@ impl FakeToolHandler {
         Self {
             outputs: outputs.into_iter().collect(),
             calls: Vec::new(),
-            approval_reason: None,
+            policy: ToolCallPolicy::Allow,
         }
     }
 
@@ -30,7 +36,22 @@ impl FakeToolHandler {
         Self {
             outputs: outputs.into_iter().collect(),
             calls: Vec::new(),
-            approval_reason: Some(reason.into()),
+            policy: ToolCallPolicy::RequiresApproval {
+                reason: reason.into(),
+            },
+        }
+    }
+
+    pub fn rejecting(
+        reason: impl Into<String>,
+        outputs: impl IntoIterator<Item = ToolOutput>,
+    ) -> Self {
+        Self {
+            outputs: outputs.into_iter().collect(),
+            calls: Vec::new(),
+            policy: ToolCallPolicy::Reject {
+                reason: reason.into(),
+            },
         }
     }
 
@@ -44,8 +65,8 @@ impl FakeToolHandler {
 }
 
 impl ToolHandler for FakeToolHandler {
-    fn approval_reason(&self, _call: &ToolCall) -> Option<String> {
-        self.approval_reason.clone()
+    fn classify(&self, _call: &ToolCall) -> ToolCallPolicy {
+        self.policy.clone()
     }
 
     fn execute(&mut self, call: &ToolCall, _cancellation: Arc<AtomicBool>) -> ToolOutput {
@@ -119,12 +140,8 @@ impl crate::execution::sealed::Sealed for FakeToolDispatcher {}
 
 impl ToolDispatcher for FakeToolDispatcher {
     fn prepare(&self, call: ToolCall) -> PreparedToolCall {
-        match self.handler.approval_reason(&call) {
-            Some(reason) => {
-                PreparedToolCall::requiring_approval(self.dispatcher_identity, call, reason)
-            }
-            None => PreparedToolCall::ready(self.dispatcher_identity, call),
-        }
+        let policy = self.handler.classify(&call);
+        PreparedToolCall::classified(self.dispatcher_identity, call, policy)
     }
 
     fn execute_prepared(
