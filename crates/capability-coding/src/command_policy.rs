@@ -551,7 +551,10 @@ fn classify_hard_rejection(
     words: &[String],
     path_probes: &mut PathProbeBudget,
 ) -> Option<CommandPolicyDecision> {
-    let invocation = unwrap_transparent_command_wrappers(words);
+    let invocation = match unwrap_transparent_command_wrappers(words) {
+        Ok(invocation) => invocation,
+        Err(()) => return Some(reject("command uses too many transparent command wrappers")),
+    };
     let program = invocation.first()?;
     let arguments = &invocation[1..];
     if matches!(program_basename(program), "sudo" | "doas" | "su") {
@@ -582,25 +585,28 @@ fn classify_hard_rejection(
     None
 }
 
-fn unwrap_transparent_command_wrappers(mut words: &[String]) -> &[String] {
+fn unwrap_transparent_command_wrappers(mut words: &[String]) -> Result<&[String], ()> {
     const MAX_TRANSPARENT_WRAPPER_DEPTH: usize = 4;
 
-    for _ in 0..MAX_TRANSPARENT_WRAPPER_DEPTH {
+    for depth in 0..=MAX_TRANSPARENT_WRAPPER_DEPTH {
         let Some(program) = words.first() else {
-            return words;
+            return Ok(words);
         };
         let argument_index = match program_basename(program) {
             "command" => command_wrapped_program_index(words),
             "exec" => exec_wrapped_program_index(words),
             "env" => env_wrapped_program_index(words),
-            _ => return words,
+            _ => return Ok(words),
         };
         let Some(argument_index) = argument_index else {
-            return words;
+            return Ok(words);
         };
+        if depth == MAX_TRANSPARENT_WRAPPER_DEPTH {
+            return Err(());
+        }
         words = &words[argument_index..];
     }
-    words
+    unreachable!("transparent wrapper loop returns at its bounded depth")
 }
 
 fn command_wrapped_program_index(words: &[String]) -> Option<usize> {
@@ -641,7 +647,16 @@ fn env_wrapped_program_index(words: &[String]) -> Option<usize> {
     let mut index = 1;
     while let Some(argument) = words.get(index) {
         match argument.as_str() {
-            "--" => return (index + 1 < words.len()).then_some(index + 1),
+            "--" => {
+                index += 1;
+                while words
+                    .get(index)
+                    .is_some_and(|word| is_shell_assignment(word))
+                {
+                    index += 1;
+                }
+                return (index < words.len()).then_some(index);
+            }
             "-i" | "--ignore-environment" | "-0" | "--null" => index += 1,
             "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" => {
                 index = index.checked_add(2)?;
