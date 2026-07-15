@@ -926,6 +926,291 @@ mod tests {
     use young_tool_runtime::ToolOutput;
 
     use super::{PatchError, PublishedRecovery};
+    use crate::workspace::WorkspacePathError;
+
+    #[test]
+    fn ordinary_patch_failures_map_to_stable_tool_errors() {
+        let cases = vec![
+            (
+                PatchError::InvalidPatch("missing header".to_string()),
+                "invalid_patch",
+                false,
+                "invalid patch: missing header",
+            ),
+            (
+                PatchError::Limit("too many bytes".to_string()),
+                "patch_too_large",
+                false,
+                "patch limit exceeded: too many bytes",
+            ),
+            (
+                PatchError::Conflict("context changed".to_string()),
+                "patch_conflict",
+                false,
+                "patch conflict: context changed",
+            ),
+            (
+                PatchError::Workspace(WorkspacePathError::OutsideWorkspace {
+                    path: "../outside.txt".into(),
+                    root: "/workspace".into(),
+                }),
+                "outside_workspace",
+                false,
+                "path '../outside.txt' escapes workspace boundary '/workspace'",
+            ),
+            (
+                PatchError::Workspace(WorkspacePathError::Access {
+                    path: "missing.txt".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                }),
+                "path_not_found",
+                false,
+                "failed to access 'missing.txt'",
+            ),
+            (
+                PatchError::Io {
+                    path: "unsupported.txt".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::Unsupported),
+                },
+                "unsupported_file_metadata",
+                false,
+                "failed to update 'unsupported.txt'",
+            ),
+            (
+                PatchError::Io {
+                    path: "busy.txt".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::WouldBlock),
+                },
+                "patch_conflict",
+                false,
+                "failed to update 'busy.txt'",
+            ),
+            (
+                PatchError::Io {
+                    path: "invalid.txt".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+                },
+                "patch_conflict",
+                false,
+                "failed to update 'invalid.txt'",
+            ),
+            (
+                PatchError::Io {
+                    path: "retry.txt".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::Interrupted),
+                },
+                "workspace_io_error",
+                true,
+                "failed to update 'retry.txt'",
+            ),
+            (
+                PatchError::Io {
+                    path: "failed.txt".into(),
+                    source: std::io::Error::other("disk failure"),
+                },
+                "workspace_io_error",
+                false,
+                "failed to update 'failed.txt': disk failure",
+            ),
+            (
+                PatchError::Cancelled,
+                "tool_cancelled",
+                false,
+                "apply_patch was cancelled",
+            ),
+        ];
+
+        for (patch_error, expected_code, expected_retryable, expected_message) in cases {
+            let output = patch_error.into_output();
+            let ToolOutput::Failure { error, extensions } = output else {
+                panic!("patch failures must normalize to ToolOutput::Failure");
+            };
+            assert_eq!(error.code, expected_code);
+            assert_eq!(error.retryable, expected_retryable);
+            assert!(
+                error.message.starts_with(expected_message),
+                "unexpected patch diagnostic: {}",
+                error.message
+            );
+            assert!(extensions.is_empty());
+        }
+    }
+
+    #[test]
+    fn every_recovery_state_preserves_publication_evidence() {
+        let recovery_path = || {
+            std::path::PathBuf::from("src/.young-agent-recovery/.young-agent-patch-displaced.tmp")
+        };
+        let preserved = vec![
+            (
+                PublishedRecovery::LocatedVerified(recovery_path()),
+                "patch_not_published_with_recovery",
+                "located_verified",
+                "verified_search_and_git_ignored",
+                1,
+                0,
+            ),
+            (
+                PublishedRecovery::LocatedContentUnverified(recovery_path()),
+                "patch_not_published_with_recovery_candidate",
+                "located_content_unverified",
+                "verified_search_and_git_ignored",
+                0,
+                1,
+            ),
+            (
+                PublishedRecovery::LocatedPolicyUnverified(recovery_path()),
+                "patch_not_published_with_recovery",
+                "located_policy_unverified",
+                "unverified",
+                1,
+                0,
+            ),
+            (
+                PublishedRecovery::LocatedContentAndPolicyUnverified(recovery_path()),
+                "patch_not_published_with_recovery_candidate",
+                "located_content_and_policy_unverified",
+                "unverified",
+                0,
+                1,
+            ),
+            (
+                PublishedRecovery::Unlocated,
+                "patch_not_published_recovery_unlocated",
+                "unlocated",
+                "unverified",
+                0,
+                0,
+            ),
+            (
+                PublishedRecovery::NotApplicableNewFile,
+                "patch_not_published_without_recovery",
+                "not_applicable_new_file",
+                "not_applicable",
+                0,
+                0,
+            ),
+        ];
+
+        for (recovery, code, state, policy, recovery_count, candidate_count) in preserved {
+            let output = PatchError::Preserved {
+                target: "src/target.txt".into(),
+                recovery,
+                source: std::io::Error::other("injected pre-publication failure"),
+            }
+            .into_output();
+            let ToolOutput::Failure { error, extensions } = output else {
+                panic!("preserved recovery must fail structurally");
+            };
+            assert_eq!(error.code, code);
+            assert_eq!(extensions["publication_state"], json!("not_published"));
+            assert_eq!(extensions["recovery_state"], json!(state));
+            assert_eq!(extensions["recovery_policy"], json!(policy));
+            assert_eq!(
+                extensions["recovery_files"]
+                    .as_array()
+                    .expect("recovery_files is an array")
+                    .len(),
+                recovery_count
+            );
+            assert_eq!(
+                extensions["recovery_candidates"]
+                    .as_array()
+                    .expect("recovery_candidates is an array")
+                    .len(),
+                candidate_count
+            );
+        }
+
+        let published = vec![
+            (
+                PublishedRecovery::LocatedVerified(recovery_path()),
+                "patch_published_with_recovery",
+                "published_with_recovery",
+                "located_verified",
+                "verified_search_and_git_ignored",
+                1,
+                0,
+            ),
+            (
+                PublishedRecovery::LocatedContentUnverified(recovery_path()),
+                "patch_published_with_recovery_candidate",
+                "published_recovery_candidate",
+                "located_content_unverified",
+                "verified_search_and_git_ignored",
+                0,
+                1,
+            ),
+            (
+                PublishedRecovery::LocatedPolicyUnverified(recovery_path()),
+                "patch_published_with_recovery",
+                "published_with_recovery",
+                "located_policy_unverified",
+                "unverified",
+                1,
+                0,
+            ),
+            (
+                PublishedRecovery::LocatedContentAndPolicyUnverified(recovery_path()),
+                "patch_published_with_recovery_candidate",
+                "published_recovery_candidate",
+                "located_content_and_policy_unverified",
+                "unverified",
+                0,
+                1,
+            ),
+            (
+                PublishedRecovery::NotApplicableNewFile,
+                "patch_published_without_recovery",
+                "published_without_recovery",
+                "not_applicable_new_file",
+                "not_applicable",
+                0,
+                0,
+            ),
+            (
+                PublishedRecovery::Unlocated,
+                "patch_published_recovery_unlocated",
+                "published_recovery_unlocated",
+                "unlocated",
+                "unverified",
+                0,
+                0,
+            ),
+        ];
+
+        for (recovery, code, publication, state, policy, recovery_count, candidate_count) in
+            published
+        {
+            let output = PatchError::Published {
+                target: "src/target.txt".into(),
+                recovery,
+                source: std::io::Error::other("injected post-publication failure"),
+            }
+            .into_output();
+            let ToolOutput::Failure { error, extensions } = output else {
+                panic!("published recovery must fail structurally");
+            };
+            assert_eq!(error.code, code);
+            assert_eq!(extensions["publication_state"], json!(publication));
+            assert_eq!(extensions["recovery_state"], json!(state));
+            assert_eq!(extensions["recovery_policy"], json!(policy));
+            assert_eq!(
+                extensions["recovery_files"]
+                    .as_array()
+                    .expect("recovery_files is an array")
+                    .len(),
+                recovery_count
+            );
+            assert_eq!(
+                extensions["recovery_candidates"]
+                    .as_array()
+                    .expect("recovery_candidates is an array")
+                    .len(),
+                candidate_count
+            );
+        }
+    }
 
     #[test]
     fn published_failure_exposes_nested_recovery_state_as_extensions() {

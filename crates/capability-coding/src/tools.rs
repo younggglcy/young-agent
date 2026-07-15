@@ -119,3 +119,45 @@ impl Error for CodingCapabilityRegistrationError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CodingCapabilityRegistrationError;
+    use young_tool_runtime::{CapabilityManifestError, ToolRegistrationError};
+
+    #[test]
+    fn registration_errors_preserve_their_context_and_sources() {
+        let cases = vec![
+            (
+                CodingCapabilityRegistrationError::Manifest(
+                    CapabilityManifestError::Invalid {
+                        message: "invalid tool".to_string(),
+                    },
+                ),
+                "coding capability manifest failed: invalid built-in capability manifest: invalid tool",
+                true,
+            ),
+            (
+                CodingCapabilityRegistrationError::UnsupportedManifestTool {
+                    name: "unknown_tool".to_string(),
+                },
+                "coding capability manifest declares unsupported tool 'unknown_tool'",
+                false,
+            ),
+            (
+                CodingCapabilityRegistrationError::Registration(
+                    ToolRegistrationError::DuplicateTool {
+                        name: "read_file".to_string(),
+                    },
+                ),
+                "coding capability registration failed: tool 'read_file' is already registered",
+                true,
+            ),
+        ];
+
+        for (error, expected, has_source) in cases {
+            assert_eq!(error.to_string(), expected);
+            assert_eq!(std::error::Error::source(&error).is_some(), has_source);
+        }
+    }
+}

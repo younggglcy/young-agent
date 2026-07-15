@@ -57,6 +57,28 @@ fn run_git(path: &Path, arguments: &[&str]) {
     assert!(status.success(), "git command failed: {arguments:?}");
 }
 
+fn dispatch_approved_patch(
+    runtime: &mut ToolRuntime,
+    id: &str,
+    patch: serde_json::Value,
+    cancelled: bool,
+) -> ToolOutput {
+    let call = ToolCall {
+        id: ToolCallId::new(id),
+        tool_name: "apply_patch".to_string(),
+        arguments: patch,
+    };
+    runtime
+        .dispatch(
+            call.clone(),
+            ToolExecutionAuthorization::ApprovalGranted {
+                call_id: call.id.clone(),
+            },
+            Arc::new(AtomicBool::new(cancelled)),
+        )
+        .output
+}
+
 #[test]
 fn workspace_resolves_the_selected_root_and_records_git_context() {
     let test_workspace = TestWorkspace::new("git-context");
@@ -940,6 +962,280 @@ fn search_files_rejects_an_explicit_symlink_escape() {
 }
 
 #[test]
+fn builtin_tools_reject_malformed_argument_envelopes_consistently() {
+    let test_workspace = TestWorkspace::new("invalid-arguments");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let cases = [
+        ("read_file", json!("README.md")),
+        ("read_file", json!({ "path": "README.md", "extra": true })),
+        ("read_file", json!({})),
+        ("read_file", json!({ "path": 7 })),
+        ("search_files", json!({ "query": "needle", "path": "" })),
+        ("search_files", json!({ "query": "needle", "path": false })),
+        ("search_files", json!({ "query": "" })),
+        ("apply_patch", json!({ "patch": null })),
+    ];
+
+    for (index, (tool_name, arguments)) in cases.into_iter().enumerate() {
+        let call = ToolCall {
+            id: ToolCallId::new(format!("call-invalid-arguments-{index}")),
+            tool_name: tool_name.to_string(),
+            arguments,
+        };
+        let authorization = if tool_name == "apply_patch" {
+            ToolExecutionAuthorization::ApprovalGranted {
+                call_id: call.id.clone(),
+            }
+        } else {
+            ToolExecutionAuthorization::NotRequired
+        };
+        let result = runtime.dispatch(call, authorization, Arc::new(AtomicBool::new(false)));
+
+        let ToolOutput::Failure { error, extensions } = result.output else {
+            panic!("{tool_name} malformed arguments must fail");
+        };
+        assert_eq!(error.code, "invalid_arguments");
+        assert!(!error.retryable);
+        assert!(extensions.is_empty());
+    }
+}
+
+#[test]
+fn apply_patch_rejects_malformed_and_conflicting_unified_diffs() {
+    let test_workspace = TestWorkspace::new("patch-validation-matrix");
+    let notes = test_workspace.path().join("notes.txt");
+    std::fs::write(&notes, "first\nsecond\n").expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let cases = [
+        ("empty", "", "invalid_arguments"),
+        (
+            "no-file-header",
+            "diff --git a/notes.txt b/notes.txt\n",
+            "invalid_patch",
+        ),
+        ("missing-new-header", "--- a/notes.txt\n", "invalid_patch"),
+        (
+            "empty-path",
+            "--- \n+++ b/notes.txt\n@@ -1 +1 @@\n-first\n+changed\n",
+            "invalid_patch",
+        ),
+        (
+            "rename",
+            "--- a/notes.txt\n+++ b/renamed.txt\n@@ -1 +1 @@\n-first\n+changed\n",
+            "invalid_patch",
+        ),
+        (
+            "both-dev-null",
+            "--- /dev/null\n+++ /dev/null\n@@ -0,0 +0,0 @@\n",
+            "invalid_patch",
+        ),
+        (
+            "missing-hunk",
+            "--- a/notes.txt\n+++ b/notes.txt\n",
+            "invalid_patch",
+        ),
+        (
+            "invalid-hunk",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ broken @@\n",
+            "invalid_patch",
+        ),
+        (
+            "missing-new-range",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 @@\n",
+            "invalid_patch",
+        ),
+        (
+            "extra-range",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 +2 @@\n",
+            "invalid_patch",
+        ),
+        (
+            "invalid-range-start",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -x +1 @@\n",
+            "invalid_patch",
+        ),
+        (
+            "invalid-range-count",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,x +1 @@\n",
+            "invalid_patch",
+        ),
+        (
+            "early-hunk-end",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n first\n",
+            "invalid_patch",
+        ),
+        (
+            "invalid-hunk-line",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n?first\n",
+            "invalid_patch",
+        ),
+        (
+            "declared-count-overflow",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,0 @@\n first\n",
+            "invalid_patch",
+        ),
+        (
+            "orphan-newline-marker",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n\\ No newline at end of file\n",
+            "invalid_patch",
+        ),
+        (
+            "new-file-already-exists",
+            "--- /dev/null\n+++ b/notes.txt\n@@ -0,0 +1 @@\n+changed\n",
+            "patch_conflict",
+        ),
+        (
+            "missing-source",
+            "--- a/missing.txt\n+++ b/missing.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            "patch_conflict",
+        ),
+        (
+            "hunk-outside-file",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -9 +9 @@\n-missing\n+changed\n",
+            "patch_conflict",
+        ),
+        (
+            "context-mismatch",
+            "--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n missing\n",
+            "patch_conflict",
+        ),
+        (
+            "out-of-order-hunks",
+            concat!(
+                "--- a/notes.txt\n",
+                "+++ b/notes.txt\n",
+                "@@ -2 +2 @@\n",
+                " second\n",
+                "@@ -1 +1 @@\n",
+                " first\n"
+            ),
+            "patch_conflict",
+        ),
+    ];
+
+    for (name, patch, expected_code) in cases {
+        let output = dispatch_approved_patch(
+            &mut runtime,
+            &format!("call-patch-validation-{name}"),
+            json!({ "patch": patch }),
+            false,
+        );
+        let ToolOutput::Failure { error, .. } = output else {
+            panic!("{name} must fail without publishing a change");
+        };
+        assert_eq!(error.code, expected_code, "case {name}");
+        assert_eq!(
+            std::fs::read_to_string(&notes).expect("fixture remains readable"),
+            "first\nsecond\n",
+            "case {name} must not mutate the target"
+        );
+    }
+}
+
+#[test]
+fn apply_patch_enforces_cancellation_and_target_resource_limits() {
+    let test_workspace = TestWorkspace::new("patch-resource-limits");
+    std::fs::write(test_workspace.path().join("invalid.txt"), [0xff, 0xfe])
+        .expect("invalid UTF-8 fixture is written");
+    let oversized = std::fs::File::create(test_workspace.path().join("oversized.txt"))
+        .expect("oversized fixture is created");
+    oversized
+        .set_len(32 * 1024 * 1024 + 1)
+        .expect("oversized fixture is extended");
+    std::fs::write(
+        test_workspace.path().join("too-many-lines.txt"),
+        "\n".repeat(1_000_001),
+    )
+    .expect("line-heavy fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let cancelled = dispatch_approved_patch(
+        &mut runtime,
+        "call-patch-cancelled",
+        json!({
+            "patch": "--- a/invalid.txt\n+++ b/invalid.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        }),
+        true,
+    );
+    let ToolOutput::Failure { error, .. } = cancelled else {
+        panic!("pre-cancelled patch must fail");
+    };
+    assert_eq!(error.code, "tool_cancelled");
+
+    let line_limit = dispatch_approved_patch(
+        &mut runtime,
+        "call-patch-line-limit",
+        json!({ "patch": "\n".repeat(200_001) }),
+        false,
+    );
+    let ToolOutput::Failure { error, .. } = line_limit else {
+        panic!("line-heavy patch must fail");
+    };
+    assert_eq!(error.code, "patch_too_large");
+
+    for (name, expected_code) in [
+        ("invalid.txt", "workspace_io_error"),
+        ("oversized.txt", "patch_too_large"),
+        ("too-many-lines.txt", "patch_too_large"),
+    ] {
+        let output = dispatch_approved_patch(
+            &mut runtime,
+            &format!("call-patch-target-{name}"),
+            json!({
+                "patch": format!(
+                    "--- a/{name}\n+++ b/{name}\n@@ -1 +1 @@\n-old\n+new\n"
+                )
+            }),
+            false,
+        );
+        let ToolOutput::Failure { error, .. } = output else {
+            panic!("{name} must be rejected");
+        };
+        assert_eq!(error.code, expected_code, "target {name}");
+    }
+}
+
+#[test]
+fn apply_patch_accepts_standard_diff_metadata_without_publishing_it() {
+    let test_workspace = TestWorkspace::new("patch-diff-metadata");
+    let notes = test_workspace.path().join("notes.txt");
+    std::fs::write(&notes, "old\n").expect("fixture is written");
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+
+    let output = dispatch_approved_patch(
+        &mut runtime,
+        "call-patch-diff-metadata",
+        json!({
+            "patch": concat!(
+                "diff --git a/notes.txt b/notes.txt\n",
+                "index 1111111..2222222 100644\n",
+                "old mode 100644\n",
+                "new mode 100644\n",
+                "--- a/notes.txt\n",
+                "+++ b/notes.txt\n",
+                "@@ -1 +1 @@\n",
+                "-old\n",
+                "+new\n"
+            )
+        }),
+        false,
+    );
+
+    assert!(matches!(output, ToolOutput::Success { .. }));
+    assert_eq!(std::fs::read_to_string(notes).unwrap(), "new\n");
+}
+
+#[test]
 fn apply_patch_updates_a_workspace_file_after_approval() {
     let test_workspace = TestWorkspace::new("apply-patch");
     test_workspace.git(&["init", "--quiet"]);
@@ -1048,6 +1344,58 @@ fn apply_patch_updates_a_workspace_file_after_approval() {
         ignore_rule.success(),
         "the recovery namespace ignore rule must not be staged by git add"
     );
+}
+
+#[test]
+fn apply_patch_creates_a_new_file_without_recovery_artifacts() {
+    let test_workspace = TestWorkspace::new("apply-patch-create");
+    test_workspace.git(&["init", "--quiet"]);
+    let workspace = CodingWorkspace::resolve(test_workspace.path()).expect("workspace resolves");
+    let mut runtime = ToolRuntime::default();
+    register_builtin_coding_capability(&mut runtime, workspace).expect("capability registers");
+    let call = ToolCall {
+        id: ToolCallId::new("call-patch-create"),
+        tool_name: "apply_patch".to_string(),
+        arguments: json!({
+            "patch": concat!(
+                "--- /dev/null\n",
+                "+++ b/new.txt\n",
+                "@@ -0,0 +1,2 @@\n",
+                "+first line\n",
+                "+second line\n"
+            )
+        }),
+    };
+
+    let result = runtime.dispatch(
+        call.clone(),
+        ToolExecutionAuthorization::ApprovalGranted {
+            call_id: call.id.clone(),
+        },
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let ToolOutput::Success {
+        content,
+        metadata,
+        extensions,
+    } = result.output
+    else {
+        panic!("new-file patch should succeed");
+    };
+    assert_eq!(
+        std::fs::read_to_string(test_workspace.path().join("new.txt"))
+            .expect("created file is readable"),
+        "first line\nsecond line\n"
+    );
+    let [ToolContent::Json { value }] = content.as_slice() else {
+        panic!("apply_patch should return structured JSON");
+    };
+    assert_eq!(value["changed_files"], json!(["new.txt"]));
+    assert_eq!(value["recovery_files"], json!([]));
+    assert_eq!(metadata["files_changed"], json!(1));
+    assert_eq!(metadata["recovery_files"], json!(0));
+    assert!(extensions.is_empty());
 }
 
 #[cfg(unix)]

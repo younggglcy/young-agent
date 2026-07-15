@@ -1,7 +1,61 @@
+use std::error::Error;
+
 use serde_json::json;
 use young_tool_runtime::{
     CapabilityManifest, McpCompatibility, ToolApprovalPolicy, ToolSafetyClass,
 };
+
+#[test]
+fn manifest_errors_and_always_reject_policy_preserve_public_contracts() {
+    let parse_error =
+        CapabilityManifest::from_toml("not valid toml").expect_err("malformed TOML must fail");
+    assert!(parse_error
+        .to_string()
+        .starts_with("failed to parse built-in capability manifest TOML:"));
+    assert!(parse_error.source().is_some());
+
+    let source = r#"
+schema_version = 1
+
+[capability]
+id = "coding"
+version = "0.1.0"
+name = "Coding"
+description = "Built-in coding tools."
+
+[[tools]]
+name = "delete_file"
+description = "Delete one workspace file."
+safety_class = "always_reject"
+safety_reason = "deletion is disabled"
+input_schema = { type = "object" }
+"#;
+    let manifest = CapabilityManifest::from_toml(source).expect("manifest loads");
+    let borrowed = manifest
+        .tool_definitions()
+        .expect("borrowed conversion succeeds");
+    let consumed = manifest
+        .into_tool_definitions()
+        .expect("consuming conversion succeeds");
+
+    for definitions in [borrowed, consumed] {
+        assert_eq!(
+            definitions[0].approval_policy,
+            ToolApprovalPolicy::AlwaysReject {
+                reason: "deletion is disabled".to_string(),
+            }
+        );
+    }
+
+    let blank_name = source.replace("name = \"Coding\"", "name = \"  \"");
+    let invalid = CapabilityManifest::from_toml(&blank_name)
+        .expect_err("blank capability name must fail validation");
+    assert_eq!(
+        invalid.to_string(),
+        "invalid built-in capability manifest: capability.name must not be empty"
+    );
+    assert!(invalid.source().is_none());
+}
 
 #[test]
 fn built_in_manifest_loads_capability_and_tool_metadata_from_toml() {
