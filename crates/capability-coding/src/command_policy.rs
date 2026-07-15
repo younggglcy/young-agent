@@ -553,7 +553,7 @@ fn classify_hard_rejection(
 ) -> Option<CommandPolicyDecision> {
     let invocation = match unwrap_transparent_command_wrappers(words) {
         Ok(invocation) => invocation,
-        Err(()) => return Some(reject("command uses too many transparent command wrappers")),
+        Err(error) => return Some(reject(error.reason())),
     };
     let program = invocation.first()?;
     let arguments = &invocation[1..];
@@ -585,7 +585,26 @@ fn classify_hard_rejection(
     None
 }
 
-fn unwrap_transparent_command_wrappers(mut words: &[String]) -> Result<&[String], ()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransparentWrapperError {
+    TooDeep,
+    UnsupportedSyntax,
+}
+
+impl TransparentWrapperError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::TooDeep => "command uses too many transparent command wrappers",
+            Self::UnsupportedSyntax => {
+                "command uses unsupported transparent command wrapper syntax"
+            }
+        }
+    }
+}
+
+fn unwrap_transparent_command_wrappers(
+    mut words: &[String],
+) -> Result<&[String], TransparentWrapperError> {
     const MAX_TRANSPARENT_WRAPPER_DEPTH: usize = 4;
 
     for depth in 0..=MAX_TRANSPARENT_WRAPPER_DEPTH {
@@ -597,38 +616,42 @@ fn unwrap_transparent_command_wrappers(mut words: &[String]) -> Result<&[String]
             "exec" => exec_wrapped_program_index(words),
             "env" => env_wrapped_program_index(words),
             _ => return Ok(words),
-        };
+        }?;
         let Some(argument_index) = argument_index else {
             return Ok(words);
         };
         if depth == MAX_TRANSPARENT_WRAPPER_DEPTH {
-            return Err(());
+            return Err(TransparentWrapperError::TooDeep);
         }
         words = &words[argument_index..];
     }
     unreachable!("transparent wrapper loop returns at its bounded depth")
 }
 
-fn command_wrapped_program_index(words: &[String]) -> Option<usize> {
+fn command_wrapped_program_index(
+    words: &[String],
+) -> Result<Option<usize>, TransparentWrapperError> {
     let mut index = 1;
     while let Some(argument) = words.get(index) {
         match argument.as_str() {
-            "--" => return (index + 1 < words.len()).then_some(index + 1),
+            "--" => return Ok((index + 1 < words.len()).then_some(index + 1)),
             "-p" => index += 1,
-            "-v" | "-V" => return None,
-            _ if argument.starts_with('-') => return None,
-            _ => return Some(index),
+            "-v" | "-V" => return Ok(None),
+            _ if argument.starts_with('-') => {
+                return Err(TransparentWrapperError::UnsupportedSyntax);
+            }
+            _ => return Ok(Some(index)),
         }
     }
-    None
+    Ok(None)
 }
 
-fn exec_wrapped_program_index(words: &[String]) -> Option<usize> {
+fn exec_wrapped_program_index(words: &[String]) -> Result<Option<usize>, TransparentWrapperError> {
     let mut index = 1;
     while let Some(argument) = words.get(index) {
         match argument.as_str() {
-            "--" => return (index + 1 < words.len()).then_some(index + 1),
-            "-a" => index = index.checked_add(2)?,
+            "--" => return Ok((index + 1 < words.len()).then_some(index + 1)),
+            "-a" => index += 2,
             _ if argument.starts_with('-')
                 && argument[1..]
                     .chars()
@@ -636,55 +659,82 @@ fn exec_wrapped_program_index(words: &[String]) -> Option<usize> {
             {
                 index += 1;
             }
-            _ if argument.starts_with('-') => return None,
-            _ => return Some(index),
+            _ if argument.starts_with('-') => {
+                return Err(TransparentWrapperError::UnsupportedSyntax);
+            }
+            _ => return Ok(Some(index)),
         }
     }
-    None
+    Ok(None)
 }
 
-fn env_wrapped_program_index(words: &[String]) -> Option<usize> {
+fn env_wrapped_program_index(words: &[String]) -> Result<Option<usize>, TransparentWrapperError> {
     let mut index = 1;
     while let Some(argument) = words.get(index) {
         match argument.as_str() {
             "--" => {
                 index += 1;
-                while words
-                    .get(index)
-                    .is_some_and(|word| is_shell_assignment(word))
-                {
+                while words.get(index).is_some_and(|word| is_env_assignment(word)) {
                     index += 1;
                 }
-                return (index < words.len()).then_some(index);
+                return Ok((index < words.len()).then_some(index));
             }
-            "-i" | "--ignore-environment" | "-0" | "--null" => index += 1,
-            "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0" => {
-                index = index.checked_add(2)?;
+            "-u" | "--unset" | "-C" | "--chdir" | "-P" | "-a" | "--argv0" => {
+                index += 2;
             }
-            "-S" | "--split-string" => return None,
+            "-S" | "--split-string" => {
+                return Err(TransparentWrapperError::UnsupportedSyntax);
+            }
+            "--help" | "--version" => return Ok(None),
             _ if argument.starts_with("--unset=")
                 || argument.starts_with("--chdir=")
                 || argument.starts_with("--argv0=") =>
             {
                 index += 1;
             }
-            _ if argument.starts_with('-') => return None,
-            _ if is_shell_assignment(argument) => index += 1,
-            _ => return Some(index),
+            _ if argument.starts_with("-S") || argument.starts_with("--split-string=") => {
+                return Err(TransparentWrapperError::UnsupportedSyntax);
+            }
+            _ if env_short_option_has_attached_value(argument) => index += 1,
+            _ if env_short_option_cluster_has_no_value(argument) => index += 1,
+            _ if argument.starts_with("--block-signal")
+                || argument.starts_with("--default-signal")
+                || argument.starts_with("--ignore-signal")
+                || argument == "--list-signal-handling"
+                || argument == "--debug" =>
+            {
+                index += 1;
+            }
+            _ if argument.starts_with('-') => {
+                return Err(TransparentWrapperError::UnsupportedSyntax);
+            }
+            _ if is_env_assignment(argument) => index += 1,
+            _ => return Ok(Some(index)),
         }
     }
-    None
+    Ok(None)
 }
 
-fn is_shell_assignment(word: &str) -> bool {
-    let Some((name, _value)) = word.split_once('=') else {
-        return false;
-    };
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
-        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
+fn env_short_option_has_attached_value(argument: &str) -> bool {
+    ["-u", "-C", "-P", "-a"].iter().any(|option| {
+        argument
+            .strip_prefix(option)
+            .is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn env_short_option_cluster_has_no_value(argument: &str) -> bool {
+    argument.strip_prefix('-').is_some_and(|options| {
+        !options.is_empty()
+            && options
+                .chars()
+                .all(|option| matches!(option, '0' | 'i' | 'v'))
+    })
+}
+
+fn is_env_assignment(word: &str) -> bool {
+    word.split_once('=')
+        .is_some_and(|(name, _value)| !name.is_empty())
 }
 
 fn command_mutates_filesystem_root(program: &str, arguments: &[String]) -> bool {
