@@ -38,4 +38,12 @@ jobs:
           disable_search: true
           fail_ci_if_error: true
           files: lcov.info
+          run_command: upload-coverage
+          use_oidc: true
+
+      - name: Publish Codecov status checks
+        uses: codecov/codecov-action@v5
+        with:
+          fail_ci_if_error: true
+          run_command: send-notifications
           use_oidc: true
