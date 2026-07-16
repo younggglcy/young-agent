@@ -1,5 +1,7 @@
 #![doc = "Audited platform process hooks for the Agent Kernel."]
 
+pub mod codecov_project_probe;
+
 use std::io;
 use std::process::Command;
 
