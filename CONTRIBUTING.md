@@ -61,6 +61,11 @@ does not publish it consistently, including when a verified probe lowers overall
 future hard project-coverage floor requires either a Codecov integration that reliably publishes
 that status or a separate local gate; the latter would no longer be a Codecov-only policy.
 
+If `upload` or `codecov/patch` is unexpectedly missing or stuck, inspect the upload log and Codecov
+PR report, then rerun the failed workflow after the service recovers. Do not bypass the incident by
+removing a required check. Any temporary branch-protection exception requires an explicit repository
+owner decision; restore the required checks and repeat the failing-and-recovery probe afterward.
+
 Changing a workflow, job, or Codecov status name also requires updating branch protection in the
 same rollout. Verify both a failing coverage change and its tested recovery before treating a new
 status context as enforced.
