@@ -1,14 +1,5 @@
-github_checks: false
-
 coverage:
   status:
-    project:
-      default:
-        target: 90%
-        threshold: 0%
-        if_not_found: failure
-        informational: false
-        only_pulls: true
     patch:
       default:
         target: 90%
