@@ -11,3 +11,14 @@ path = "src/main.rs"
 
 [lints]
 workspace = true
+
+[dependencies]
+ctrlc.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+young-agent-runtime = { path = "../agent-runtime" }
+young-capability-coding = { path = "../capability-coding" }
+young-event-store = { path = "../event-store" }
+young-model-runtime = { path = "../model-runtime" }
+young-tool-runtime = { path = "../tool-runtime" }

@@ -112,6 +112,29 @@ fn run_started(run_id: &str) -> AgentEvent {
     agent_event(json!({ "type": "run_started", "run_id": run_id }))
 }
 
+#[cfg(unix)]
+#[test]
+fn newly_created_store_keeps_the_reserved_file_identity() {
+    let log = TestLog::new("reserved-identity");
+    let displaced = log.path().with_extension("reserved.jsonl");
+    let store = JsonlEventStore::create_new(log.path()).expect("new Event Log should be reserved");
+
+    std::fs::rename(log.path(), &displaced).expect("reserved log should be displaced");
+    std::fs::write(log.path(), "victim\n").expect("replacement path should be created");
+    store
+        .append(&run_started("run-reserved"))
+        .expect("append should keep using the reserved file");
+
+    assert_eq!(
+        std::fs::read_to_string(log.path()).expect("replacement should remain readable"),
+        "victim\n"
+    );
+    assert!(std::fs::read_to_string(&displaced)
+        .expect("reserved file should remain readable")
+        .contains("run-reserved"));
+    let _ = std::fs::remove_file(displaced);
+}
+
 fn turn_started(run_id: &str, turn_id: &str) -> AgentEvent {
     agent_event(json!({
         "type": "turn_started",
