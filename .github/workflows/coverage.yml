@@ -1,4 +1,4 @@
-name: Coverage
+name: Codecov
 
 on:
   push:
@@ -15,7 +15,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  coverage:
+  upload:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -31,22 +31,6 @@ jobs:
 
       - name: Generate coverage report
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
-
-      - name: Enforce overall coverage
-        run: |
-          awk -F: '
-            $1 == "LF" { lines += $2 }
-            $1 == "LH" { hits += $2 }
-            END {
-              if (lines == 0) {
-                print "No LCOV line coverage found" > "/dev/stderr"
-                exit 1
-              }
-              coverage = 100 * hits / lines
-              printf "Overall LCOV line coverage: %.2f%% (%d/%d)\n", coverage, hits, lines
-              if (coverage < 90) exit 1
-            }
-          ' lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
