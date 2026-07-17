@@ -163,9 +163,55 @@ fn decode_approval_line(line: Vec<u8>) -> ApprovalInput {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{self, BufRead, Cursor, Read, Write};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
 
-    use super::{read_approval_input, ApprovalInput, MAX_APPROVAL_INPUT_BYTES};
+    use serde_json::json;
+    use young_agent_runtime::{ApprovalDecision, ApprovalRequest, RunControl};
+    use young_tool_runtime::{ToolCall, ToolCallId};
+
+    use crate::terminal::TerminalOutput;
+
+    use super::{
+        decode_approval_line, read_approval_input, ApprovalInput, InteractiveApprovalControl,
+        MAX_APPROVAL_INPUT_BYTES,
+    };
+
+    fn approval_request() -> ApprovalRequest {
+        ApprovalRequest {
+            id: "approval-001".to_string(),
+            call: ToolCall {
+                id: ToolCallId::new("tool-001"),
+                tool_name: "run_command".to_string(),
+                arguments: json!({ "command": "touch approved.txt" }),
+            },
+            reason: "command mutates the workspace".to_string(),
+        }
+    }
+
+    fn decide(inputs: Vec<ApprovalInput>, cancelled: bool) -> ApprovalDecision {
+        let (sender, receiver) = mpsc::channel();
+        for input in inputs {
+            sender.send(input).expect("approval input should queue");
+        }
+        drop(sender);
+        let mut control = InteractiveApprovalControl {
+            input: receiver,
+            output: TerminalOutput::new(Vec::new(), false),
+        };
+        control.decide_approval(&approval_request(), Arc::new(AtomicBool::new(cancelled)))
+    }
+
+    fn assert_denied_contains(decision: ApprovalDecision, expected: &str) {
+        match decision {
+            ApprovalDecision::Deny { reason } => assert!(
+                reason.contains(expected),
+                "denial reason '{reason}' did not contain '{expected}'"
+            ),
+            ApprovalDecision::Approve => panic!("approval should have been denied"),
+        }
+    }
 
     #[test]
     fn oversized_approval_line_returns_immediately_without_draining_the_source() {
@@ -178,5 +224,162 @@ mod tests {
             ApprovalInput::TooLong
         ));
         assert_eq!(reader.position(), MAX_APPROVAL_INPUT_BYTES as u64);
+    }
+
+    #[test]
+    fn approval_input_distinguishes_lines_eof_and_invalid_utf8() {
+        let mut line = Cursor::new(b"yes\nremaining".to_vec());
+        assert!(matches!(
+            read_approval_input(&mut line),
+            ApprovalInput::Line(value) if value == "yes\n"
+        ));
+        assert_eq!(line.position(), 4);
+
+        let mut final_line = Cursor::new(b"no".to_vec());
+        assert!(matches!(
+            read_approval_input(&mut final_line),
+            ApprovalInput::Line(value) if value == "no"
+        ));
+
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        assert!(matches!(
+            read_approval_input(&mut empty),
+            ApprovalInput::Eof
+        ));
+
+        assert!(matches!(
+            decode_approval_line(vec![0xff]),
+            ApprovalInput::Error(error) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    struct BrokenReader;
+
+    impl Read for BrokenReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("input failed"))
+        }
+    }
+
+    impl BufRead for BrokenReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("input failed"))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    #[test]
+    fn approval_input_preserves_reader_errors() {
+        assert!(matches!(
+            read_approval_input(&mut BrokenReader),
+            ApprovalInput::Error(error) if error.to_string() == "input failed"
+        ));
+    }
+
+    #[test]
+    fn approval_control_handles_every_input_terminal_state() {
+        assert_eq!(
+            decide(vec![ApprovalInput::Line("yes\n".to_string())], false),
+            ApprovalDecision::Approve
+        );
+        assert_denied_contains(
+            decide(vec![ApprovalInput::Line("n\n".to_string())], false),
+            "user denied",
+        );
+        assert_denied_contains(
+            decide(vec![ApprovalInput::Line("\n".to_string())], false),
+            "user denied",
+        );
+        assert_denied_contains(decide(vec![ApprovalInput::Eof], false), "input closed");
+        assert_denied_contains(
+            decide(vec![ApprovalInput::TooLong], false),
+            "input exceeded",
+        );
+        assert_denied_contains(
+            decide(
+                vec![ApprovalInput::Error(io::Error::other("reader failed"))],
+                false,
+            ),
+            "reader failed",
+        );
+        assert_denied_contains(decide(Vec::new(), false), "input disconnected");
+        assert_denied_contains(
+            decide(vec![ApprovalInput::Line("yes\n".to_string())], true),
+            "wait stopped",
+        );
+
+        assert_eq!(
+            decide(
+                vec![
+                    ApprovalInput::Line("maybe\n".to_string()),
+                    ApprovalInput::Line("y\n".to_string()),
+                ],
+                false,
+            ),
+            ApprovalDecision::Approve
+        );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("terminal unavailable"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("terminal unavailable"))
+        }
+    }
+
+    #[test]
+    fn approval_control_denies_when_the_prompt_cannot_be_written() {
+        let (_sender, receiver) = mpsc::channel();
+        let mut control = InteractiveApprovalControl {
+            input: receiver,
+            output: TerminalOutput::new(FailingWriter, true),
+        };
+
+        assert_denied_contains(
+            control.decide_approval(&approval_request(), Arc::new(AtomicBool::new(false))),
+            "terminal output failed",
+        );
+    }
+
+    struct CorrectionFailingWriter;
+
+    impl Write for CorrectionFailingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer
+                .windows(b"enter 'y'".len())
+                .any(|window| window == b"enter 'y'")
+            {
+                Err(io::Error::other("correction unavailable"))
+            } else {
+                Ok(buffer.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn approval_control_denies_when_invalid_input_cannot_be_corrected() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(ApprovalInput::Line("maybe\n".to_string()))
+            .expect("invalid approval input should queue");
+        let mut control = InteractiveApprovalControl {
+            input: receiver,
+            output: TerminalOutput::new(CorrectionFailingWriter, false),
+        };
+
+        assert_denied_contains(
+            control.decide_approval(&approval_request(), Arc::new(AtomicBool::new(false))),
+            "terminal output failed during approval decision",
+        );
     }
 }

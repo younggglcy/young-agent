@@ -251,6 +251,51 @@ fn default_event_log_uses_state_storage_outside_the_workspace() {
     }
 }
 
+#[cfg(not(windows))]
+#[test]
+fn default_event_log_honors_xdg_and_home_state_fallbacks() {
+    for (name, variable, state_root, expected_root) in [
+        (
+            "xdg-state",
+            "XDG_STATE_HOME",
+            "xdg-state",
+            PathBuf::from("xdg-state/young-agent"),
+        ),
+        (
+            "home-state",
+            "HOME",
+            "home",
+            PathBuf::from("home/.local/state/young-agent"),
+        ),
+    ] {
+        let directory = TestDirectory::new(name);
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace should be created");
+        let state_root = directory.path().join(state_root);
+
+        let mut command = CliCommand::new("Inspect", &workspace);
+        command
+            .command
+            .env_remove("YOUNG_AGENT_STATE_DIR")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("HOME")
+            .env(variable, &state_root);
+        let output = command.output();
+
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        let event_log = stdout(&output)
+            .lines()
+            .find_map(|line| line.strip_prefix("[event-log] "))
+            .map(PathBuf::from)
+            .expect("CLI should report an Event Log");
+        assert!(
+            event_log.starts_with(directory.path().join(expected_root)),
+            "unexpected Event Log path: {event_log:?}"
+        );
+        assert!(event_log.exists(), "Event Log should exist");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn default_state_directory_rejects_a_symlink() {

@@ -189,3 +189,117 @@ impl Error for CliError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io::{self, Write};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use young_capability_coding::{register_builtin_coding_capability, CodingWorkspace};
+    use young_tool_runtime::ToolRuntime;
+
+    use super::{run, CliError, CliExitStatus};
+
+    #[test]
+    fn exit_statuses_keep_their_process_contract() {
+        assert_eq!(CliExitStatus::Completed.code(), 0);
+        assert_eq!(CliExitStatus::Failed.code(), 2);
+        assert_eq!(CliExitStatus::Interrupted.code(), 130);
+        assert_eq!(CliExitStatus::Cancelled.code(), 125);
+    }
+
+    #[test]
+    fn help_completes_without_initializing_a_run() {
+        assert_eq!(
+            run([OsString::from("--help")], Vec::new(), false)
+                .expect("help should render successfully"),
+            CliExitStatus::Completed
+        );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("stdout closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("stdout closed"))
+        }
+    }
+
+    #[test]
+    fn help_surfaces_terminal_write_failures() {
+        let error = run([OsString::from("--help")], FailingWriter, false)
+            .expect_err("terminal failure should be returned");
+        assert!(matches!(error, CliError::TerminalOutput(_)));
+        assert!(format!("{error}").contains("terminal output failed: stdout closed"));
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn cli_error_wrappers_preserve_context_and_sources() {
+        let arguments = CliError::Arguments("bad arguments".to_string());
+        assert_eq!(arguments.to_string(), "bad arguments");
+        assert!(arguments.source().is_none());
+
+        let provider = CliError::FakeProvider(Box::new(io::Error::other("provider failed")));
+        assert_eq!(provider.to_string(), "provider failed");
+        assert!(provider.source().is_some());
+
+        let state = CliError::State(Box::new(io::Error::other("state failed")));
+        assert_eq!(state.to_string(), "state failed");
+        assert!(state.source().is_some());
+
+        let terminal = CliError::TerminalOutput(io::Error::other("terminal failed"));
+        assert_eq!(
+            terminal.to_string(),
+            "terminal output failed: terminal failed"
+        );
+        assert!(terminal.source().is_some());
+    }
+
+    fn unique_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "young-agent-app-unit-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn workspace_and_registration_errors_keep_their_typed_sources() {
+        let missing = unique_path("missing");
+        let workspace_error = match CodingWorkspace::resolve(&missing) {
+            Ok(_) => panic!("missing workspace should be rejected"),
+            Err(error) => error,
+        };
+        let workspace_error = CliError::Workspace(workspace_error);
+        assert!(workspace_error
+            .to_string()
+            .contains("failed to open workspace"));
+        assert!(workspace_error.source().is_some());
+
+        let root = unique_path("duplicate-registration");
+        fs::create_dir(&root).expect("workspace should be created");
+        let workspace = CodingWorkspace::resolve(&root).expect("workspace should resolve");
+        let mut tools = ToolRuntime::default();
+        register_builtin_coding_capability(&mut tools, workspace.clone())
+            .expect("first capability registration should succeed");
+        let registration_error = register_builtin_coding_capability(&mut tools, workspace)
+            .expect_err("duplicate capability registration should fail");
+        let registration_error = CliError::RegisterCapability(registration_error);
+        assert!(!registration_error.to_string().is_empty());
+        assert!(registration_error.source().is_some());
+        drop(tools);
+        fs::remove_dir_all(&root).expect("workspace should be removed");
+    }
+}

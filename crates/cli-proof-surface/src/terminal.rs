@@ -341,3 +341,139 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::io::{self, Write};
+
+    use serde_json::json;
+    use young_model_runtime::{
+        ModelError, ModelRequestId, ModelStreamEvent, ModelToolCallId, ModelUsage,
+    };
+
+    use super::{render_model_event, write_terminal_safe, TerminalOutput};
+
+    #[test]
+    fn terminal_safe_writer_escapes_control_and_bidi_characters() {
+        let mut rendered = Vec::new();
+        write_terminal_safe(
+            &mut rendered,
+            "plain\0\u{007f}\u{061c}\u{200b}\u{202e}\u{2060}\u{feff}\nend",
+        )
+        .expect("safe terminal text should render");
+        let rendered = String::from_utf8(rendered).expect("escaped output should be UTF-8");
+
+        for escaped in [
+            r"\u{0000}",
+            r"\u{007f}",
+            r"\u{061c}",
+            r"\u{200b}",
+            r"\u{202e}",
+            r"\u{2060}",
+            r"\u{feff}",
+            r"\u{000a}",
+        ] {
+            assert!(rendered.contains(escaped), "missing {escaped}: {rendered}");
+        }
+        assert!(rendered.starts_with("plain"));
+        assert!(rendered.ends_with("end"));
+    }
+
+    #[test]
+    fn model_event_rendering_covers_stream_metadata_variants() {
+        let output = TerminalOutput::new(Vec::new(), false);
+        let events = [
+            ModelStreamEvent::Started {
+                request_id: None,
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::Started {
+                request_id: Some(ModelRequestId::new("request-001")),
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::ToolCallDelta {
+                id: ModelToolCallId::new("call-001"),
+                name: None,
+                arguments_delta: "{\"command\":".to_string(),
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::ToolCallDelta {
+                id: ModelToolCallId::new("call-001"),
+                name: Some("run_command".to_string()),
+                arguments_delta: "\"cargo test\"}".to_string(),
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::ToolCall {
+                id: ModelToolCallId::new("call-001"),
+                name: "run_command".to_string(),
+                arguments: json!({ "command": "cargo test" }),
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::Usage {
+                usage: ModelUsage {
+                    input_tokens: 12,
+                    output_tokens: 34,
+                },
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::Completed {
+                finish_reason: None,
+                extensions: BTreeMap::new(),
+            },
+            ModelStreamEvent::Failed {
+                error: ModelError {
+                    code: "provider_error".to_string(),
+                    message: "unavailable".to_string(),
+                    retryable: true,
+                },
+                extensions: BTreeMap::new(),
+            },
+        ];
+
+        for event in &events {
+            assert!(render_model_event(&output, event));
+        }
+
+        let state = output.state.lock().expect("terminal state should lock");
+        let rendered = String::from_utf8(state.writer.clone()).expect("output should be UTF-8");
+        assert!(rendered.contains("[model] started\n"));
+        assert!(rendered.contains("[model] started request-001"));
+        assert!(rendered.contains("[model-tool-delta] call-001 <pending>"));
+        assert!(rendered.contains("[model-tool-call] call-001 run_command"));
+        assert!(rendered.contains("[usage] input=12 output=34"));
+        assert!(rendered.contains("[model] completed\n"));
+        assert!(rendered.contains("[model-error] provider_error: unavailable"));
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("terminal unavailable"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("terminal unavailable"))
+        }
+    }
+
+    #[test]
+    fn terminal_output_latches_write_and_prompt_failures() {
+        let output = TerminalOutput::new(FailingWriter, false);
+        assert!(!output.line(format_args!("first")));
+        assert!(!output.line(format_args!("second")));
+        assert!(!output.prepare_approval_prompt());
+        assert_eq!(
+            output
+                .take_error()
+                .expect("write failure should be retained")
+                .to_string(),
+            "terminal unavailable"
+        );
+
+        let prompt = TerminalOutput::new(FailingWriter, true);
+        assert!(!prompt.prepare_approval_prompt());
+        assert!(prompt.take_error().is_some());
+    }
+}

@@ -117,7 +117,16 @@ mod tests {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{parse_args, CliOptions, ParseResult, SignalAction};
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::{parse_args, usage, CliOptions, ParseResult, SignalAction};
+
+    fn parse_error(arguments: &[&str]) -> String {
+        parse_args(arguments.iter().map(|argument| OsString::from(*argument)))
+            .err()
+            .expect("arguments should be rejected")
+    }
 
     #[test]
     fn parses_the_minimal_fake_provider_invocation() {
@@ -140,5 +149,103 @@ mod tests {
                 signal_action: SignalAction::Interrupt,
             }) if prompt == "inspect" && workspace.as_path() == Path::new("/tmp/workspace")
         ));
+    }
+
+    #[test]
+    fn parses_optional_paths_and_signal_action() {
+        let parsed = parse_args([
+            OsString::from("--fake"),
+            OsString::from("--prompt"),
+            OsString::from("inspect"),
+            OsString::from("--workspace"),
+            OsString::from("workspace"),
+            OsString::from("--event-log"),
+            OsString::from("run.jsonl"),
+            OsString::from("--fake-script"),
+            OsString::from("script.json"),
+            OsString::from("--on-signal"),
+            OsString::from("cancel"),
+        ])
+        .expect("optional arguments should parse");
+
+        assert!(matches!(
+            parsed,
+            ParseResult::Options(CliOptions {
+                prompt,
+                workspace,
+                event_log: Some(event_log),
+                fake_script: Some(fake_script),
+                signal_action: SignalAction::Cancel,
+            }) if prompt == "inspect"
+                && workspace == Path::new("workspace")
+                && event_log == Path::new("run.jsonl")
+                && fake_script == Path::new("script.json")
+        ));
+    }
+
+    #[test]
+    fn help_and_usage_are_available_without_provider_arguments() {
+        assert!(matches!(
+            parse_args([OsString::from("--help")]),
+            Ok(ParseResult::Help)
+        ));
+        assert!(matches!(
+            parse_args([OsString::from("-h")]),
+            Ok(ParseResult::Help)
+        ));
+        assert!(usage().starts_with("Usage: young-agent"));
+    }
+
+    #[test]
+    fn rejects_invalid_or_incomplete_invocations_with_actionable_usage() {
+        for (arguments, expected) in [
+            (vec!["--fake", "--wat"], "unknown option '--wat'"),
+            (vec!["--fake", "extra"], "unexpected argument 'extra'"),
+            (vec![], "--fake is required"),
+            (vec!["--fake"], "--prompt is required"),
+            (
+                vec!["--fake", "--prompt", "   ", "--workspace", "."],
+                "--prompt must not be empty",
+            ),
+            (
+                vec!["--fake", "--prompt", "inspect"],
+                "--workspace is required",
+            ),
+            (
+                vec![
+                    "--fake",
+                    "--prompt",
+                    "inspect",
+                    "--workspace",
+                    ".",
+                    "--on-signal",
+                    "stop",
+                ],
+                "--on-signal must be 'interrupt' or 'cancel'",
+            ),
+            (vec!["--fake", "--prompt"], "--prompt requires a value"),
+        ] {
+            let error = parse_error(&arguments);
+            assert!(error.contains(expected), "unexpected error: {error}");
+            assert!(error.contains(usage()), "usage missing from: {error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_non_utf8_options_and_text_values() {
+        let invalid_option = parse_args([OsString::from_vec(vec![0xff])])
+            .err()
+            .expect("non-UTF-8 option should be rejected");
+        assert!(invalid_option.contains("valid UTF-8 options"));
+
+        let invalid_prompt = parse_args([
+            OsString::from("--fake"),
+            OsString::from("--prompt"),
+            OsString::from_vec(vec![0xff]),
+        ])
+        .err()
+        .expect("non-UTF-8 prompt should be rejected");
+        assert!(invalid_prompt.contains("--prompt must be valid UTF-8"));
     }
 }
