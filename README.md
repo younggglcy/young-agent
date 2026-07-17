@@ -48,10 +48,12 @@ The CLI prints each Agent Event after it is committed to the Canonical Event Log
 log path before the run starts. Default logs live in an application state directory outside the
 selected workspace (`$YOUNG_AGENT_STATE_DIR`, `$XDG_STATE_HOME/young-agent`, or
 `$HOME/.local/state/young-agent`, in that order on Unix). Pass `--event-log <PATH>` to reserve a
-different new path. New runs keep the originally created file identity open so a path replacement
-cannot redirect later events. Unix state directories are owner-checked, reject symlinks, and use
-mode `0700`; Event Logs use mode `0600`. If no state environment is available, the Unix fallback
-is isolated by uid under the system temporary directory.
+different new path. Custom Event Log locations are caller-managed: the CLI creates missing parent
+directories but does not apply the default state directory's owner, symlink, or mode checks to
+them. New runs keep the originally created file identity open so a path replacement cannot redirect
+later events. Unix state directories are owner-checked, reject symlinks, and use mode `0700`; Event
+Logs use mode `0600`. If no state environment is available, the Unix fallback is isolated by uid
+under the system temporary directory.
 
 Use `--fake-script <PATH>` to replay deterministic model turns. The file contains arrays of
 `ModelStreamEvent` payloads, one array per model turn:
