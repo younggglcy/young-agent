@@ -4,6 +4,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -62,6 +64,33 @@ impl JsonlEventStore {
             path: path.into(),
             append_file: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Creates a brand-new Event Log and keeps the created file identity for
+    /// the lifetime of this store. This is the constructor for new Agent Runs:
+    /// it rejects an existing path and prevents a path replacement between
+    /// reservation and the first append from redirecting canonical events.
+    pub fn create_new(path: impl Into<PathBuf>) -> Result<Self, EventStoreError> {
+        let path = path.into();
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&path)
+            .map_err(|source| EventStoreError::OpenForAppend {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            path,
+            append_file: Arc::new(Mutex::new(Some(AppendFile {
+                file,
+                parent_directory_needs_sync: true,
+                fully_validated: true,
+                line_count: 0,
+            }))),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -401,10 +430,11 @@ impl JsonlEventStore {
     }
 
     fn open_append_file(&self) -> Result<AppendFile, EventStoreError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
             .open(&self.path)
             .map_err(|source| EventStoreError::OpenForAppend {
                 path: self.path.clone(),
